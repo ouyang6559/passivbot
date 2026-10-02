@@ -1,0 +1,72 @@
+{
+  "val_normal_osc_base.json": {
+    "regime": "normal_osc",
+    "kind": "base",
+    "start": "2023-03-15",
+    "end": "2023-04-30",
+    "why": "BTC/ETH 均为正常震荡"
+  },
+  "val_normal_osc_regime.json": {
+    "regime": "normal_osc",
+    "kind": "regime",
+    "start": "2023-03-15",
+    "end": "2023-04-30",
+    "why": "BTC/ETH 均为正常震荡"
+  },
+  "val_low_vol_osc_base.json": {
+    "regime": "low_vol_osc",
+    "kind": "base",
+    "start": "2023-07-05",
+    "end": "2023-08-28",
+    "why": "BTC+ETH 同期低波动震荡"
+  },
+  "val_low_vol_osc_regime.json": {
+    "regime": "low_vol_osc",
+    "kind": "regime",
+    "start": "2023-07-05",
+    "end": "2023-08-28",
+    "why": "BTC+ETH 同期低波动震荡"
+  },
+  "val_strong_trend_base.json": {
+    "regime": "strong_trend",
+    "kind": "base",
+    "start": "2023-11-01",
+    "end": "2024-01-15",
+    "why": "SOL/ADA 强趋势,BTC 同向"
+  },
+  "val_strong_trend_regime.json": {
+    "regime": "strong_trend",
+    "kind": "regime",
+    "start": "2023-11-01",
+    "end": "2024-01-15",
+    "why": "SOL/ADA 强趋势,BTC 同向"
+  },
+  "val_bear_base.json": {
+    "regime": "bear",
+    "kind": "base",
+    "start": "2022-05-01",
+    "end": "2022-07-31",
+    "why": "LUNA 崩盘后的市场级熊市"
+  },
+  "val_bear_regime.json": {
+    "regime": "bear",
+    "kind": "regime",
+    "start": "2022-05-01",
+    "end": "2022-07-31",
+    "why": "LUNA 崩盘后的市场级熊市"
+  },
+  "val_extreme_vol_base.json": {
+    "regime": "extreme_vol",
+    "kind": "base",
+    "start": "2021-05-10",
+    "end": "2021-06-08",
+    "why": "2021-05 大崩盘窗口"
+  },
+  "val_extreme_vol_regime.json": {
+    "regime": "extreme_vol",
+    "kind": "regime",
+    "start": "2021-05-10",
+    "end": "2021-06-08",
+    "why": "2021-05 大崩盘窗口"
+  }
+}

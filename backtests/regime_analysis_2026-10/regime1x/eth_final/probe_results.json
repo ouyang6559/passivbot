@@ -1,0 +1,194 @@
+{
+  "P1_entry_ema_x1.3": {
+    "window": [
+      "2019-11-28",
+      "2026-10-01"
+    ],
+    "seconds": 26.0,
+    "adg_pnl": 0.002459519744959445,
+    "drawdown_worst_usd": 0.6706275665915847,
+    "loss_profit_ratio": 0.2605148954542094,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 10787.0,
+    "run_dir": "backtests/binance/2026-10-02T02_05_52",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 4.4,
+        "frac_close_unstuck": 0.3531,
+        "frac_entry_grid_cropped": 0.1503,
+        "entries_per_cycle_mean": 3.65,
+        "unstuck_pnl_total": -344321.7,
+        "win_sum": 1336915.0,
+        "loss_sum": -348286.3,
+        "close_dist_pct_median": 1.592
+      }
+    }
+  },
+  "P2_entry_ema_x0.7": {
+    "window": [
+      "2019-11-28",
+      "2026-10-01"
+    ],
+    "seconds": 25.8,
+    "adg_pnl": 0.0025291008050679535,
+    "drawdown_worst_usd": 0.6679251152070609,
+    "loss_profit_ratio": 0.24418632476125046,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 11793.0,
+    "run_dir": "backtests/binance/2026-10-02T02_06_17",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 4.78,
+        "frac_close_unstuck": 0.3433,
+        "frac_entry_grid_cropped": 0.1572,
+        "entries_per_cycle_mean": 3.69,
+        "unstuck_pnl_total": -391122.1,
+        "win_sum": 1633272.4,
+        "loss_sum": -398822.8,
+        "close_dist_pct_median": 1.554
+      }
+    }
+  },
+  "P3_close_qty_0.2": {
+    "window": [
+      "2019-11-28",
+      "2026-10-01"
+    ],
+    "seconds": 24.4,
+    "adg_pnl": 0.002471059352672914,
+    "drawdown_worst_usd": 0.6707179128759324,
+    "loss_profit_ratio": 0.2564026896729416,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 10281.0,
+    "run_dir": "backtests/binance/2026-10-02T02_06_42",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 4.2,
+        "frac_close_unstuck": 0.3676,
+        "frac_entry_grid_cropped": 0.1637,
+        "entries_per_cycle_mean": 3.47,
+        "unstuck_pnl_total": -370729.2,
+        "win_sum": 1461360.0,
+        "loss_sum": -374696.6,
+        "close_dist_pct_median": 1.566
+      }
+    }
+  },
+  "P4_vol_span_1m_300": {
+    "window": [
+      "2019-11-28",
+      "2026-10-01"
+    ],
+    "seconds": 25.8,
+    "adg_pnl": 0.002495987957634201,
+    "drawdown_worst_usd": 0.6707221048454064,
+    "loss_profit_ratio": 0.258615490937382,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 10988.0,
+    "run_dir": "backtests/binance/2026-10-02T02_07_08",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 4.49,
+        "frac_close_unstuck": 0.3448,
+        "frac_entry_grid_cropped": 0.1525,
+        "entries_per_cycle_mean": 3.72,
+        "unstuck_pnl_total": -368375.0,
+        "win_sum": 1447356.2,
+        "loss_sum": -374308.7,
+        "close_dist_pct_median": 1.585
+      }
+    }
+  },
+  "P5_we_weight_0.30": {
+    "window": [
+      "2019-11-28",
+      "2026-10-01"
+    ],
+    "seconds": 25.5,
+    "adg_pnl": 0.0023517948073877503,
+    "drawdown_worst_usd": 0.6694707374898107,
+    "loss_profit_ratio": 0.24567045041588392,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 10452.0,
+    "run_dir": "backtests/binance/2026-10-02T02_07_33",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 4.27,
+        "frac_close_unstuck": 0.3255,
+        "frac_entry_grid_cropped": 0.1451,
+        "entries_per_cycle_mean": 3.5,
+        "unstuck_pnl_total": -336952.4,
+        "win_sum": 1395755.1,
+        "loss_sum": -342895.8,
+        "close_dist_pct_median": 1.581
+      }
+    }
+  },
+  "P6_initial_dist_deep": {
+    "window": [
+      "2019-11-28",
+      "2026-10-01"
+    ],
+    "seconds": 25.7,
+    "adg_pnl": 0.002766739280128076,
+    "drawdown_worst_usd": 0.6686568491752526,
+    "loss_profit_ratio": 0.2635440634095586,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 11878.0,
+    "run_dir": "backtests/binance/2026-10-02T02_07_59",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 4.85,
+        "frac_close_unstuck": 0.3514,
+        "frac_entry_grid_cropped": 0.1644,
+        "entries_per_cycle_mean": 3.84,
+        "unstuck_pnl_total": -410225.1,
+        "win_sum": 1580821.0,
+        "loss_sum": -416616.0,
+        "close_dist_pct_median": 1.581
+      }
+    }
+  },
+  "P7_hsl_short_rescue": {
+    "window": [
+      "2023-10-13",
+      "2024-05-15"
+    ],
+    "seconds": 5.6,
+    "adg_pnl": -0.0010504179942193662,
+    "drawdown_worst_usd": 0.3095491775732684,
+    "loss_profit_ratio": 1.418785039889891,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 2001.0,
+    "run_dir": "backtests/binance/2026-10-02T02_08_10",
+    "fills_stats": {
+      "long": {
+        "fills_per_day": 5.2,
+        "frac_close_unstuck": 0.1256,
+        "frac_entry_grid_cropped": 0.061,
+        "entries_per_cycle_mean": 2.13,
+        "unstuck_pnl_total": -1681.6,
+        "win_sum": 26240.8,
+        "loss_sum": -1797.4,
+        "close_dist_pct_median": 1.213
+      },
+      "short": {
+        "fills_per_day": 4.14,
+        "frac_close_unstuck": 0.4153,
+        "frac_entry_grid_cropped": 0.2156,
+        "entries_per_cycle_mean": 4.37,
+        "unstuck_pnl_total": -8834.2,
+        "win_sum": 4486.0,
+        "loss_sum": -41797.3,
+        "close_dist_pct_median": 1.373
+      }
+    }
+  }
+}

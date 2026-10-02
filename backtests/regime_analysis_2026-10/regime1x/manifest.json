@@ -1,0 +1,737 @@
+[
+  {
+    "coin": "BTC",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "BTC/normal_osc/long.json",
+    "S": 0.592
+  },
+  {
+    "coin": "BTC",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "BTC/normal_osc/short.json",
+    "S": 0.592
+  },
+  {
+    "coin": "BTC",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "BTC/normal_osc/both.json",
+    "S": 0.592
+  },
+  {
+    "coin": "BTC",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "BTC/low_vol_osc/long.json",
+    "S": 0.4
+  },
+  {
+    "coin": "BTC",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "BTC/low_vol_osc/short.json",
+    "S": 0.4
+  },
+  {
+    "coin": "BTC",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "BTC/low_vol_osc/both.json",
+    "S": 0.4
+  },
+  {
+    "coin": "BTC",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "BTC/strong_trend/long.json",
+    "S": 0.667
+  },
+  {
+    "coin": "BTC",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "BTC/strong_trend/short.json",
+    "S": 0.667
+  },
+  {
+    "coin": "BTC",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "BTC/strong_trend/both.json",
+    "S": 0.667
+  },
+  {
+    "coin": "BTC",
+    "regime": "bear",
+    "direction": "long",
+    "config": "BTC/bear/long.json",
+    "S": 0.704
+  },
+  {
+    "coin": "BTC",
+    "regime": "bear",
+    "direction": "short",
+    "config": "BTC/bear/short.json",
+    "S": 0.704
+  },
+  {
+    "coin": "BTC",
+    "regime": "bear",
+    "direction": "both",
+    "config": "BTC/bear/both.json",
+    "S": 0.704
+  },
+  {
+    "coin": "BTC",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "BTC/extreme_vol/long.json",
+    "S": 2.113
+  },
+  {
+    "coin": "BTC",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "BTC/extreme_vol/short.json",
+    "S": 2.113
+  },
+  {
+    "coin": "BTC",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "BTC/extreme_vol/both.json",
+    "S": 2.113
+  },
+  {
+    "coin": "ETH",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "ETH/normal_osc/long.json",
+    "S": 0.777
+  },
+  {
+    "coin": "ETH",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "ETH/normal_osc/short.json",
+    "S": 0.777
+  },
+  {
+    "coin": "ETH",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "ETH/normal_osc/both.json",
+    "S": 0.777
+  },
+  {
+    "coin": "ETH",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "ETH/low_vol_osc/long.json",
+    "S": 0.414
+  },
+  {
+    "coin": "ETH",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "ETH/low_vol_osc/short.json",
+    "S": 0.414
+  },
+  {
+    "coin": "ETH",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "ETH/low_vol_osc/both.json",
+    "S": 0.414
+  },
+  {
+    "coin": "ETH",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "ETH/strong_trend/long.json",
+    "S": 0.913
+  },
+  {
+    "coin": "ETH",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "ETH/strong_trend/short.json",
+    "S": 0.913
+  },
+  {
+    "coin": "ETH",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "ETH/strong_trend/both.json",
+    "S": 0.913
+  },
+  {
+    "coin": "ETH",
+    "regime": "bear",
+    "direction": "long",
+    "config": "ETH/bear/long.json",
+    "S": 0.896
+  },
+  {
+    "coin": "ETH",
+    "regime": "bear",
+    "direction": "short",
+    "config": "ETH/bear/short.json",
+    "S": 0.896
+  },
+  {
+    "coin": "ETH",
+    "regime": "bear",
+    "direction": "both",
+    "config": "ETH/bear/both.json",
+    "S": 0.896
+  },
+  {
+    "coin": "ETH",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "ETH/extreme_vol/long.json",
+    "S": 2.2
+  },
+  {
+    "coin": "ETH",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "ETH/extreme_vol/short.json",
+    "S": 2.2
+  },
+  {
+    "coin": "ETH",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "ETH/extreme_vol/both.json",
+    "S": 2.2
+  },
+  {
+    "coin": "XRP",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "XRP/normal_osc/long.json",
+    "S": 0.892
+  },
+  {
+    "coin": "XRP",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "XRP/normal_osc/short.json",
+    "S": 0.892
+  },
+  {
+    "coin": "XRP",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "XRP/normal_osc/both.json",
+    "S": 0.892
+  },
+  {
+    "coin": "XRP",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "XRP/low_vol_osc/long.json",
+    "S": 0.494
+  },
+  {
+    "coin": "XRP",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "XRP/low_vol_osc/short.json",
+    "S": 0.494
+  },
+  {
+    "coin": "XRP",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "XRP/low_vol_osc/both.json",
+    "S": 0.494
+  },
+  {
+    "coin": "XRP",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "XRP/strong_trend/long.json",
+    "S": 1.209
+  },
+  {
+    "coin": "XRP",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "XRP/strong_trend/short.json",
+    "S": 1.209
+  },
+  {
+    "coin": "XRP",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "XRP/strong_trend/both.json",
+    "S": 1.209
+  },
+  {
+    "coin": "XRP",
+    "regime": "bear",
+    "direction": "long",
+    "config": "XRP/bear/long.json",
+    "S": 0.791
+  },
+  {
+    "coin": "XRP",
+    "regime": "bear",
+    "direction": "short",
+    "config": "XRP/bear/short.json",
+    "S": 0.791
+  },
+  {
+    "coin": "XRP",
+    "regime": "bear",
+    "direction": "both",
+    "config": "XRP/bear/both.json",
+    "S": 0.791
+  },
+  {
+    "coin": "XRP",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "XRP/extreme_vol/long.json",
+    "S": 2.2
+  },
+  {
+    "coin": "XRP",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "XRP/extreme_vol/short.json",
+    "S": 2.2
+  },
+  {
+    "coin": "XRP",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "XRP/extreme_vol/both.json",
+    "S": 2.2
+  },
+  {
+    "coin": "SOL",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "SOL/normal_osc/long.json",
+    "S": 1.121
+  },
+  {
+    "coin": "SOL",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "SOL/normal_osc/short.json",
+    "S": 1.121
+  },
+  {
+    "coin": "SOL",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "SOL/normal_osc/both.json",
+    "S": 1.121
+  },
+  {
+    "coin": "SOL",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "SOL/low_vol_osc/long.json",
+    "S": 0.615
+  },
+  {
+    "coin": "SOL",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "SOL/low_vol_osc/short.json",
+    "S": 0.615
+  },
+  {
+    "coin": "SOL",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "SOL/low_vol_osc/both.json",
+    "S": 0.615
+  },
+  {
+    "coin": "SOL",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "SOL/strong_trend/long.json",
+    "S": 1.612
+  },
+  {
+    "coin": "SOL",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "SOL/strong_trend/short.json",
+    "S": 1.612
+  },
+  {
+    "coin": "SOL",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "SOL/strong_trend/both.json",
+    "S": 1.612
+  },
+  {
+    "coin": "SOL",
+    "regime": "bear",
+    "direction": "long",
+    "config": "SOL/bear/long.json",
+    "S": 1.066
+  },
+  {
+    "coin": "SOL",
+    "regime": "bear",
+    "direction": "short",
+    "config": "SOL/bear/short.json",
+    "S": 1.066
+  },
+  {
+    "coin": "SOL",
+    "regime": "bear",
+    "direction": "both",
+    "config": "SOL/bear/both.json",
+    "S": 1.066
+  },
+  {
+    "coin": "SOL",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "SOL/extreme_vol/long.json",
+    "S": 2.2
+  },
+  {
+    "coin": "SOL",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "SOL/extreme_vol/short.json",
+    "S": 2.2
+  },
+  {
+    "coin": "SOL",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "SOL/extreme_vol/both.json",
+    "S": 2.2
+  },
+  {
+    "coin": "ADA",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "ADA/normal_osc/long.json",
+    "S": 1.0
+  },
+  {
+    "coin": "ADA",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "ADA/normal_osc/short.json",
+    "S": 1.0
+  },
+  {
+    "coin": "ADA",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "ADA/normal_osc/both.json",
+    "S": 1.0
+  },
+  {
+    "coin": "ADA",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "ADA/low_vol_osc/long.json",
+    "S": 0.57
+  },
+  {
+    "coin": "ADA",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "ADA/low_vol_osc/short.json",
+    "S": 0.57
+  },
+  {
+    "coin": "ADA",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "ADA/low_vol_osc/both.json",
+    "S": 0.57
+  },
+  {
+    "coin": "ADA",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "ADA/strong_trend/long.json",
+    "S": 1.307
+  },
+  {
+    "coin": "ADA",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "ADA/strong_trend/short.json",
+    "S": 1.307
+  },
+  {
+    "coin": "ADA",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "ADA/strong_trend/both.json",
+    "S": 1.307
+  },
+  {
+    "coin": "ADA",
+    "regime": "bear",
+    "direction": "long",
+    "config": "ADA/bear/long.json",
+    "S": 0.903
+  },
+  {
+    "coin": "ADA",
+    "regime": "bear",
+    "direction": "short",
+    "config": "ADA/bear/short.json",
+    "S": 0.903
+  },
+  {
+    "coin": "ADA",
+    "regime": "bear",
+    "direction": "both",
+    "config": "ADA/bear/both.json",
+    "S": 0.903
+  },
+  {
+    "coin": "ADA",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "ADA/extreme_vol/long.json",
+    "S": 2.2
+  },
+  {
+    "coin": "ADA",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "ADA/extreme_vol/short.json",
+    "S": 2.2
+  },
+  {
+    "coin": "ADA",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "ADA/extreme_vol/both.json",
+    "S": 2.2
+  },
+  {
+    "coin": "DOGE",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "DOGE/normal_osc/long.json",
+    "S": 1.081
+  },
+  {
+    "coin": "DOGE",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "DOGE/normal_osc/short.json",
+    "S": 1.081
+  },
+  {
+    "coin": "DOGE",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "DOGE/normal_osc/both.json",
+    "S": 1.081
+  },
+  {
+    "coin": "DOGE",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "DOGE/low_vol_osc/long.json",
+    "S": 0.589
+  },
+  {
+    "coin": "DOGE",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "DOGE/low_vol_osc/short.json",
+    "S": 0.589
+  },
+  {
+    "coin": "DOGE",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "DOGE/low_vol_osc/both.json",
+    "S": 0.589
+  },
+  {
+    "coin": "DOGE",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "DOGE/strong_trend/long.json",
+    "S": 1.62
+  },
+  {
+    "coin": "DOGE",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "DOGE/strong_trend/short.json",
+    "S": 1.62
+  },
+  {
+    "coin": "DOGE",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "DOGE/strong_trend/both.json",
+    "S": 1.62
+  },
+  {
+    "coin": "DOGE",
+    "regime": "bear",
+    "direction": "long",
+    "config": "DOGE/bear/long.json",
+    "S": 0.864
+  },
+  {
+    "coin": "DOGE",
+    "regime": "bear",
+    "direction": "short",
+    "config": "DOGE/bear/short.json",
+    "S": 0.864
+  },
+  {
+    "coin": "DOGE",
+    "regime": "bear",
+    "direction": "both",
+    "config": "DOGE/bear/both.json",
+    "S": 0.864
+  },
+  {
+    "coin": "DOGE",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "DOGE/extreme_vol/long.json",
+    "S": 2.2
+  },
+  {
+    "coin": "DOGE",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "DOGE/extreme_vol/short.json",
+    "S": 2.2
+  },
+  {
+    "coin": "DOGE",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "DOGE/extreme_vol/both.json",
+    "S": 2.2
+  },
+  {
+    "coin": "LINK",
+    "regime": "normal_osc",
+    "direction": "long",
+    "config": "LINK/normal_osc/long.json",
+    "S": 1.06
+  },
+  {
+    "coin": "LINK",
+    "regime": "normal_osc",
+    "direction": "short",
+    "config": "LINK/normal_osc/short.json",
+    "S": 1.06
+  },
+  {
+    "coin": "LINK",
+    "regime": "normal_osc",
+    "direction": "both",
+    "config": "LINK/normal_osc/both.json",
+    "S": 1.06
+  },
+  {
+    "coin": "LINK",
+    "regime": "low_vol_osc",
+    "direction": "long",
+    "config": "LINK/low_vol_osc/long.json",
+    "S": 0.604
+  },
+  {
+    "coin": "LINK",
+    "regime": "low_vol_osc",
+    "direction": "short",
+    "config": "LINK/low_vol_osc/short.json",
+    "S": 0.604
+  },
+  {
+    "coin": "LINK",
+    "regime": "low_vol_osc",
+    "direction": "both",
+    "config": "LINK/low_vol_osc/both.json",
+    "S": 0.604
+  },
+  {
+    "coin": "LINK",
+    "regime": "strong_trend",
+    "direction": "long",
+    "config": "LINK/strong_trend/long.json",
+    "S": 1.332
+  },
+  {
+    "coin": "LINK",
+    "regime": "strong_trend",
+    "direction": "short",
+    "config": "LINK/strong_trend/short.json",
+    "S": 1.332
+  },
+  {
+    "coin": "LINK",
+    "regime": "strong_trend",
+    "direction": "both",
+    "config": "LINK/strong_trend/both.json",
+    "S": 1.332
+  },
+  {
+    "coin": "LINK",
+    "regime": "bear",
+    "direction": "long",
+    "config": "LINK/bear/long.json",
+    "S": 1.031
+  },
+  {
+    "coin": "LINK",
+    "regime": "bear",
+    "direction": "short",
+    "config": "LINK/bear/short.json",
+    "S": 1.031
+  },
+  {
+    "coin": "LINK",
+    "regime": "bear",
+    "direction": "both",
+    "config": "LINK/bear/both.json",
+    "S": 1.031
+  },
+  {
+    "coin": "LINK",
+    "regime": "extreme_vol",
+    "direction": "long",
+    "config": "LINK/extreme_vol/long.json",
+    "S": 2.2
+  },
+  {
+    "coin": "LINK",
+    "regime": "extreme_vol",
+    "direction": "short",
+    "config": "LINK/extreme_vol/short.json",
+    "S": 2.2
+  },
+  {
+    "coin": "LINK",
+    "regime": "extreme_vol",
+    "direction": "both",
+    "config": "LINK/extreme_vol/both.json",
+    "S": 2.2
+  }
+]

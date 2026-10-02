@@ -1,0 +1,503 @@
+{
+  "BTC/both": {
+    "liquidated": false,
+    "adg_pnl": 0.000123857881168357,
+    "drawdown_worst_usd": 0.7303835984740797,
+    "completion": 1.0,
+    "n_fills_total": 5171.0,
+    "total_return_mult": 0.7558,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.0979,
+        "worst_dd": -0.2164,
+        "end_equity": 90217.0,
+        "sharpe": -0.38,
+        "n_fills": 2335
+      },
+      "2023": {
+        "return": 0.3033,
+        "worst_dd": -0.1017,
+        "end_equity": 117549.0,
+        "sharpe": 2.14,
+        "n_fills": 1530
+      },
+      "2024": {
+        "return": -0.4361,
+        "worst_dd": -0.5808,
+        "end_equity": 66278.0,
+        "sharpe": -0.94,
+        "n_fills": 871
+      },
+      "2025": {
+        "return": 0.0972,
+        "worst_dd": -0.6252,
+        "end_equity": 71740.0,
+        "sharpe": 0.51,
+        "n_fills": 159
+      },
+      "2026": {
+        "return": 0.0561,
+        "worst_dd": -0.2711,
+        "end_equity": 75588.0,
+        "sharpe": 0.37,
+        "n_fills": 276
+      }
+    }
+  },
+  "BTC/long": {
+    "liquidated": false,
+    "adg_pnl": 0.0007700544097240255,
+    "drawdown_worst_usd": 0.6137656053947202,
+    "completion": 1.0,
+    "n_fills_total": 7854.0,
+    "total_return_mult": 1.9359,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.5578,
+        "worst_dd": -0.6098,
+        "end_equity": 44227.0,
+        "sharpe": -1.22,
+        "n_fills": 1030
+      },
+      "2023": {
+        "return": 1.2136,
+        "worst_dd": -0.2014,
+        "end_equity": 97847.0,
+        "sharpe": 2.33,
+        "n_fills": 663
+      },
+      "2024": {
+        "return": 0.4435,
+        "worst_dd": -0.1733,
+        "end_equity": 141249.0,
+        "sharpe": 1.88,
+        "n_fills": 2442
+      },
+      "2025": {
+        "return": 0.232,
+        "worst_dd": -0.1411,
+        "end_equity": 174078.0,
+        "sharpe": 1.3,
+        "n_fills": 2207
+      },
+      "2026": {
+        "return": 0.1122,
+        "worst_dd": -0.1893,
+        "end_equity": 193615.0,
+        "sharpe": 0.7,
+        "n_fills": 1512
+      }
+    }
+  },
+  "BTC/short": {
+    "liquidated": true,
+    "adg_pnl": 0.001104560492307603,
+    "drawdown_worst_usd": 0.9669906043112992,
+    "completion": 0.39053354146653857,
+    "n_fills_total": 3238.0,
+    "total_return_mult": 0.05,
+    "start": "2022-01-01",
+    "end": "2023-11-09",
+    "years": {
+      "2022": {
+        "return": 0.5146,
+        "worst_dd": -0.1438,
+        "end_equity": 151450.0,
+        "sharpe": 1.77,
+        "n_fills": 2501
+      },
+      "2023": {
+        "return": -0.967,
+        "worst_dd": -0.967,
+        "end_equity": 5000.0,
+        "sharpe": -1.47,
+        "n_fills": 737
+      }
+    }
+  },
+  "ETH/both": {
+    "liquidated": false,
+    "adg_pnl": 0.00040212752057551006,
+    "drawdown_worst_usd": 0.6764776457251075,
+    "completion": 1.0,
+    "n_fills_total": 7177.0,
+    "total_return_mult": 1.262,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.1999,
+        "worst_dd": -0.3149,
+        "end_equity": 80014.0,
+        "sharpe": -0.64,
+        "n_fills": 1419
+      },
+      "2023": {
+        "return": 0.2691,
+        "worst_dd": -0.1313,
+        "end_equity": 101484.0,
+        "sharpe": 1.4,
+        "n_fills": 995
+      },
+      "2024": {
+        "return": -0.073,
+        "worst_dd": -0.2868,
+        "end_equity": 94087.0,
+        "sharpe": -0.01,
+        "n_fills": 1431
+      },
+      "2025": {
+        "return": -0.0497,
+        "worst_dd": -0.6719,
+        "end_equity": 88943.0,
+        "sharpe": 0.31,
+        "n_fills": 1853
+      },
+      "2026": {
+        "return": 0.4223,
+        "worst_dd": -0.1163,
+        "end_equity": 126204.0,
+        "sharpe": 2.66,
+        "n_fills": 1479
+      }
+    }
+  },
+  "ETH/long": {
+    "liquidated": false,
+    "adg_pnl": 0.0005413218079366224,
+    "drawdown_worst_usd": 0.6402853887066067,
+    "completion": 1.0,
+    "n_fills_total": 6695.0,
+    "total_return_mult": 0.9281,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.5083,
+        "worst_dd": -0.6322,
+        "end_equity": 49172.0,
+        "sharpe": -0.54,
+        "n_fills": 1112
+      },
+      "2023": {
+        "return": 0.8631,
+        "worst_dd": -0.2675,
+        "end_equity": 91458.0,
+        "sharpe": 1.7,
+        "n_fills": 1246
+      },
+      "2024": {
+        "return": 0.3261,
+        "worst_dd": -0.1871,
+        "end_equity": 121352.0,
+        "sharpe": 0.99,
+        "n_fills": 2471
+      },
+      "2025": {
+        "return": -0.1732,
+        "worst_dd": -0.5166,
+        "end_equity": 101083.0,
+        "sharpe": -0.0,
+        "n_fills": 1391
+      },
+      "2026": {
+        "return": -0.0841,
+        "worst_dd": -0.517,
+        "end_equity": 92826.0,
+        "sharpe": 0.04,
+        "n_fills": 475
+      }
+    }
+  },
+  "ETH/short": {
+    "liquidated": true,
+    "adg_pnl": 0.0012562416497034097,
+    "drawdown_worst_usd": 0.9683409708221306,
+    "completion": 0.4494264329170669,
+    "n_fills_total": 3782.0,
+    "total_return_mult": 0.05,
+    "start": "2022-01-01",
+    "end": "2024-02-19",
+    "years": {
+      "2022": {
+        "return": 0.5743,
+        "worst_dd": -0.6488,
+        "end_equity": 157411.0,
+        "sharpe": 0.96,
+        "n_fills": 2798
+      },
+      "2023": {
+        "return": -0.5849,
+        "worst_dd": -0.6751,
+        "end_equity": 65337.0,
+        "sharpe": -0.6,
+        "n_fills": 859
+      },
+      "2024": {
+        "return": -0.922,
+        "worst_dd": -0.933,
+        "end_equity": 5000.0,
+        "sharpe": -3.49,
+        "n_fills": 125
+      }
+    }
+  },
+  "SOL/both": {
+    "liquidated": false,
+    "adg_pnl": 0.000809223772925588,
+    "drawdown_worst_usd": 0.44810816290773053,
+    "completion": 1.0,
+    "n_fills_total": 8195.0,
+    "total_return_mult": 1.7979,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.3212,
+        "worst_dd": -0.4447,
+        "end_equity": 67883.0,
+        "sharpe": -1.05,
+        "n_fills": 1902
+      },
+      "2023": {
+        "return": 0.5451,
+        "worst_dd": -0.2019,
+        "end_equity": 104901.0,
+        "sharpe": 1.71,
+        "n_fills": 1046
+      },
+      "2024": {
+        "return": 0.5064,
+        "worst_dd": -0.1967,
+        "end_equity": 157775.0,
+        "sharpe": 1.8,
+        "n_fills": 2327
+      },
+      "2025": {
+        "return": 0.2649,
+        "worst_dd": -0.1896,
+        "end_equity": 199588.0,
+        "sharpe": 1.11,
+        "n_fills": 1998
+      },
+      "2026": {
+        "return": -0.0991,
+        "worst_dd": -0.2063,
+        "end_equity": 179802.0,
+        "sharpe": -0.68,
+        "n_fills": 922
+      }
+    }
+  },
+  "SOL/long": {
+    "liquidated": false,
+    "adg_pnl": 0.0015241210336862077,
+    "drawdown_worst_usd": 0.8647919697466548,
+    "completion": 1.0,
+    "n_fills_total": 7584.0,
+    "total_return_mult": 4.223,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.7771,
+        "worst_dd": -0.8604,
+        "end_equity": 22296.0,
+        "sharpe": -0.99,
+        "n_fills": 1688
+      },
+      "2023": {
+        "return": 4.833,
+        "worst_dd": -0.4159,
+        "end_equity": 130156.0,
+        "sharpe": 2.74,
+        "n_fills": 906
+      },
+      "2024": {
+        "return": 0.9401,
+        "worst_dd": -0.2303,
+        "end_equity": 252551.0,
+        "sharpe": 2.25,
+        "n_fills": 2265
+      },
+      "2025": {
+        "return": 0.4081,
+        "worst_dd": -0.4378,
+        "end_equity": 355686.0,
+        "sharpe": 0.92,
+        "n_fills": 1817
+      },
+      "2026": {
+        "return": 0.1873,
+        "worst_dd": -0.193,
+        "end_equity": 422355.0,
+        "sharpe": 0.94,
+        "n_fills": 908
+      }
+    }
+  },
+  "SOL/short": {
+    "liquidated": true,
+    "adg_pnl": 0.0028313197605848487,
+    "drawdown_worst_usd": 0.9793973351316498,
+    "completion": 0.22185718860070444,
+    "n_fills_total": 2819.0,
+    "total_return_mult": 0.05,
+    "start": "2022-01-01",
+    "end": "2023-01-20",
+    "years": {
+      "2022": {
+        "return": 1.3752,
+        "worst_dd": -0.2127,
+        "end_equity": 237488.0,
+        "sharpe": 2.0,
+        "n_fills": 2732
+      },
+      "2023": {
+        "return": -0.9789,
+        "worst_dd": -0.9794,
+        "end_equity": 5000.0,
+        "sharpe": -3.39,
+        "n_fills": 87
+      }
+    }
+  },
+  "XRP/both": {
+    "liquidated": false,
+    "adg_pnl": 0.0008514186183136985,
+    "drawdown_worst_usd": 0.4868672228708894,
+    "completion": 1.0,
+    "n_fills_total": 9785.0,
+    "total_return_mult": 2.6814,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": 0.4317,
+        "worst_dd": -0.0898,
+        "end_equity": 143160.0,
+        "sharpe": 2.06,
+        "n_fills": 2763
+      },
+      "2023": {
+        "return": 0.1729,
+        "worst_dd": -0.282,
+        "end_equity": 167911.0,
+        "sharpe": 0.76,
+        "n_fills": 1610
+      },
+      "2024": {
+        "return": 0.1274,
+        "worst_dd": -0.3397,
+        "end_equity": 189303.0,
+        "sharpe": 0.5,
+        "n_fills": 2527
+      },
+      "2025": {
+        "return": 0.2601,
+        "worst_dd": -0.4089,
+        "end_equity": 236582.0,
+        "sharpe": 0.67,
+        "n_fills": 1479
+      },
+      "2026": {
+        "return": 0.1334,
+        "worst_dd": -0.0872,
+        "end_equity": 268133.0,
+        "sharpe": 1.4,
+        "n_fills": 1406
+      }
+    }
+  },
+  "XRP/long": {
+    "liquidated": false,
+    "adg_pnl": 0.001706982091452372,
+    "drawdown_worst_usd": 0.610770178109216,
+    "completion": 1.0,
+    "n_fills_total": 8766.0,
+    "total_return_mult": 2.7596,
+    "start": "2022-01-01",
+    "end": "2026-10-01",
+    "years": {
+      "2022": {
+        "return": -0.0407,
+        "worst_dd": -0.44,
+        "end_equity": 95943.0,
+        "sharpe": 0.26,
+        "n_fills": 1720
+      },
+      "2023": {
+        "return": 0.7806,
+        "worst_dd": -0.1741,
+        "end_equity": 170646.0,
+        "sharpe": 2.0,
+        "n_fills": 1643
+      },
+      "2024": {
+        "return": 0.8895,
+        "worst_dd": -0.2122,
+        "end_equity": 322496.0,
+        "sharpe": 2.06,
+        "n_fills": 2551
+      },
+      "2025": {
+        "return": 0.0367,
+        "worst_dd": -0.3355,
+        "end_equity": 334374.0,
+        "sharpe": 0.32,
+        "n_fills": 1969
+      },
+      "2026": {
+        "return": -0.1759,
+        "worst_dd": -0.5548,
+        "end_equity": 275991.0,
+        "sharpe": -0.15,
+        "n_fills": 883
+      }
+    }
+  },
+  "XRP/short": {
+    "liquidated": true,
+    "adg_pnl": 0.0014148332130717366,
+    "drawdown_worst_usd": 0.9833291080645378,
+    "completion": 0.6406592219020173,
+    "n_fills_total": 5390.0,
+    "total_return_mult": 0.05,
+    "start": "2022-01-01",
+    "end": "2025-01-16",
+    "years": {
+      "2022": {
+        "return": 0.631,
+        "worst_dd": -0.3014,
+        "end_equity": 163084.0,
+        "sharpe": 1.36,
+        "n_fills": 2093
+      },
+      "2023": {
+        "return": 0.2181,
+        "worst_dd": -0.6073,
+        "end_equity": 198650.0,
+        "sharpe": 0.65,
+        "n_fills": 1345
+      },
+      "2024": {
+        "return": 0.1115,
+        "worst_dd": -0.7034,
+        "end_equity": 220803.0,
+        "sharpe": 0.7,
+        "n_fills": 1952
+      },
+      "2025": {
+        "return": -0.9769,
+        "worst_dd": -0.9772,
+        "end_equity": 5000.0,
+        "sharpe": -10.41,
+        "n_fills": 0
+      }
+    }
+  }
+}

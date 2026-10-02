@@ -1,0 +1,282 @@
+{
+  "normal_osc/baseline": {
+    "window": [
+      "2023-10-13",
+      "2024-05-15"
+    ],
+    "adg_pnl": -0.0009700083241223545,
+    "drawdown_worst_usd": 0.9501250108286108,
+    "loss_profit_ratio": 10.642506451678749,
+    "backtest_completion_ratio": 0.6437273901808785,
+    "liquidated": true,
+    "run_dir": "backtests/binance/2026-10-02T00_13_01",
+    "fills": {
+      "fills_per_day": 1.45,
+      "frac_close_unstuck": 0.725,
+      "unstuck_pnl": -2539.6,
+      "loss_sum": -2539.6,
+      "win_sum": 238.6,
+      "twe_max": 0.99
+    }
+  },
+  "normal_osc/v2": {
+    "window": [
+      "2023-10-13",
+      "2024-05-15"
+    ],
+    "adg_pnl": -0.0015427251642865679,
+    "drawdown_worst_usd": 0.9501040238365173,
+    "loss_profit_ratio": 12.797884111098382,
+    "backtest_completion_ratio": 0.6437726098191214,
+    "liquidated": true,
+    "run_dir": "backtests/binance/2026-10-02T00_13_05",
+    "fills": {
+      "fills_per_day": 1.13,
+      "frac_close_unstuck": 0.721,
+      "unstuck_pnl": -2545.4,
+      "loss_sum": -2545.8,
+      "win_sum": 198.9,
+      "twe_max": 0.99
+    }
+  },
+  "low_vol_osc/baseline": {
+    "window": [
+      "2023-07-05",
+      "2023-11-01"
+    ],
+    "adg_pnl": 0.0003465578725403169,
+    "drawdown_worst_usd": 0.06876608919890259,
+    "loss_profit_ratio": 0.3914019036329179,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_10",
+    "fills": {
+      "fills_per_day": 6.1,
+      "frac_close_unstuck": 0.386,
+      "unstuck_pnl": -2731.3,
+      "loss_sum": -2733.8,
+      "win_sum": 6984.7,
+      "twe_max": 0.99
+    }
+  },
+  "low_vol_osc/v2": {
+    "window": [
+      "2023-07-05",
+      "2023-11-01"
+    ],
+    "adg_pnl": 0.0004808811387925143,
+    "drawdown_worst_usd": 0.022494724536513973,
+    "loss_profit_ratio": 0.12226849554744088,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_13",
+    "fills": {
+      "fills_per_day": 3.39,
+      "frac_close_unstuck": 0.165,
+      "unstuck_pnl": -700.9,
+      "loss_sum": -719.1,
+      "win_sum": 5881.3,
+      "twe_max": 0.99
+    }
+  },
+  "strong_trend/baseline": {
+    "window": [
+      "2025-07-16",
+      "2025-09-08"
+    ],
+    "adg_pnl": 0.00045802930339697143,
+    "drawdown_worst_usd": 0.11500230365231921,
+    "loss_profit_ratio": 0.1638974011378495,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_16",
+    "fills": {
+      "fills_per_day": 2.48,
+      "frac_close_unstuck": 0.148,
+      "unstuck_pnl": -354.1,
+      "loss_sum": -361.4,
+      "win_sum": 2205.3,
+      "twe_max": 0.693
+    }
+  },
+  "strong_trend/v2": {
+    "window": [
+      "2025-07-16",
+      "2025-09-08"
+    ],
+    "adg_pnl": 0.0005390099831055132,
+    "drawdown_worst_usd": 0.11503000566277694,
+    "loss_profit_ratio": 0.2263993369095396,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_19",
+    "fills": {
+      "fills_per_day": 2.79,
+      "frac_close_unstuck": 0.208,
+      "unstuck_pnl": -638.2,
+      "loss_sum": -638.8,
+      "win_sum": 2821.4,
+      "twe_max": 0.693
+    }
+  },
+  "bear/baseline": {
+    "window": [
+      "2025-10-17",
+      "2026-04-20"
+    ],
+    "adg_pnl": 0.001466280663678843,
+    "drawdown_worst_usd": 0.056185990735338344,
+    "loss_profit_ratio": 0.054397552536170485,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_23",
+    "fills": {
+      "fills_per_day": 2.53,
+      "frac_close_unstuck": 0.143,
+      "unstuck_pnl": -1209.4,
+      "loss_sum": -1380.3,
+      "win_sum": 25374.0,
+      "twe_max": 0.99
+    }
+  },
+  "bear/v2": {
+    "window": [
+      "2025-10-17",
+      "2026-04-20"
+    ],
+    "adg_pnl": 0.0014594594960800264,
+    "drawdown_worst_usd": 0.05413852490949553,
+    "loss_profit_ratio": 0.05952400446211099,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_27",
+    "fills": {
+      "fills_per_day": 2.52,
+      "frac_close_unstuck": 0.15,
+      "unstuck_pnl": -955.3,
+      "loss_sum": -1511.4,
+      "win_sum": 25391.4,
+      "twe_max": 0.99
+    }
+  },
+  "extreme_vol/baseline": {
+    "window": [
+      "2021-05-03",
+      "2021-05-25"
+    ],
+    "adg_pnl": 0.00017645950732325444,
+    "drawdown_worst_usd": 0.008906036670212997,
+    "loss_profit_ratio": 0.0,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_30",
+    "fills": {
+      "fills_per_day": 2.66,
+      "frac_close_unstuck": 0.0,
+      "unstuck_pnl": 0.0,
+      "loss_sum": 0.0,
+      "win_sum": 317.1,
+      "twe_max": 0.139
+    }
+  },
+  "extreme_vol/v2": {
+    "window": [
+      "2021-05-03",
+      "2021-05-25"
+    ],
+    "adg_pnl": 0.00017645950732325444,
+    "drawdown_worst_usd": 0.008906036670212997,
+    "loss_profit_ratio": 0.0,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_32",
+    "fills": {
+      "fills_per_day": 2.66,
+      "frac_close_unstuck": 0.0,
+      "unstuck_pnl": 0.0,
+      "loss_sum": 0.0,
+      "win_sum": 317.1,
+      "twe_max": 0.139
+    }
+  },
+  "bear_2022-08-27/baseline": {
+    "window": [
+      "2022-08-27",
+      "2023-01-24"
+    ],
+    "adg_pnl": 0.0017448531833200145,
+    "drawdown_worst_usd": 0.26248825565757977,
+    "loss_profit_ratio": 0.08632342346623352,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_37",
+    "fills": {
+      "fills_per_day": 2.36,
+      "frac_close_unstuck": 0.238,
+      "unstuck_pnl": -1331.2,
+      "loss_sum": -1532.3,
+      "win_sum": 17751.1,
+      "twe_max": 0.99
+    }
+  },
+  "bear_2022-08-27/v2": {
+    "window": [
+      "2022-08-27",
+      "2023-01-24"
+    ],
+    "adg_pnl": 0.0017023915933890943,
+    "drawdown_worst_usd": 0.26022976601143705,
+    "loss_profit_ratio": 0.09024006738987872,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_40",
+    "fills": {
+      "fills_per_day": 2.38,
+      "frac_close_unstuck": 0.258,
+      "unstuck_pnl": -853.3,
+      "loss_sum": -1568.5,
+      "win_sum": 17381.9,
+      "twe_max": 0.99
+    }
+  },
+  "normal_osc_2023-02-09/baseline": {
+    "window": [
+      "2023-02-09",
+      "2023-07-21"
+    ],
+    "adg_pnl": -0.0005518038748071855,
+    "drawdown_worst_usd": 0.3686279754716451,
+    "loss_profit_ratio": 1.994099663998443,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_45",
+    "fills": {
+      "fills_per_day": 1.88,
+      "frac_close_unstuck": 0.717,
+      "unstuck_pnl": -3117.6,
+      "loss_sum": -3121.4,
+      "win_sum": 1565.3,
+      "twe_max": 0.99
+    }
+  },
+  "normal_osc_2023-02-09/v2": {
+    "window": [
+      "2023-02-09",
+      "2023-07-21"
+    ],
+    "adg_pnl": -0.0005261804958867234,
+    "drawdown_worst_usd": 0.3610065271706791,
+    "loss_profit_ratio": 2.101079391189905,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T00_13_49",
+    "fills": {
+      "fills_per_day": 1.69,
+      "frac_close_unstuck": 0.673,
+      "unstuck_pnl": -3005.6,
+      "loss_sum": -3017.2,
+      "win_sum": 1436.0,
+      "twe_max": 0.99
+    }
+  }
+}

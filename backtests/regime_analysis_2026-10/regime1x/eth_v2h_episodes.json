@@ -1,0 +1,1276 @@
+{
+  "normal_osc/long": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 79637.0,
+        "year_returns": {
+          "2022": -0.2039
+        },
+        "adg_pnl": -0.000934846456728933,
+        "drawdown_worst_usd": 0.31376271908102105,
+        "loss_profit_ratio": 1.161830206237634,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 123812.0,
+        "year_returns": {
+          "2023": 0.2382
+        },
+        "adg_pnl": 0.0008526324773887136,
+        "drawdown_worst_usd": 0.13191690628732805,
+        "loss_profit_ratio": 0.07403119334795248,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 93320.0,
+        "year_returns": {
+          "2024": -0.0669
+        },
+        "adg_pnl": -0.00038537890941748286,
+        "drawdown_worst_usd": 0.2779276911222934,
+        "loss_profit_ratio": 1.044320777201121,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 61738.0,
+        "year_returns": {
+          "2025": -0.3827
+        },
+        "adg_pnl": -0.0019218554853584551,
+        "drawdown_worst_usd": 0.4431128835054212,
+        "loss_profit_ratio": 1.8253431613887312,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 98549.0,
+        "year_returns": {
+          "2026": -0.0146
+        },
+        "adg_pnl": -0.00016037515099941318,
+        "drawdown_worst_usd": 0.2512946360135805,
+        "loss_profit_ratio": 0.9753345194055404,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.2039,
+      "2023": 0.2382,
+      "2024": -0.0669,
+      "2025": -0.3827,
+      "2026": -0.0146
+    },
+    "final_equity_multiple": 0.5598,
+    "seconds": 30.0
+  },
+  "normal_osc/short": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 103197.0,
+        "year_returns": {
+          "2022": 0.032
+        },
+        "adg_pnl": -1.3131369247179536e-05,
+        "drawdown_worst_usd": 0.3618120945454478,
+        "loss_profit_ratio": 0.9005767182790846,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 78286.0,
+        "year_returns": {
+          "2023": -0.2171
+        },
+        "adg_pnl": -0.0010986473294577017,
+        "drawdown_worst_usd": 0.25346191250894656,
+        "loss_profit_ratio": 2.3944010452999334,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 97044.0,
+        "year_returns": {
+          "2024": -0.0296
+        },
+        "adg_pnl": -0.000167026303254706,
+        "drawdown_worst_usd": 0.17658262569209812,
+        "loss_profit_ratio": 1.0166563202007481,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 84815.0,
+        "year_returns": {
+          "2025": -0.1519
+        },
+        "adg_pnl": -0.0006780855216499429,
+        "drawdown_worst_usd": 0.33125942995324403,
+        "loss_profit_ratio": 1.2854467332958797,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 95321.0,
+        "year_returns": {
+          "2026": -0.0468
+        },
+        "adg_pnl": -0.00033440547384459406,
+        "drawdown_worst_usd": 0.20918259446843632,
+        "loss_profit_ratio": 1.1168149270190444,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": 0.032,
+      "2023": -0.2171,
+      "2024": -0.0296,
+      "2025": -0.1519,
+      "2026": -0.0468
+    },
+    "final_equity_multiple": 0.6338,
+    "seconds": 26.7
+  },
+  "normal_osc/both": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 149304.0,
+        "year_returns": {
+          "2022": 0.4926
+        },
+        "adg_pnl": 0.0015237989987729953,
+        "drawdown_worst_usd": 0.6887237664092326,
+        "loss_profit_ratio": 0.5530217601125392,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 34670.0,
+        "year_returns": {
+          "2023": -0.6533
+        },
+        "adg_pnl": -0.0009869809420171667,
+        "drawdown_worst_usd": 0.7576581723316258,
+        "loss_profit_ratio": 9.488359202667427,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 76676.0,
+        "year_returns": {
+          "2024": -0.2334
+        },
+        "adg_pnl": 0.00017287821926773093,
+        "drawdown_worst_usd": 0.6259599104645042,
+        "loss_profit_ratio": 0.7873206886544654,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-07-16",
+        "liquidated": true,
+        "end_equity": 5000.0,
+        "year_returns": {
+          "2025": -0.95
+        },
+        "adg_pnl": -0.0015790889295098016,
+        "drawdown_worst_usd": 0.9527508891223823,
+        "loss_profit_ratio": 1.3187072415587269,
+        "hsl_liquidation": true
+      },
+      {
+        "start": "2025-07-17",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 92688.0,
+        "year_returns": {
+          "2025": -0.0733
+        },
+        "adg_pnl": -0.0008960566870028284,
+        "drawdown_worst_usd": 0.2931481021562255,
+        "loss_profit_ratio": 1.173952911317469,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 50050.0,
+        "year_returns": {
+          "2026": -0.4995
+        },
+        "adg_pnl": 0.000320041258765949,
+        "drawdown_worst_usd": 0.6105459775805315,
+        "loss_profit_ratio": 0.7345877477937224,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 1,
+    "liquidation_dates": [
+      "2025-07-16"
+    ],
+    "year_returns_compounded": {
+      "2022": 0.4926,
+      "2023": -0.6533,
+      "2024": -0.2334,
+      "2025": -0.9537,
+      "2026": -0.4995
+    },
+    "final_equity_multiple": 0.0092,
+    "seconds": 38.0
+  },
+  "low_vol_osc/long": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 34988.0,
+        "year_returns": {
+          "2022": -0.6502
+        },
+        "adg_pnl": -0.004024426326105457,
+        "drawdown_worst_usd": 0.7090652727344805,
+        "loss_profit_ratio": 1.749280391904983,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 130422.0,
+        "year_returns": {
+          "2023": 0.3043
+        },
+        "adg_pnl": 0.0009720521902476905,
+        "drawdown_worst_usd": 0.17066633983788806,
+        "loss_profit_ratio": 0.3856692193987764,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 98794.0,
+        "year_returns": {
+          "2024": -0.0123
+        },
+        "adg_pnl": -0.00022807712295936223,
+        "drawdown_worst_usd": 0.37425968666130593,
+        "loss_profit_ratio": 0.9168721094920036,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 58895.0,
+        "year_returns": {
+          "2025": -0.4112
+        },
+        "adg_pnl": -0.002282263236942114,
+        "drawdown_worst_usd": 0.4377905328421168,
+        "loss_profit_ratio": 1.3620977783945418,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 105743.0,
+        "year_returns": {
+          "2026": 0.0573
+        },
+        "adg_pnl": 0.00012236734521916252,
+        "drawdown_worst_usd": 0.2657257919085148,
+        "loss_profit_ratio": 0.8069012808072192,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.6502,
+      "2023": 0.3043,
+      "2024": -0.0123,
+      "2025": -0.4112,
+      "2026": 0.0573
+    },
+    "final_equity_multiple": 0.2808,
+    "seconds": 31.2
+  },
+  "low_vol_osc/short": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 72890.0,
+        "year_returns": {
+          "2022": -0.2711
+        },
+        "adg_pnl": -0.001288031558317263,
+        "drawdown_worst_usd": 0.43657017594306885,
+        "loss_profit_ratio": 1.2025263879481556,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 74791.0,
+        "year_returns": {
+          "2023": -0.2521
+        },
+        "adg_pnl": -0.0011519256674632156,
+        "drawdown_worst_usd": 0.30347956615201493,
+        "loss_profit_ratio": 1.721220223823192,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 80189.0,
+        "year_returns": {
+          "2024": -0.1981
+        },
+        "adg_pnl": -0.0009100288256821013,
+        "drawdown_worst_usd": 0.3284399367240751,
+        "loss_profit_ratio": 1.233644213853088,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 89904.0,
+        "year_returns": {
+          "2025": -0.101
+        },
+        "adg_pnl": -0.0004946398107466336,
+        "drawdown_worst_usd": 0.4458019554798471,
+        "loss_profit_ratio": 1.0202449129921944,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 106808.0,
+        "year_returns": {
+          "2026": 0.0681
+        },
+        "adg_pnl": 0.0004466082408137761,
+        "drawdown_worst_usd": 0.2127017212037199,
+        "loss_profit_ratio": 0.6776723163509093,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.2711,
+      "2023": -0.2521,
+      "2024": -0.1981,
+      "2025": -0.101,
+      "2026": 0.0681
+    },
+    "final_equity_multiple": 0.4198,
+    "seconds": 28.8
+  },
+  "low_vol_osc/both": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-08-13",
+        "liquidated": true,
+        "end_equity": 5000.0,
+        "year_returns": {
+          "2022": -0.95
+        },
+        "adg_pnl": -0.0018898166017358507,
+        "drawdown_worst_usd": 0.9574923734909948,
+        "loss_profit_ratio": 1.0498891243119943,
+        "hsl_liquidation": true
+      },
+      {
+        "start": "2022-08-14",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 129711.0,
+        "year_returns": {
+          "2022": 0.297
+        },
+        "adg_pnl": 0.002279653484242097,
+        "drawdown_worst_usd": 0.19530810302721593,
+        "loss_profit_ratio": 0.5178832202039289,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 125840.0,
+        "year_returns": {
+          "2023": 0.2585
+        },
+        "adg_pnl": 0.0011102424855984226,
+        "drawdown_worst_usd": 0.42233009221269857,
+        "loss_profit_ratio": 0.42488508144288656,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 89316.0,
+        "year_returns": {
+          "2024": -0.107
+        },
+        "adg_pnl": 0.0007992585552523365,
+        "drawdown_worst_usd": 0.6427139146699739,
+        "loss_profit_ratio": 0.7108026049477424,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-07-16",
+        "liquidated": true,
+        "end_equity": 5000.0,
+        "year_returns": {
+          "2025": -0.95
+        },
+        "adg_pnl": -0.000885149696860427,
+        "drawdown_worst_usd": 0.9503483958681789,
+        "loss_profit_ratio": 0.9532034591880723,
+        "hsl_liquidation": true
+      },
+      {
+        "start": "2025-07-17",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 110471.0,
+        "year_returns": {
+          "2025": 0.1047
+        },
+        "adg_pnl": 0.000765232874623743,
+        "drawdown_worst_usd": 0.3114594094314586,
+        "loss_profit_ratio": 0.7221743464420797,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 57635.0,
+        "year_returns": {
+          "2026": -0.4237
+        },
+        "adg_pnl": 0.0006954322195663545,
+        "drawdown_worst_usd": 0.5964841060420465,
+        "loss_profit_ratio": 0.7059396762621026,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 2,
+    "liquidation_dates": [
+      "2022-08-13",
+      "2025-07-16"
+    ],
+    "year_returns_compounded": {
+      "2022": -0.9352,
+      "2023": 0.2585,
+      "2024": -0.107,
+      "2025": -0.9448,
+      "2026": -0.4237
+    },
+    "final_equity_multiple": 0.0023,
+    "seconds": 41.1
+  },
+  "strong_trend/long": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 80776.0,
+        "year_returns": {
+          "2022": -0.1924
+        },
+        "adg_pnl": -0.0010674077159212709,
+        "drawdown_worst_usd": 0.35828617418241354,
+        "loss_profit_ratio": 1.2119168863668348,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 108689.0,
+        "year_returns": {
+          "2023": 0.087
+        },
+        "adg_pnl": 0.00038067469290983005,
+        "drawdown_worst_usd": 0.15702149392067696,
+        "loss_profit_ratio": 0.6151018398381385,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 110918.0,
+        "year_returns": {
+          "2024": 0.109
+        },
+        "adg_pnl": 0.0002700688522883379,
+        "drawdown_worst_usd": 0.25062778847615175,
+        "loss_profit_ratio": 0.7598240232428375,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 98891.0,
+        "year_returns": {
+          "2025": -0.0113
+        },
+        "adg_pnl": -0.00022518045515213601,
+        "drawdown_worst_usd": 0.35321687740581986,
+        "loss_profit_ratio": 0.9727748875838825,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 104499.0,
+        "year_returns": {
+          "2026": 0.0449
+        },
+        "adg_pnl": 0.00017335237109321179,
+        "drawdown_worst_usd": 0.17386613070228246,
+        "loss_profit_ratio": 0.7931807394117659,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.1924,
+      "2023": 0.087,
+      "2024": 0.109,
+      "2025": -0.0113,
+      "2026": 0.0449
+    },
+    "final_equity_multiple": 1.0063,
+    "seconds": 25.3
+  },
+  "strong_trend/short": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 108961.0,
+        "year_returns": {
+          "2022": 0.0896
+        },
+        "adg_pnl": 0.0002988170659655141,
+        "drawdown_worst_usd": 0.15399427714831773,
+        "loss_profit_ratio": 0.5395632940102868,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 93721.0,
+        "year_returns": {
+          "2023": -0.0628
+        },
+        "adg_pnl": -0.0003782381454966197,
+        "drawdown_worst_usd": 0.11500188067695744,
+        "loss_profit_ratio": 2.333356826199316,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 86500.0,
+        "year_returns": {
+          "2024": -0.135
+        },
+        "adg_pnl": -0.0006271579755648755,
+        "drawdown_worst_usd": 0.17239065103516366,
+        "loss_profit_ratio": 2.6400611233204563,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 80039.0,
+        "year_returns": {
+          "2025": -0.1996
+        },
+        "adg_pnl": -0.0009047650556713811,
+        "drawdown_worst_usd": 0.2758407782698698,
+        "loss_profit_ratio": 2.8371711283412653,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 93835.0,
+        "year_returns": {
+          "2026": -0.0616
+        },
+        "adg_pnl": -0.0003945173574468151,
+        "drawdown_worst_usd": 0.1085021810334985,
+        "loss_profit_ratio": 2.0305092767840778,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": 0.0896,
+      "2023": -0.0628,
+      "2024": -0.135,
+      "2025": -0.1996,
+      "2026": -0.0616
+    },
+    "final_equity_multiple": 0.6634,
+    "seconds": 25.7
+  },
+  "strong_trend/both": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 114379.0,
+        "year_returns": {
+          "2022": 0.1435
+        },
+        "adg_pnl": 0.00020228106909685463,
+        "drawdown_worst_usd": 0.3143219732377922,
+        "loss_profit_ratio": 0.8268783042198586,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 103395.0,
+        "year_returns": {
+          "2023": 0.034
+        },
+        "adg_pnl": 0.00011453772106948988,
+        "drawdown_worst_usd": 0.18707949013368147,
+        "loss_profit_ratio": 0.7764988930551995,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 103524.0,
+        "year_returns": {
+          "2024": 0.0351
+        },
+        "adg_pnl": 0.0006259362340417845,
+        "drawdown_worst_usd": 0.3821793512102927,
+        "loss_profit_ratio": 0.5686991407539135,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-08-13",
+        "liquidated": true,
+        "end_equity": 5000.0,
+        "year_returns": {
+          "2025": -0.95
+        },
+        "adg_pnl": -0.0021314375866429234,
+        "drawdown_worst_usd": 0.953530271581943,
+        "loss_profit_ratio": 1.6986073531166832,
+        "hsl_liquidation": true
+      },
+      {
+        "start": "2025-08-14",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 114956.0,
+        "year_returns": {
+          "2025": 0.1498
+        },
+        "adg_pnl": 0.001082310352796507,
+        "drawdown_worst_usd": 0.19725237744317137,
+        "loss_profit_ratio": 0.4605445325584799,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 88243.0,
+        "year_returns": {
+          "2026": -0.1176
+        },
+        "adg_pnl": 0.00017497613814638702,
+        "drawdown_worst_usd": 0.23349733388367946,
+        "loss_profit_ratio": 0.791174762064476,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 1,
+    "liquidation_dates": [
+      "2025-08-13"
+    ],
+    "year_returns_compounded": {
+      "2022": 0.1435,
+      "2023": 0.034,
+      "2024": 0.0351,
+      "2025": -0.9425,
+      "2026": -0.1176
+    },
+    "final_equity_multiple": 0.0621,
+    "seconds": 34.3
+  },
+  "bear/long": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 85695.0,
+        "year_returns": {
+          "2022": -0.1431
+        },
+        "adg_pnl": -0.0006259256786996793,
+        "drawdown_worst_usd": 0.3392251130025783,
+        "loss_profit_ratio": 1.4476263425326474,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 107360.0,
+        "year_returns": {
+          "2023": 0.0736
+        },
+        "adg_pnl": 0.00031713498091340633,
+        "drawdown_worst_usd": 0.04963194207600649,
+        "loss_profit_ratio": 0.09137613092914582,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 102380.0,
+        "year_returns": {
+          "2024": 0.0237
+        },
+        "adg_pnl": 5.086249787573226e-05,
+        "drawdown_worst_usd": 0.1688811393976475,
+        "loss_profit_ratio": 0.7905828571458791,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 108266.0,
+        "year_returns": {
+          "2025": 0.0826
+        },
+        "adg_pnl": 0.0002594273721689326,
+        "drawdown_worst_usd": 0.20253205820559447,
+        "loss_profit_ratio": 0.5797788125751023,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 96254.0,
+        "year_returns": {
+          "2026": -0.0375
+        },
+        "adg_pnl": -0.00024423798494706067,
+        "drawdown_worst_usd": 0.1301028262074758,
+        "loss_profit_ratio": 1.2581734928163968,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.1431,
+      "2023": 0.0736,
+      "2024": 0.0237,
+      "2025": 0.0826,
+      "2026": -0.0375
+    },
+    "final_equity_multiple": 0.9816,
+    "seconds": 28.2
+  },
+  "bear/short": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 86022.0,
+        "year_returns": {
+          "2022": -0.1398
+        },
+        "adg_pnl": -0.0007102160042068372,
+        "drawdown_worst_usd": 0.3333125877381941,
+        "loss_profit_ratio": 1.1971138569508164,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 74469.0,
+        "year_returns": {
+          "2023": -0.2553
+        },
+        "adg_pnl": -0.0016205068546765158,
+        "drawdown_worst_usd": 0.30400447107175277,
+        "loss_profit_ratio": 2.8218949117163383,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 88708.0,
+        "year_returns": {
+          "2024": -0.1129
+        },
+        "adg_pnl": -0.0005660652883405765,
+        "drawdown_worst_usd": 0.21682119891182622,
+        "loss_profit_ratio": 1.334864769613512,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 99539.0,
+        "year_returns": {
+          "2025": -0.0046
+        },
+        "adg_pnl": -0.00010362775523585388,
+        "drawdown_worst_usd": 0.3154033214378397,
+        "loss_profit_ratio": 0.9613810477678697,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 110320.0,
+        "year_returns": {
+          "2026": 0.1032
+        },
+        "adg_pnl": 0.0005230494154800896,
+        "drawdown_worst_usd": 0.11609559915842417,
+        "loss_profit_ratio": 0.5410068072137344,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.1398,
+      "2023": -0.2553,
+      "2024": -0.1129,
+      "2025": -0.0046,
+      "2026": 0.1032
+    },
+    "final_equity_multiple": 0.624,
+    "seconds": 25.3
+  },
+  "bear/both": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 126727.0,
+        "year_returns": {
+          "2022": 0.2671
+        },
+        "adg_pnl": 0.0009216898545605527,
+        "drawdown_worst_usd": 0.6765278176636421,
+        "loss_profit_ratio": 0.6241146760178703,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 31427.0,
+        "year_returns": {
+          "2023": -0.6857
+        },
+        "adg_pnl": -0.0011597959804587024,
+        "drawdown_worst_usd": 0.7915690517794298,
+        "loss_profit_ratio": 23.162439933101414,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 92958.0,
+        "year_returns": {
+          "2024": -0.0705
+        },
+        "adg_pnl": 0.0013388438250104598,
+        "drawdown_worst_usd": 0.6108402005171673,
+        "loss_profit_ratio": 0.20366753341332153,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-07-17",
+        "liquidated": true,
+        "end_equity": 5000.0,
+        "year_returns": {
+          "2025": -0.95
+        },
+        "adg_pnl": 0.0004218121957349128,
+        "drawdown_worst_usd": 0.9541732966575392,
+        "loss_profit_ratio": 0.7116587724064647,
+        "hsl_liquidation": true
+      },
+      {
+        "start": "2025-07-18",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 120343.0,
+        "year_returns": {
+          "2025": 0.2036
+        },
+        "adg_pnl": 0.001574432491323105,
+        "drawdown_worst_usd": 0.24216517462688866,
+        "loss_profit_ratio": 0.13762358098125144,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 84885.0,
+        "year_returns": {
+          "2026": -0.1512
+        },
+        "adg_pnl": 0.0005581407995713486,
+        "drawdown_worst_usd": 0.35505272597506393,
+        "loss_profit_ratio": 0.5605124152559884,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 1,
+    "liquidation_dates": [
+      "2025-07-17"
+    ],
+    "year_returns_compounded": {
+      "2022": 0.2671,
+      "2023": -0.6857,
+      "2024": -0.0705,
+      "2025": -0.9398,
+      "2026": -0.1512
+    },
+    "final_equity_multiple": 0.0189,
+    "seconds": 33.8
+  },
+  "extreme_vol/long": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 90876.0,
+        "year_returns": {
+          "2022": -0.0913
+        },
+        "adg_pnl": -0.00068149884161099,
+        "drawdown_worst_usd": 0.13191097966959897,
+        "loss_profit_ratio": 3.3620882683767075,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 100762.0,
+        "year_returns": {
+          "2023": 0.0076
+        },
+        "adg_pnl": 0.00011217297678786973,
+        "drawdown_worst_usd": 0.004117303112599751,
+        "loss_profit_ratio": 0.0,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 102271.0,
+        "year_returns": {
+          "2024": 0.0227
+        },
+        "adg_pnl": 0.00017981868812244305,
+        "drawdown_worst_usd": 0.03881584830998357,
+        "loss_profit_ratio": 0.03209112657155514,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 102496.0,
+        "year_returns": {
+          "2025": 0.0249
+        },
+        "adg_pnl": 0.0001744962266361644,
+        "drawdown_worst_usd": 0.014510074648093273,
+        "loss_profit_ratio": 0.0,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 101464.0,
+        "year_returns": {
+          "2026": 0.0146
+        },
+        "adg_pnl": 0.00020074905899845463,
+        "drawdown_worst_usd": 0.03985985916331048,
+        "loss_profit_ratio": 0.04863810818937429,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.0913,
+      "2023": 0.0076,
+      "2024": 0.0227,
+      "2025": 0.0249,
+      "2026": 0.0146
+    },
+    "final_equity_multiple": 0.9739,
+    "seconds": 27.6
+  },
+  "extreme_vol/short": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 102068.0,
+        "year_returns": {
+          "2022": 0.0207
+        },
+        "adg_pnl": 0.00015360683197832465,
+        "drawdown_worst_usd": 0.04750666972186046,
+        "loss_profit_ratio": 0.0358451482386559,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 100301.0,
+        "year_returns": {
+          "2023": 0.003
+        },
+        "adg_pnl": 5.364922393271862e-05,
+        "drawdown_worst_usd": 0.0018900133266371874,
+        "loss_profit_ratio": 0.0,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 100593.0,
+        "year_returns": {
+          "2024": 0.0059
+        },
+        "adg_pnl": 8.563975545667406e-05,
+        "drawdown_worst_usd": 0.00689527581840801,
+        "loss_profit_ratio": 0.0,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 101537.0,
+        "year_returns": {
+          "2025": 0.0154
+        },
+        "adg_pnl": 0.00017613773354300695,
+        "drawdown_worst_usd": 0.09878258527106698,
+        "loss_profit_ratio": 0.16456843827029052,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 92376.0,
+        "year_returns": {
+          "2026": -0.0762
+        },
+        "adg_pnl": 6.445567046957854e-06,
+        "drawdown_worst_usd": 0.1037026681844734,
+        "loss_profit_ratio": 0.7349083369065075,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": 0.0207,
+      "2023": 0.003,
+      "2024": 0.0059,
+      "2025": 0.0154,
+      "2026": -0.0762
+    },
+    "final_equity_multiple": 0.9659,
+    "seconds": 26.0
+  },
+  "extreme_vol/both": {
+    "episodes": [
+      {
+        "start": "2022-01-01",
+        "end": "2022-12-30",
+        "liquidated": false,
+        "end_equity": 92397.0,
+        "year_returns": {
+          "2022": -0.0761
+        },
+        "adg_pnl": -0.0004315171301197728,
+        "drawdown_worst_usd": 0.15300631880294277,
+        "loss_profit_ratio": 2.2320569928027263,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2023-01-01",
+        "end": "2023-12-30",
+        "liquidated": false,
+        "end_equity": 101058.0,
+        "year_returns": {
+          "2023": 0.0106
+        },
+        "adg_pnl": 0.00010892501877676595,
+        "drawdown_worst_usd": 0.0038308964441272336,
+        "loss_profit_ratio": 0.0,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2024-01-01",
+        "end": "2024-12-30",
+        "liquidated": false,
+        "end_equity": 102887.0,
+        "year_returns": {
+          "2024": 0.0288
+        },
+        "adg_pnl": 0.00018854971995517608,
+        "drawdown_worst_usd": 0.038899914312184654,
+        "loss_profit_ratio": 0.025567883783338616,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2025-01-01",
+        "end": "2025-12-30",
+        "liquidated": false,
+        "end_equity": 103754.0,
+        "year_returns": {
+          "2025": 0.0375
+        },
+        "adg_pnl": 0.0002205374522199864,
+        "drawdown_worst_usd": 0.12591152166852787,
+        "loss_profit_ratio": 0.12004303481841194,
+        "hsl_liquidation": false
+      },
+      {
+        "start": "2026-01-01",
+        "end": "2026-09-30",
+        "liquidated": false,
+        "end_equity": 93890.0,
+        "year_returns": {
+          "2026": -0.0611
+        },
+        "adg_pnl": 0.00014697988185698096,
+        "drawdown_worst_usd": 0.10064768586407716,
+        "loss_profit_ratio": 0.17027121951313515,
+        "hsl_liquidation": false
+      }
+    ],
+    "n_liquidations": 0,
+    "liquidation_dates": [],
+    "year_returns_compounded": {
+      "2022": -0.0761,
+      "2023": 0.0106,
+      "2024": 0.0288,
+      "2025": 0.0375,
+      "2026": -0.0611
+    },
+    "final_equity_multiple": 0.9359,
+    "seconds": 31.6
+  }
+}

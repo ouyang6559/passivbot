@@ -1,0 +1,18 @@
+{
+  "ema_anchor": {
+    "adg_pnl": -0.00010362775523585388,
+    "drawdown_worst_usd": 0.3154033214378397,
+    "loss_profit_ratio": 0.9613810477678697,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T02_56_04"
+  },
+  "trailing_grid_v7": {
+    "adg_pnl": -0.0011597959804587024,
+    "drawdown_worst_usd": 0.7915690517794298,
+    "loss_profit_ratio": 23.162439933101414,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "run_dir": "backtests/binance/2026-10-02T02_56_22"
+  }
+}
