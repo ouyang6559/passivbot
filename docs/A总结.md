@@ -4,6 +4,26 @@
 
 hsl.enabled=true  防止极端行情直接止损 
 
+
+Tier 1：SSS级 — 综合最优
+sol 多空
+BTC多
+ETH多
+S级别：
+avax、doge、uni、link多空
+A：
+bnb多、xrp、ltc两个多空
+
+B：
+ada多、dot小仓位、xmr门罗币（不推荐）
+
+
+核心结论：从回测数据+流动性+社区实战三维交叉验证，
+SOL是Passivbot马丁策略的绝对首选（波动大、深度好、回撤频繁），
+其次是BTC/ETH作为安全底仓。
+高波动四天王（SOL/DOGE/AVAX/UNI）适合追求收益，但必须严格控制TWEL。XMR不推荐。
+
+
 xmr 10倍杠杆多空双向持仓   就是两核两g的服务器，一年109元   
 
 

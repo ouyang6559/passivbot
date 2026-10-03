@@ -240,13 +240,52 @@
     "analysis_metrics_done": true
   },
   "DOGE/long": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_07_38",
+    "seconds": 24.8,
+    "adg_pnl": 0.0016726086514493,
+    "mdg_pnl": 0.00045470681098990493,
+    "drawdown_worst_usd": 0.6647530677103132,
+    "loss_profit_ratio": 0.34737210842269745,
+    "peak_recovery_hours_pnl": 8598.7,
+    "position_held_hours_max": 8596.9,
+    "position_unchanged_hours_max": 714.8,
+    "volume_pct_per_day_avg_w": 0.090252190231315,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 7954.0,
+    "analysis_metrics_done": true
   },
   "DOGE/short": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_07_48",
+    "seconds": 6.9,
+    "adg_pnl": 0.0013047593953405537,
+    "mdg_pnl": 0.0003610558376897805,
+    "drawdown_worst_usd": 0.9638076557971414,
+    "loss_profit_ratio": 0.22196658706710823,
+    "peak_recovery_hours_pnl": 195.36666666666667,
+    "position_held_hours_max": 195.35,
+    "position_unchanged_hours_max": 133.58333333333334,
+    "volume_pct_per_day_avg_w": 0.13038265162645096,
+    "backtest_completion_ratio": 0.17386167146974063,
+    "liquidated": true,
+    "n_fills": 1515.0,
+    "analysis_metrics_done": true
   },
   "DOGE/both": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_08_01",
+    "seconds": 15.5,
+    "adg_pnl": 0.0008511918915755991,
+    "mdg_pnl": 0.00017195732181004804,
+    "drawdown_worst_usd": 0.468727412596342,
+    "loss_profit_ratio": 0.1978049214616716,
+    "peak_recovery_hours_pnl": 2155.8333333333335,
+    "position_held_hours_max": 2047.8833333333334,
+    "position_unchanged_hours_max": 719.4166666666666,
+    "volume_pct_per_day_avg_w": 0.07426776206628291,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 8791.0,
+    "analysis_metrics_done": true
   },
   "ADA/long": {
     "run_dir": "backtests/binance/2026-10-02T22_01_29",
@@ -345,13 +384,52 @@
     "analysis_metrics_done": true
   },
   "LINK/long": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_08_29",
+    "seconds": 29.2,
+    "adg_pnl": 0.0004932963776586439,
+    "mdg_pnl": 0.00031345111168768836,
+    "drawdown_worst_usd": 0.7334095800201741,
+    "loss_profit_ratio": 0.7886783725030055,
+    "peak_recovery_hours_pnl": 18545.683333333334,
+    "position_held_hours_max": 15788.9,
+    "position_unchanged_hours_max": 719.2833333333333,
+    "volume_pct_per_day_avg_w": 0.09202850020575276,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 5279.0,
+    "analysis_metrics_done": true
   },
   "LINK/short": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_08_40",
+    "seconds": 7.6,
+    "adg_pnl": 0.001731904044117098,
+    "mdg_pnl": 0.0004173809634478008,
+    "drawdown_worst_usd": 0.980290302995808,
+    "loss_profit_ratio": 0.1859247015649288,
+    "peak_recovery_hours_pnl": 1211.9666666666667,
+    "position_held_hours_max": 1211.95,
+    "position_unchanged_hours_max": 719.1,
+    "volume_pct_per_day_avg_w": 0.1542206943049529,
+    "backtest_completion_ratio": 0.407245837335895,
+    "liquidated": true,
+    "n_fills": 3698.0,
+    "analysis_metrics_done": true
   },
   "LINK/both": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_08_54",
+    "seconds": 16.2,
+    "adg_pnl": 0.000874201146618042,
+    "mdg_pnl": 0.00020776970996775089,
+    "drawdown_worst_usd": 0.7734922378194147,
+    "loss_profit_ratio": 0.23564893537377724,
+    "peak_recovery_hours_pnl": 12845.566666666668,
+    "position_held_hours_max": 6957.8,
+    "position_unchanged_hours_max": 716.5,
+    "volume_pct_per_day_avg_w": 0.09506364313037731,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 9310.0,
+    "analysis_metrics_done": true
   },
   "DOT/long": {
     "run_dir": "backtests/binance/2026-10-02T22_03_25",
@@ -482,15 +560,67 @@
     "analysis_metrics_done": true
   },
   "LTC/both": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_05_53",
+    "seconds": 25.4,
+    "adg_pnl": 0.0009201242160869236,
+    "mdg_pnl": 0.0002584907325123369,
+    "drawdown_worst_usd": 0.2515537778902362,
+    "loss_profit_ratio": 0.20783935091415423,
+    "peak_recovery_hours_pnl": 5128.266666666666,
+    "position_held_hours_max": 4751.933333333333,
+    "position_unchanged_hours_max": 717.5333333333333,
+    "volume_pct_per_day_avg_w": 0.12364426995562963,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 12274.0,
+    "analysis_metrics_done": true
   },
   "XMR/long": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_06_21",
+    "seconds": 30.4,
+    "adg_pnl": 0.0011326670150461978,
+    "mdg_pnl": 0.0003713839897654612,
+    "drawdown_worst_usd": 0.4822705470060897,
+    "loss_profit_ratio": 0.3507319092367352,
+    "peak_recovery_hours_pnl": 6121.683333333333,
+    "position_held_hours_max": 5343.4,
+    "position_unchanged_hours_max": 719.9666666666667,
+    "volume_pct_per_day_avg_w": 0.22306594706864452,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 6741.0,
+    "analysis_metrics_done": true
   },
   "XMR/short": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_06_40",
+    "seconds": 16.7,
+    "adg_pnl": 0.001232377104073809,
+    "mdg_pnl": 0.0003174712374993029,
+    "drawdown_worst_usd": 0.6449372317784405,
+    "loss_profit_ratio": 0.254043548356681,
+    "peak_recovery_hours_pnl": 3938.5666666666666,
+    "position_held_hours_max": 2527.0833333333335,
+    "position_unchanged_hours_max": 719.35,
+    "volume_pct_per_day_avg_w": 0.23394988665213817,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 7261.0,
+    "analysis_metrics_done": true
   },
   "XMR/both": {
-    "error": "exit 1"
+    "run_dir": "backtests/binance/2026-10-02T22_06_56",
+    "seconds": 15.8,
+    "adg_pnl": 0.0007110189721699819,
+    "mdg_pnl": 0.00020543282772852436,
+    "drawdown_worst_usd": 0.34657821173561715,
+    "loss_profit_ratio": 0.19014381668419253,
+    "peak_recovery_hours_pnl": 3773.2833333333333,
+    "position_held_hours_max": 2747.4666666666667,
+    "position_unchanged_hours_max": 717.7166666666667,
+    "volume_pct_per_day_avg_w": 0.10286839040604052,
+    "backtest_completion_ratio": 1.0,
+    "liquidated": false,
+    "n_fills": 8598.0,
+    "analysis_metrics_done": true
   }
 }
