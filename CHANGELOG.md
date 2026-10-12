@@ -6,11 +6,249 @@ since the latest release tag; these features may already be available when insta
 
 ## Unreleased
 
+- Stop candle pagination when an exchange repeats or regresses its response tail, avoiding repeated sparse-page requests while holding the fetch lock. Keep already fetched rows and leave unresolved tails unavailable.
+
+- Keep runtime config fingerprints stable across restarts with identical config content by excluding the timestamped loader transformation audit trail. Existing runtime manifests retain their original hashes.
+
+- Fix historical candle-resolution seams when retained 1m history begins inside a higher-timeframe bucket. A straddling coarse bucket may now reconstruct the missing pre-boundary minutes when the overlapping exact 1m interval is complete, preserving extrema known to belong to the missing prefix and leaving exact rows unchanged. Genuine internal 1m gaps remain unavailable.
+
+- Reject individual GPU suite candidates with invalid aggregated metrics, matching the CPU optimizer, instead of terminating the entire optimization batch.
+
+- Fix live-only editable installs failing during config loading: cooldown and EMA
+  migrations no longer import backtest/optimizer runtimes. Declare the optimizer
+  fingerprinting dependency in full installs.
+
+- Name optimizer, backtest, suite and iterative sessions with UTC dates, readable coin
+  labels, deterministic setup fingerprints and unique run IDs. Record generated optimizer
+  seeds for comparison and resume, and freeze selected starting configs before execution.
+  Suite scenarios now write artifacts directly under their scenario directory, keeping
+  exchange subdirectories only for multiple results. Suite summaries expose layout version,
+  relative artifact paths and actual scenario timing. This changes generated output paths;
+  existing results are preserved and optimizer resume retains its original directory.
+
+- Add `passivbot tool clean-config` for full canonical cleanup, lean live/backtest/optimizer
+  exports and formatting-only JSON. Support explicit source/destination paths, opt-in atomic
+  in-place replacement, bounded directory scans, dry-run/check modes and overwrite protection.
+
+- Make excess allowance always bounded by side TWEL, removing its policy selector.
+  Older explicit bounded selectors are removed with a warning; explicit raw policies
+  stop configuration loading with a field path and revalidation instructions, including
+  overrides and scenarios. Add global per-side `hsl.scale_budget_with_excess_allowance`
+  (default `false`) for coin HSL: optionally scale current and terminal balance budgets
+  by each coin's bounded headroom across live, CPU backtests and GPU optimization.
+
+- Add optimizer `-ltwel` and `-stwel` aliases for wallet exposure bounds, accepting fixed
+  values or ranges. GPU setup now uses the bounds-clamped seed, allowing bounds to enable
+  or disable a side relative to the input config while keeping side topology fixed throughout
+  the search.
+
+- Expose HSL candle-source failure types and fetch/cache stages in bounded status diagnostics,
+  with a compact console cause and transitions when failures change or recover.
+
+- Resume incomplete native candle history from missing spans with a small overlap, so bounded
+  reads retain progress across deadlines and restarts instead of repeating a cached prefix.
+
+- Avoid repeated unrelated execution-history scans when reconstructing backtest HSL scopes.
+- Apply GPU exact worker auto-tuning during seed validation, draining admitted work before pool changes and accounting for observed private worker memory.
+
+
+- Fix HSL migration on live-only installations when the config selects the GPU optimizer,
+  keeping static HSL validation independent of optional optimizer and GPU runtime imports.
+
+- Allow disabled legacy HSL configurations to load with a warning after CLI changes,
+  clearing retired engine selection and dormant restart authorization. Enabled legacy HSL
+  still requires migration, including override files, optimizer fixed overrides and suite
+  scenarios. Fresh optimizer seeds accept legacy HSL parameter values best effort under
+  the main config's current policy and reevaluate fitness.
+- Add `passivbot tool migrate-hsl input.json --in-place` to atomically replace a config
+  after complete validation, preserving ownership and permissions and leaving the input unchanged on failure.
+
+- Format generated configs, dashboard config exports and crash-suite configs more compactly,
+  keeping short objects and lists on one line while retaining indentation for larger sections.
+  Preserve serialization policies, including strict JSON validation in
+  `passivbot tool migrate-hsl`; internal analysis, metadata and diagnostic reports retain
+  ordinary JSON formatting.
+- Reduce CUDA optimizer suite preparation memory by streaming packed market inputs and coin subsets to run-local files instead of allocating full copies in host RAM.
+
+- Allow `optimize.n_cpus: null` with GPU automatic worker sizing, and show exact-validation
+  queue activity, oldest pending age, next-result estimates and elapsed phase time in the
+  bounded optimizer progress summaries. Overdue or uncalibrated estimates remain unknown.
+
+- Avoid rebuilding minute-by-minute HSL valuation history for an observed flat coin/side
+  with no retained fills. This speeds up exact validation in single-side optimization suites
+  while preserving held-position protection, retained episode replay, and detailed HSL exports.
+
+- Improve default GPU auto tuning for long single-coin HSL optimizations: gather temporal
+  evidence on both directional and one-sided replays, release inactive suite scratch, and size
+  active history buffers from available memory. Trial CPU worker counts from completed exact
+  work, coordinating with GPU/queue trials and draining validations before pool changes. Show
+  applied workers and a scoped generation ETA from recent completed generations.
+- Let GPU replay liquidate finite depleted cash before another HSL observation, avoiding a
+  false missing-valuation error after terminal closes. Keep genuine valuation and controller
+  failures distinct and fatal. Reduce exact HSL reconstruction allocations by borrowing immutable
+  snapshot prices and projecting ordered simulator closes without general candle arbitration;
+  historical clipping, diagnostics, and trading results remain unchanged.
+- Hydrate missing Forager unilateralness weight/span and adaptive entry cooldown
+  weight/minimum-duration optimizer bounds as fixed ranges at each side's configured
+  value. Also expose a fixed maximum-duration bound when a finite ceiling is configured;
+  a null ceiling remains unbounded. Parsed and cleaned configs expose these parameters
+  without opening new search ranges; explicit bounds are preserved.
+
+- Bound CUDA multicoin suite memory by keeping only the active market dataset resident on the
+  GPU and spilling inactive immutable packing to temporary files. Release inactive proxies'
+  replay buffers even when they share that dataset. Preserve scenario grouping,
+  screening, and exact validation. Apply the 45% invariant-memory cap to initial free VRAM and
+  check current availability on every activation, avoiding failures from accumulating datasets
+  or repeatedly shrinking the budget after CUDA workspace allocation. Keep the original error
+  or interrupt when secondary cleanup fails.
+
+- Make HSL balance reporting passive and retryable: show one initial snapshot even when equity
+  inputs are unavailable, retain failed publications for retry, and keep unchanged/raw-only
+  updates off the console without adding fetches or affecting trading decisions.
+
+- Show each Pareto objective's full range at INFO in ascending `[min,max]` order, with `*` on
+  an improved goal-directed best endpoint. Keep new tradeoffs visible when no best improves,
+  and derive both endpoints from the same feasible or explicitly labelled infeasible front.
+
+- GPU optimization now defaults to hardware/RAM-aware initial exact-validation worker sizing and
+  continuous exact-queue tuning for omitted, null, or `"auto"` worker/queue settings. Queue trials
+  use bounded evidence windows including queue-induced admission stalls, adapt sooner for expensive
+  validations, coordinate with GPU batch tuning, and reuse compatible local measurements. Worker
+  sizing includes lazy suite views and physical cores within CPU affinity; unfinished one-shot GPU
+  trials cannot block queue calibration. Positive numbers remain fixed; explicit zero retains legacy sizing.
+
+- Replace legacy HSL with one Rust-owned, best-effort equity-drawdown controller
+  for live, fake, backtest and optimizer paths. Current RED authorizes panic;
+  recovery cancels it. Terminal RED starts cooldown, renewed exposure clears it,
+  and all retained history is bounded by lookback. Remove obsolete tiers, engine
+  selection, terminal-threshold and recovery-grace controls and their implementations.
+  Update public examples, migration guidance, tests and HSL documentation. Migrate
+  and re-backtest existing HSL configurations; saved optimizer fitness is invalidated.
+  Development package version is `8.2.0.dev0`, with config schema `v8.6.0`.
+  The v8 package line does not imply compatibility with previous HSL semantics.
+  Validate public examples through effective optimizer policies; the BTC example now
+  uses supported BTC equity peak-recovery hours for its 28-day recovery limit
+  and the currency-independent realized loss/profit ratio metric.
+  Enforce the documented aggregate HSL balance-override restriction before live
+  credential lookup and capture. Reject explicit retired engine selectors and pre-v8.6 HSL inputs that omit them;
+  require explicit semantic migration before schema hydration, including referenced
+  file-backed coin overrides and legacy `-lc` references. Reject runtime schema-version
+  overrides before any CLI mutation. External suite files use
+  the raw base schema for the same migration gate before normalization. Explicit
+  migration materializes legacy root coin flags so their file policies survive conversion. Include resting
+  orders in HSL scopes so flat, unselected coins can retire stale panic orders
+  without ordinary planning or flat-symbol quotes when only unusable history rows remain;
+  retain their diagnostics. Keep the fake HSL example on automatic GPU exact sizing. Restore account-change
+  reporting after protection without letting slow diagnostics block subsequent passes.
+  Skip protective quote requests when HSL
+  is disabled. Preflight uses the active portfolio policy in unified mode, and
+  smoke/dashboard views consume scoped status observations with stale and omitted
+  evidence explicit.
+  Remove retired replay diagnostic panels; offline HSL previews now read scoped
+  observations and mark expired captures stale. GPU panic-loss ratios include completed,
+  recovered and unfinished panic segments without consuming reporting state.
+- Live console health now distinguishes active trailing input waits, fill freshness, recent cycle/write activity, and pending HSL preparation. Recovery records show observed blocker phases; candle cache notices identify their warmup scope. HSL reasons remain readable, shared candle receive failures are coalesced with durable per-symbol details, and routine KuCoin history re-fetches stay at DEBUG.
+- Command log archives use unique run suffixes so simultaneous starts and long shared command prefixes cannot select the same file. Live log prefixes include the configured user.
+- Structured cycle timings retain numeric authoritative refresh durations and report finite HSL protective passes separately from overlapping ordinary preparation.
+- Fix slow GPU automatic batch calibration on long histories: preserve the existing bounded
+  dispatch width when memory headroom permits it and gather rolling evidence from completed
+  temporal chunks, applying trials between successful full candidate replays rather than waiting
+  for dozens of full-history batches.
+  Consume at most one tuning/cooldown window per replay to bound repeated unproductive trials.
+
+- Add opt-in adaptive entry cooldown and Forager RMS unilateralness scoring for
+  sustained one-way price action. Cooldown uses additive exposure-ratio and adverse-directionality
+  weights with a floor/ceiling; RMS shares a floating-point EMA span across both consumers and
+  decays during flat prices. Move the base duration to `bot.<side>.entry_cooldown` (schema v8.5.0),
+  retaining legacy config/CLI/optimizer aliases, numeric defaults, and disabled-feature behavior.
+  New weights and optimizer dimensions remain opt-in. Metal/CUDA GPU screening supports both
+  features for EMA Anchor and Trailing Martingale, including per-coin cooldown overrides;
+  start a fresh GPU search because the parameter layout changed.
+  Replay completed-candle windows consistently in live/CPU, wait for all compared scores before
+  ranking, and scope unavailable inputs to their consumers so closes remain independent.
+  Constant clamps, including effective GPU coin overrides, need no modifier inputs. Validate optimizer bounds, coin overrides and candle
+  intervals against reachable consumers while keeping RMS history separate from shared activation.
+  Size history from eligible coin-side consumers and finalized optimizer pins; omit unused global
+  cooldown horizons for explicit resolved or empty universes while retaining held graceful-stop
+  policies. Skip dormant RMS scoring and history when each side's eligible universe fits
+  fixed slots without dynamic WEL, including aggregated GPU candles. Retry GPU EMA Anchor
+  ranking after newly eligible coins finish warming up. Keep omitted adaptive optimizer
+  bounds fixed at their configured values.
+  Defer cooldown inputs
+  that become stale during loading. Reuse live RMS replay within a completed minute, invalidating
+  results on candle repairs or gap evidence; cache-only ranking uses the latest complete
+  contiguous window within its original source-age allowance, including before an internal gap.
+  Report enabled unilateralness ranking totals from Rust diagnostics in the monitor.
+  Document all four scoring weights, configuration, benchmarks, effective cooldown inspection,
+  and unchanged partial-fill semantics.
+
+- Report every accepted Pareto member with all configured objective bests, respecting max/min
+  goals and marking new bests while retaining tradeoffs that improve no extremes. GPU logs now
+  identify generations, phases, scenario groups, candidate batches and history/kernel work, with
+  periodic run/Pareto/exact progress, readable scoped ETAs and clearer auto-tune evidence. Coalesce
+  repeated drift warnings without changing validation or safety halt decisions.
+
+- Reduce optimizer console noise with minute-spaced GPU replay summaries,
+  replay percentage, throughput and ETA, and exact seed-validation progress. Aggregate
+  seed-clamp warnings and retain per-candidate metrics and clamp details at DEBUG. Resumed
+  Pareto updates exclude historical reconstruction and use restored evaluation counts.
+
+- GPU optimization now tunes automatic candidate batch sizes during actual screening, using rolling
+  throughput evidence, bounded trials, memory headroom, and reusable local calibration records.
+  Numeric batch sizes remain fixed; `optimize.gpu.tuning_mode` supports `auto`, `refresh`, and `off`.
+  GPU population, batch, and dispatch-envelope settings accept `"auto"` alongside `null`.
+
+- Reject HSL configuration migration when optimizer mirroring would overwrite an explicitly chosen restart policy. Matching policies remain supported. Preserve canonically normalized restart choices supplied by unified portfolio policy files when reconciling fixed optimizer overrides, and support scenario paths into file-derived coin policy fields without changing file/inline precedence. Validate migrated optimizer metrics against effective scenario policies, retain ordered coin-mapping replacements, and reject unsupported GPU candle intervals before writing output.
+
+- Improve GPU optimizer parity with exact Rust: apply the same forager-weight
+  normalization and bound quantization, refresh Trailing Martingale flat-coin rankings
+  each candle, grant selection hysteresis only to existing entry orders, and size
+  raw-touch entries before executable-price finalization. Multi-coin Trailing Martingale
+  auto-unstuck now honors the configured rolling PnL lookback, including fees and shared
+  long/short accounting.
+  Start a fresh GPU run after this update; older GPU checkpoints contain incompatible
+  screening scores. Existing result configs remain usable as starting configs.
+
+- Use configured BTC price sources for multi-exchange backtests and optimizations in both online and offline modes, retaining Binance priority when configured and Binance as the final fallback otherwise. This can change BTC-denominated results; offline runs no longer require unrelated Binance candles. Prepared caches are rebuilt for the new policy, and candidates lacking the full requested BTC history are skipped.
+
+- Record completed GPU optimizer CPU validations during the following GPU proxy pass and report exact progress immediately, while keeping resumable checkpoints at completed generation boundaries.
+
+- Reduce repeated fill-history reconstruction after successful empty refreshes once full replay
+  proves the history unchanged; keep fetches, coverage, checkpoints and enrichment processing intact.
+
+- Reduce repeated strategy resolution during live warmup and market diagnostics, keeping reuse
+  local to each synchronous calculation so subsequent calculations observe current settings.
+
+- Reduce live candle ingestion CPU use for ordered appends and open-candle replacements, and
+  avoid searching historical gaps outside incoming rows while preserving overwrite and retry rules.
+
+- Add an offline `passivbot tool migrate-hsl` helper that validates a separately saved HSL
+  configuration, requires explicit replacement of unsupported enabled restart policies, and
+  refuses input/output overwrite. Resolve and validate file-backed coin policies into inline
+  overrides including scenario-local patches, validate effective optimizer/scenario policies,
+  preserve explicit restart choices through optimization, and reject inactive fixed
+  parameter selectors.
+
+- Fix forager WebSocket candle ingestion at UTC day rollover when the new day's shard
+  does not exist yet. Reject unavailable existing shards, preserve finality and verified
+  persistence, and distinguish receive
+  failures from local ingestion failures in fallback warnings.
+
 - Remove redundant per-symbol sleeps during live EMA preparation while preserving remote candle
   request pacing. Add bounded per-symbol and stage timings to structured EMA completion events.
 
 - Orient 2D Pareto plot axes so the ideal point is always toward the lower-left,
   reversing maximization axes while preserving metric values and 3D orientation.
+
+- Let `pareto-plot` use the latest populated optimizer front when PATH is omitted, and save
+  default plots under `pareto_plots/` with names derived from the input run or file.
+
+- Highlight the Pareto member closest to the normalized ideal with a star in the plot
+  explorer, while retaining the theoretical ideal as an open diamond. Both update with limits.
+
+- Expand the Pareto plot HTML into an offline explorer with all saved metrics, 2D/3D
+  axis selectors, persistent floor/ceiling sliders, and a highlighted theoretical ideal
+  that updates from the filtered candidates.
 
 - Add `passivbot tool pareto-plot` for offline interactive 2D and rotatable 3D objective
   scatter plots, with candidate hover details, metric discovery, and PNG export.
@@ -20,7 +258,7 @@ since the latest release tag; these features may already be available when insta
   timing and order-refresh mechanics in DEBUG. Summarize replaced HSL observations without hiding
   current outages or RED transitions; retain detailed structured events and concise warnings.
 
-- Reduce repeated revised-HSL console summaries with bounded transition-aware admission,
+- Reduce repeated HSL console summaries with bounded transition-aware admission,
   retaining immediate scope/risk/availability changes and full structured events. Console summaries
   identify estimated inputs explicitly and aggregate equivalent updates at most every five minutes;
   estimate-free recovery events now use a valid registered status.
@@ -38,7 +276,7 @@ since the latest release tag; these features may already be available when insta
   one-way and reduce-only orders, cross/isolated margin, leverage, live and historical market data, and
   paginated fill/PnL history with restart reconstruction. See the Lighter setup guide.
 
-- Reduce revised live HSL candle-processing CPU use by retaining immutable native source rows and avoiding per-minute temporary allocations; every projection and risk decision still uses the current observation window and account inputs.
+- Reduce live HSL candle-processing CPU use by retaining immutable native source rows and avoiding per-minute temporary allocations; every projection and risk decision still uses the current observation window and account inputs.
 
 - Replace GPU successive halving with one scenario-based screening pass: select
   `optimize.gpu.screening.scenarios`, promote a Pareto-diverse subset, then evaluate survivors
@@ -48,92 +286,77 @@ since the latest release tag; these features may already be available when insta
 
 - Add `backtest.limit_order_fill_buffer_pct` (default `0.0`) to require a strict additional price
   crossing before limit fills. The buffer uses a fraction of the order price, leaves market
-  execution unchanged, and is supported by CPU backtests and optimization. GPU optimization
-  rejects nonzero values.
+  execution unchanged, and is supported by CPU backtests and CPU/GPU optimization, including
+  suite overrides. GPU fill boundaries are prepared once without changing kernels; caches and
+  checkpoints distinguish fill assumptions.
 
 - Default Bitunix live quote refreshes to the requested symbols so unrelated quiet markets cannot
   delay protective or ordinary order planning. Explicit bulk overrides remain supported.
 
-- Reconcile incomplete revised-HSL fill history locally, preserving completed episodes when a
+- Reconcile incomplete HSL fill history locally, preserving completed episodes when a
   new position arrives before its entry fill and retaining losses from partial-close histories.
 - Share a coin-side position/fill settling gate across trading actions: start qualifying fill
   reads at least five seconds after a noticed position change, with a 15-second hard cap per
   unresolved burst so failed requests or repeated changes cannot indefinitely block this gate.
 
-- Make revised-HSL per-minute backtest diagnostics opt-in with `backtest.hsl_detailed_report=true`. Default backtests retain summaries and RED/flat/restart events with lower runtime and memory use; enable the option for full traces and HSL drawdown plots. Trading results and analysis metrics are unchanged.
+- Make HSL per-minute backtest diagnostics opt-in with `backtest.hsl_detailed_report=true`. Default backtests retain summaries and RED/flat/restart events with lower runtime and memory use; enable the option for full traces and HSL drawdown plots. Trading results and analysis metrics are unchanged.
 
-- Speed up revised HSL backtests by converting diagnostic samples directly to Python, without an intermediate JSON tree; preserve complete reports and skip unused sample construction during optimizer evaluations. Compute worst-percentile statistics by selecting and sorting only the required tail, and avoid unused EMA suffix statistics.
+- Speed up HSL backtests by converting diagnostic samples directly to Python, without an intermediate JSON tree; preserve complete reports and skip unused sample construction during optimizer evaluations. Compute worst-percentile statistics by selecting and sorting only the required tail, and avoid unused EMA suffix statistics.
 
-- Make offline revised-HSL replay comparisons insensitive to async scheduler pass counts,
+- Make offline HSL replay comparisons insensitive to async scheduler pass counts,
   while retaining raw diagnostics and strict trading/readiness comparisons. Settle pending
   history reads within the existing bounded fake-cycle loop before advancing scenario time.
 
-- Reduce revised-HSL CPU allocations by streaming the shared numerical signal into
+- Reduce HSL CPU allocations by streaming the shared numerical signal into
   its controller and reusing validated simulator buffers and policy references.
   Diagnostic output, current decisions, and reconstruction fallbacks are preserved.
-- Reduce revised-HSL Trailing Martingale Metal optimizer overhead by sizing private arrays to
+- Reduce HSL Trailing Martingale Metal optimizer overhead by sizing private arrays to
   the prepared coin count, preserving full-capacity results and temporal replay.
 
-- Support revised HSL in multi-coin Metal/CUDA optimization for both strategy families,
+- Support HSL in multi-coin Metal/CUDA optimization for both strategy families,
   all signal modes and one or both position sides, with bounded independent history,
   static coin-policy overrides, exact Rust validation and checkpoint resume.
 
-- Further reduce revised-HSL replay allocations by reading bounded episode samples
+- Further reduce HSL replay allocations by reading bounded episode samples
   directly, preserving duplicate-minute observations and the numerical reference.
 
-- Reduce revised-HSL GPU history memory by storing compact minute samples and
+- Reduce HSL GPU history memory by storing compact minute samples and
   summaries of completed blocks, preserving same-minute peak/EMA updates and
   bounded-lookback behavior while allowing larger candidate batches.
 
-- Support revised-HSL single-coin GPU optimization on Metal and CUDA in coin, pside
+- Support HSL single-coin GPU optimization on Metal and CUDA in coin, pside
   and unified modes, including canonical policy bounds, exact Rust validation and resume.
   GPU history scratch is bounded
   and current-equity signal arithmetic has parity coverage.
 
 
-- Further accelerate revised-HSL backtests and CPU optimization by retaining factual
+- Further accelerate HSL backtests and CPU optimization by retaining factual
   PNL/UPNL traces between ordinary fills and balance changes, while reevaluating the shared
   controller against the current inputs. Episode/window changes still rebuild history.
 
-- Accelerate revised-HSL backtests and CPU optimization by replaying only the latest
+- Accelerate HSL backtests and CPU optimization by replaying only the latest
   relevant episode and incrementally evaluating unchanged observations. Fills, budget/slot
   changes, lookback clipping and sensitive numeric comparisons rebuild the shared reference.
-
-- Anchor revised HSL to scoped current equity and revoke panic as soon as the current
-  raw/EMA signal recovers. Only terminal RED in the latest episode starts cooldown;
-  renewed exposure clears it. Remove the revised cooldown-intervention option and retire
-  recovered panic orders without waiting for ordinary strategy inputs. Legacy is unchanged.
 
 - Report bounded optimizer population and starting-config progress every five minutes while CPU
   evaluations are still pending, including completed, pending, elapsed, rate and estimated time.
 
-- Reduce private-state pressure for single-side multi-coin EMA Anchor GPU
-  optimization when every candidate and coin override disables legacy HSL. The
-  specialized kernel removes unreachable per-coin controller state and HSL scans
-  while retaining forced-delist diagnostics and optional per-coin fill metrics.
-  Per-coin fill counting remains disabled unless required by scoring or limits.
-
-- Reduce revised HSL replay allocations and repeated exact-cashflow summation without
+- Reduce HSL replay allocations and repeated exact-cashflow summation without
   changing reconstructed signals, lifecycle decisions, or diagnostics.
 
-- Expose `--hsl-engine legacy|revised` (also `--live.hsl_engine`) in backtest and optimizer startup CLI
-  overrides, matching the existing JSON selector. Legacy remains the default.
-
-
-- Revised HSL services completed ordinary plans before the next account refresh can invalidate
+- HSL services completed ordinary plans before the next account refresh can invalidate
   them. Slow preparation tolerates raw-balance drift while preserving its strategy inputs;
   final Rust calculation and connector admission still require the same raw balance, so
   realized-loss, exposure and HSL risk checks remain authoritative. Empty plans retain their
-  account/fill receipt, and shutdown prevents further revised protective or ordinary submissions.
+  account/fill receipt, and shutdown prevents further protective or ordinary submissions.
 
-- Revised HSL now uses one best-effort fill reconciliation path for drawdown and cooldown.
+- HSL now uses one best-effort fill reconciliation path for drawdown and cooldown.
   Known fill quantities are preserved with minimum feasible opening inventory and explicit
   current-position adjustments. Missing or ambiguous history and read ordering produce
   diagnostics instead of a second veto on estimated flats. Fresh flat positions complete
-  missing closes at an estimated last-fill time; delayed history rebuilds the result. Legacy
-  HSL remains the default and is unchanged.
+  missing closes at an estimated last-fill time; delayed history rebuilds the result.
 
-- Keep shared quote requests alive when one reader times out, so revised HSL quote deadlines
+- Keep shared quote requests alive when one reader times out, so HSL quote deadlines
   cannot cancel ordinary planning and repeatedly restart the bot. Shutdown still cancels shared
   requests and awaits their cleanup before closing clients through every close path. Late non-transient
   failures, including malformed result shapes, reach
@@ -150,185 +373,51 @@ since the latest release tag; these features may already be available when insta
   cleanup stays bounded when a client suppresses cancellation. Abandoned readers do not leak
   connector exception text through Python 3.14 shield diagnostics.
 
-- Report revised-HSL account and health equity from current balances, positions and cached
+- Report HSL account and health equity from current balances, positions and cached
   quotes instead of retaining the startup placeholder. Missing or stale inputs show unavailable
   equity; reporting does not fetch data or affect trading.
 
-- Enable explicit revised HSL live selection with `live.hsl_engine=revised` for coin, pside and
-  unified signals alongside the legacy default. The standard offline fake CLI now exercises the
-  same path without an activation bypass. Add an operator live-validation and rollback checklist;
-  offline qualification does not establish live exchange readiness. Revised coin HSL now uses
-  equity-peak drawdown and current-budget rebasing, aligned with pside and unified signals.
-  The engine uses best-effort history and an entry reference when history is absent, GREEN/RED
-  trading only, explicit portfolio configuration, and finite-window lifecycle reconstruction
-  without the legacy journal. `never` expires with lookback; zero cooldown means no wait.
-  The terminal threshold and legacy intervention/tier optimizer dimensions are removed; policies
-  and fitness require explicit migration. See [the revised guide](docs/hsl_revised.md).
-
-- Let fresh exchange-flat positions complete revised HSL protection when closing fills are
+- Let fresh exchange-flat positions complete HSL protection when closing fills are
   missing or ambiguous. If the final boundary cannot be reconstructed, use the latest retained
   fill in that scope as a disclosed cooldown timestamp estimate; repeated reads and restarts
-  do not renew it. Delayed history can correct the anchor. Legacy HSL is unchanged.
+  do not renew it. Delayed history can correct the anchor.
 
-- Reduce revised HSL write-admission cost by reevaluating the order's authorizing scope: one
+- Reduce HSL write-admission cost by reevaluating the order's authorizing scope: one
   coin-side, one whole position side or the whole unified portfolio. Complete current-account
   confirmation and freshness checks remain required.
 
-- Enable the opt-in revised HSL engine for backtests and CPU optimization in coin, pside and
-  unified modes, including scenario evaluation and checkpoint resume. Legacy remains the default;
-  GPU optimization remains explicitly unsupported.
-- Reduce revised HSL live snapshot overhead by retaining immutable projected minute prices in
+- Reduce HSL live snapshot overhead by retaining immutable projected minute prices in
   Rust across capture and evaluation, with unchanged reconstruction and freshness requirements.
 
-- Keep legacy coin-HSL replay scoped to each pair's required episode. A longer history window
-  for another side or coin no longer replays an expired flat episode's loss and retriggers RED
-  while waiting for a closing fill that already occurred.
-
-- Reduce revised-HSL historical price-projection overhead while preserving source selection,
+- Reduce HSL historical price-projection overhead while preserving source selection,
   conflict handling, gap filling and diagnostics.
 
-- Exercise staged revised HSL through the standard offline fake runner and command-line parser,
-  using the production execution pass for both ordinary orders and protective closes. Emit scoped
-  revised traces and preserve candle acquisition time separately from simulated exchange time.
-  Legacy remains the default.
-
-- Show staged revised-HSL scope decisions, drawdown, approximation quality and input freshness in
-  structured status events and monitor snapshots, dashboard and TUI. Unified mode displays one
-  portfolio scope; unavailable or stale observations cannot appear as current GREEN protection.
-  Report after protective execution so diagnostic work cannot delay its writes, and retain
-  unavailable warnings when the configured console sink fails. The legacy monitor format is unchanged.
-
-- Connect staged revised-HSL live protection to the actual execution loop and startup preparation.
-  History repair and ordinary planning run in the background while current inputs support scoped
-  panic closes. Recheck each write against current Rust permissions; reconstruct restart and
-  partial-close behavior from exchange observations. Legacy HSL stays the default.
-
-- Reduce staged revised-HSL live snapshot cost by transporting candle scalars and the compact
-  native price grid directly, preserving projected closes, factual source times, diagnostics and
-  complete decisions.
-
-- Add staged live observation transport for revised HSL: evaluate canonical fills and source
-  candles with fresh account observations through the shared Rust evaluator, isolating unavailable
-  current inputs by scope and preserving historical approximation diagnostics.
-
-- Preserve explicit revised-HSL portfolio policies and optimizer bounds when cleaning or exporting
+- Preserve explicit HSL portfolio policies and optimizer bounds when cleaning or exporting
   configs and recording fitness contracts. Do not restore removed legacy tier fields or invent
   missing unified/restart choices. Preserve prepared coin membership in single-run CPU optimizer
   results so unchanged runs can resume.
 
-- Avoid duplicate revised-HSL snapshot reconstruction when selected prices already have the
+- Avoid duplicate HSL snapshot reconstruction when selected prices already have the
   required minute grid. Each evaluation still rebuilds from current facts; sparse and damaged
   histories keep their existing approximation path.
 
-- Save staged revised-HSL native reports with backtest artifacts, including effective scope
-  policies and explicit compact/detail status. Plot native drawdown, EMA and GREEN/RED state
-  separately per scope, without substituting legacy signals or account-equity reconstruction.
-  Artifact workspaces expose the report.
-
-- Reject revised-HSL optimizer objectives and limits that refer to nonexistent unified-mode side
+- Reject HSL optimizer objectives and limits that refer to nonexistent unified-mode side
   controllers or disabled policies, including portfolio metrics when every controller is disabled.
   Coin mode resolves overrides for actual dataset
   members, including combined-dataset market identities; scenario selection remains respected.
-  General side-performance metrics remain available. GPU screening selects the revised shader
-  explicitly rather than using legacy proxy behavior.
+  General side-performance metrics remain available.
 
-- Populate staged revised-HSL backtest analysis from observed lifecycle events, including unfinished
-  halts and partial exits. Restore strategy-only equity statistics/artifacts independently of HSL
-  enablement and BTC collateral changes, and preserve compact reports and subset policies. Removed
-  yellow/orange metrics stay absent.
-
-- Stage explicit revised-HSL backtest policy transport for coin, side, and portfolio scopes.
-  Native simulations reject invalid policy inputs before running and retain the revised report
-  in compact results.
-
-- Add revised-HSL lifecycle diagnostics and separate simulator reports, including
+- Add HSL lifecycle diagnostics and separate simulator reports, including
   instantaneous zero-cooldown stops, replay deduplication and one portfolio counter
   in unified mode. Reports do not supply trading state.
-
-- Connect the internal revised-HSL simulator path to scoped permissions, full-position
-  panic orders and fill-time cooldown reconstruction. Legacy stays the default.
-
-- Add a shared experimental revised-HSL snapshot evaluator for complete, sparse and
-  candle-free histories, including scoped cashflow peaks and restart permissions.
-  The legacy default remains unchanged.
-
-- Seed experimental revised HSL's incomplete initial episode from estimated entry value,
-  including when candles exist, so flat/backfilled history cannot hide an existing loss.
-  The estimate adds no EMA sample and resets at a supported flatten. Legacy behavior remains unchanged.
-
-- Add immutable factual fill and candle transport for the experimental revised HSL,
-  preserving native contract quantities, signed fees and historical uncertainty.
-  Add bounded source-resolution candle acquisition with cache-only recovery and sparse
-  observations for Rust's whole-window projection, without changing the active trading path.
-
-- Add the startup-only `live.hsl_engine` selector, defaulting to legacy, and explicit
-  revised-HSL configuration migration with portfolio optimizer paths.
-  Enabled revised scopes require an explicit restart choice and a 1–90 day lookback;
-  missing unified portfolio settings and removed or inactive optimization paths fail
-  with migration guidance rather than inheriting an unintended policy.
-
-- Add an isolated experimental Rust drawdown kernel for revised HSL offline comparisons.
-  Add companion pair-history and historical candle-projection components with approximation
-  diagnostics, stateless controller replay, scoped snapshot preparation and candle-free
-  estimates retaining known realized cashflows.
-  Add scoped trace composition from aligned pair histories, retaining final flatten
-  observations, reopening fees and between-candle exposure events for controller replay.
-  Preserve small relative drawdowns through normalization by a large balance budget.
-  Add simulator factual-input transport for shared revised reconstruction, retaining
-  flat delisted scopes without requiring an irrelevant fresh mark, explicit flat
-  coin observations without invented quotes, and the simulator's candle/fill phase
-  and global execution order through aggregate flatten/reopen reconstruction.
-  Revised JSON numeric inputs preserve exact float round-trips, preventing a supplied
-  position or cashflow from drifting by an ulp. Legacy HSL and its parsing remain unchanged.
 
 - Preserve Bitget UTA linear fill quantities when reported quote values are rounded.
   Repair previously inferred contract multipliers on cache reload so fully closed positions
   leave no phantom dust that can block trailing fill confirmation after a new entry.
 
-- Keep HSL reconstruction usable across independent symbols' same-timestamp fills by retaining
-  drawdown across uncertain aggregate flatten boundaries. Recover a later coin episode after an
-  incomplete older opening when current quantity, a certified post-position fill tail, and a cooldown-separated flat
-  gap support it under the `always` restart policy. Both bounded reconstruction paths expose their
-  degraded status while retaining normal drawdown and EMA evaluation.
-
-- Restore committed HSL exits before startup balance/history recovery. Schedule overdue emergency
-  scopes after existing protective close attempts, including normal RED and cooldown work, so an
-  unfilled close cannot starve another scope. Bound emergency input reads and derive pending exits
-  directly from scoped protection state. Validate connector position mode on fresh protective
-  snapshots before closing; explicitly one-way resting orders remain cancellable when flat.
-
 - Batch compatible Apple GPU suite scenarios together during Trailing Martingale successive
   halving so small survivor sets share dispatches. Preserve scenario defaults, reducers,
   exact validation, and existing GPU work limits. Add a bounded synthetic batching benchmark.
-
-- Respect inactive coin sides during HSL emergency evaluation, avoiding zero-budget-divisor
-  failures while other scopes recover. Previously committed exits still close residual exposure
-  when position sizing becomes inactive.
-
-- Keep coin HSL evaluating with its existing EMA when unordered same-millisecond fills
-  provably cannot flatten the position and their realized deltas are monotone. Report this
-  bounded approximation as degraded evidence only while the cohort remains in the active window.
-  When EMA reconstruction is unavailable beyond grace, retain verified current-episode realized
-  losses in the coin emergency signal when fresh fill-tail and account evidence agree; missing
-  or incoherent evidence falls back to raw UPNL.
-
-- Attempt already-authorized HSL RED and cooldown closes before balance or history repair.
-  A temporary quote outage for one symbol no longer blocks independent protective closes;
-  unavailable symbols retain their orders and are identified in monitoring. Bound stalled quote
-  probes so healthy quotes remain fresh. Honor aggregate RED recovery pauses and close immediately
-  when a fresh sample reactivates RED.
-
-- Let HSL recovery exits close positions even when balance is unavailable. Use a minimal
-  Rust panic-close contract independent of history and strategy settings, while retaining
-  fresh positions, open orders, quotes, and strict validation of the complete close batch.
-
-- Keep HSL protection alive through unavailable history with scoped health and a configurable
-  120-second grace period before emergency unrealized-loss evaluation. Brief outages preserve
-  EMA-based behavior and valid martingale adds. Persistent outages can close through the configured
-  panic path; empty fill history despite exposure triggers a controlled exit after grace.
-  Persist outage/exit continuity across restarts, retain partial exits until confirmed flat, and
-  reconstruct cooldown policy before reopening. Expose grace, fallback, and execution health in
-  monitoring. Preserve proven cooldown/manual ownership and avoid replaying consumed boundaries.
 
 - Identify GPU temporal replays with suite scenario labels, suite-pass position, history
   fraction, and a replay ID. Explicit start and completion messages distinguish new
@@ -347,13 +436,6 @@ since the latest release tag; these features may already be available when insta
   1,024 candidates, with shorter history chunks preserving per-dispatch work limits.
   Apple GPU batches and strategy calculations retain their existing behavior.
 
-- Share fill-derived HSL episode evidence across startup replay and live validation,
-  preserving exact episode boundaries and opening quantities when history is clipped.
-  Keep proven closed episodes through their cooldown horizon without reopening older history.
-  Reject changed replay observations and reconstruct revised sampled fills. Unavailable
-  episode evidence now uses bounded risk-input recovery with visible causes and
-  continued independently ready protection, instead of an unbounded retry loop.
-
 - Prevent GPU optimizer rank halts caused by near-ties or opposing objectives cancelling in
   scalar scores when complete per-objective evidence confirms agreement. Preserve constraint
   gates and material rank-disagreement checks, add a separate `drift_rank_halt` override, and
@@ -371,22 +453,15 @@ since the latest release tag; these features may already be available when insta
   refetching already cached history when adjacent records jointly defer a gap. Bound
   coverage scanning and skip proof requests whose boundaries exceed one page.
 
-- Keep live coin-HSL symbol discovery and PnL sampling within the proven restart
-  history window, so discarded closed episodes cannot trigger a new stop.
 - Preserve missing Bitunix fill fees as unavailable so the configured fee fallback
   applies; explicit zero fees and rebates retain their reported values.
 
 - Apply the shared 30-second request timeout to KuCoin clients and honor explicit
   timeout overrides and native CCXT credential names while preserving broker signing.
 
-- Keep live coin-HSL episode-boundary checks within the canonical proven history
-  window, preventing discarded cached fills from blocking current trading.
-
 - Improve NVIDIA Trailing Martingale multi-coin screening throughput with smaller CUDA
   thread blocks for unchunked replays. Apple GPU dispatch and strategy arithmetic are unchanged.
 
-- Clear completed coin-HSL rolling PnL windows when GPU replay finalizes a RED stop at
-  a closing fill, preventing old losses from triggering another stop after cooldown.
 - Quantize single trailing-martingale close prices before backtest fill peeks, matching
   expanded close bundles and preventing off-tick simulated fills.
 
@@ -411,8 +486,8 @@ The earlier incremental entries are preserved in the
 
 ### Upgrade notes
 
-- Current configs use schema `v8.4.0`; package/release versions and config-schema versions are
-  separate. Supported v8.0.0–v8.3.0 configs migrate on load. Review migration warnings and the
+- Current configs use schema `v8.6.0`; package/release versions and config-schema versions are
+  separate. Supported v8.0.0–v8.5.0 configs migrate on load. Review migration warnings and the
   normalized result before live use; do not relabel an old config to bypass migration.
 - Auto-unstuck owns independent `bot.<side>.unstuck.ema_span_0/1` horizons. Migration derives
   missing values from the effective strategy where possible. Trailing Martingale entry spans
@@ -458,11 +533,6 @@ The earlier incremental entries are preserved in the
 
 ### Live trading, risk, and exchanges
 
-- HSL restart reconstruction uses authoritative history and proven episode boundaries; the
-  persisted replay cache is retired. Coin-mode replay no longer expands over discarded episodes
-  or lets their losses trigger current RED. Cooldown, re-entry fees, delayed closes, manual
-  intervention, and no-restart handling retain the required history. Unified HSL waits for the
-  entire account to flatten before ending a RED episode.
 - KuCoin partial closes contribute realized PnL before the whole position closes. KuCoin and
   Gate.io reject incomplete fill-history pagination; OKX reads every pending-order page before
   reconciliation. Bitget retains fills without client order IDs. KuCoin also refreshes expired
@@ -497,6 +567,10 @@ The earlier incremental entries are preserved in the
   Wrapped configs preserve CLI overrides and keep incomplete-HSL-history waivers per-run only.
 - Clarified tagged releases versus `master`, corrected current schema and installation guidance,
   and consolidated the changelog's superseded implementation entries.
+
+- Reuse available position-log prices for passive balance equity diagnostics, including
+  the existing 60-second candle fallback. Label older/candle valuations as estimates and
+  explain unavailable equity without changing trading or risk freshness requirements.
 
 ## v8.1.0 - 2026-08-10
 

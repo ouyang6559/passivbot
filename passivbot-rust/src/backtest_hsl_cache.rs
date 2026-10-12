@@ -1,17 +1,17 @@
 //! Disposable simulator-only shortcuts over immutable, ordered execution facts.
 //! A miss returns to the shared best-effort reconstruction; it never reuses
 //! permission after an input change.
-use super::revised_runtime::{Scope, SignalSettings};
+use super::hsl_runtime::{Scope, SignalSettings};
 use super::*;
-use crate::hsl_revised_controller::Action;
+use crate::hsl_controller::Action;
 
 pub(super) type Cutoffs =
     std::collections::BTreeMap<(Option<usize>, Option<usize>), (usize, Option<(i64, usize)>)>;
 
 pub(super) type Traces = std::collections::BTreeMap<(Option<usize>, Option<usize>), Trace>;
 pub(super) struct Trace {
-    episodes: Vec<crate::hsl_revised_controller::Episode>,
-    realized: crate::hsl_revised_sum::CurrencySum,
+    episodes: Vec<crate::hsl_controller::Episode>,
+    realized: crate::hsl_sum::CurrencySum,
     cashflow: f64,
     fill_count: usize,
     reference: Option<f64>,
@@ -22,7 +22,7 @@ impl Trace {
         if !exposed {
             episode.points.truncate(1);
         }
-        episode.points.push(crate::hsl_revised_controller::Point {
+        episode.points.push(crate::hsl_controller::Point {
             timestamp: now,
             pnl: self.cashflow,
             upnl,
@@ -38,15 +38,38 @@ impl Backtest<'_> {
     /// authorize current panic/cooldown. Simulator executions are globally ordered
     /// and carry the authoritative post-fill position, so no episode inference is
     /// needed here. Cache loss just repeats this factual reverse walk.
-    pub(super) fn revised_history_cutoff(
+    pub(super) fn hsl_history_cutoff(
         &mut self,
         side: Option<usize>,
         coin: Option<usize>,
     ) -> Option<(i64, usize)> {
         let key = (side, coin);
-        if let Some((count, cutoff)) = self.revised_hsl_cutoffs.get(&key) {
-            if *count == self.fills.len() {
-                return *cutoff;
+        if let Some((count, cutoff)) = self.hsl_cutoffs.get(&key) {
+            // Only executions belonging to this scope can change its flat
+            // boundary. Other sides/coins leave the selected positions intact.
+            if *count <= self.fills.len()
+                && self.fills[*count..].iter().all(|fill| {
+                    let s = if fill.order_type.is_long() {
+                        LONG
+                    } else {
+                        SHORT
+                    };
+                    side.is_some_and(|v| v != s)
+                        || coin.is_some_and(|c| self.backtest_params.coins[c] != fill.coin)
+                })
+            {
+                let cutoff = *cutoff;
+                let cutoff = cutoff.map(|(timestamp, consumed)| {
+                    // No selected execution has ever occurred: advance the
+                    // fill-only prefix without changing the lookback timestamp.
+                    if timestamp == i64::MIN {
+                        (timestamp, self.fills.len())
+                    } else {
+                        (timestamp, consumed)
+                    }
+                });
+                self.hsl_cutoffs.insert(key, (self.fills.len(), cutoff));
+                return cutoff;
             }
         }
         let mut sizes = [
@@ -128,17 +151,19 @@ impl Backtest<'_> {
                     side.is_none_or(|v| v == s)
                         && coin.is_none_or(|c| self.backtest_params.coins[c] == fill.coin)
                 })
-                .map(|fill| ((fill.timestamp_ms as i64).saturating_sub(60_000), 0));
+                .map(|fill| ((fill.timestamp_ms as i64).saturating_sub(60_000), 0))
+                // This scope has no execution history. Skip the unrelated tape
+                // but retain the configured valuation/diagnostic window.
+                .or(Some((i64::MIN, self.fills.len())));
         }
-        self.revised_hsl_cutoffs
-            .insert(key, (self.fills.len(), cutoff));
+        self.hsl_cutoffs.insert(key, (self.fills.len(), cutoff));
         cutoff
     }
 
     /// Append a factual mark to an unchanged reconstructed episode. Any fill,
     /// budget/slot change, window clipping or numeric concern leaves this scalar
     /// shortcut. Changed inputs always receive a fresh controller evaluation.
-    pub(super) fn advance_revised_scope(
+    pub(super) fn advance_hsl_scope(
         &mut self,
         k: usize,
         side: Option<usize>,
@@ -146,7 +171,7 @@ impl Backtest<'_> {
         settings: SignalSettings,
     ) -> Option<Scope> {
         let previous = self
-            .revised_hsl_scopes
+            .hsl_scopes
             .iter()
             .find(|s| s.side == side && s.coin == coin)?;
         let cursor = previous.result.cursor.as_ref()?;
@@ -154,12 +179,14 @@ impl Backtest<'_> {
         let start =
             now - (self.backtest_params.pnls_max_lookback_days * 86_400_000.0).round() as i64;
         let slots = side.map_or(1, |s| self.hard_stop_coin_slot_n_positions(s)) as u64;
-        let budget = self.balance.usd_total_balance
-            / if coin.is_some() {
-                slots.max(1) as f64
-            } else {
-                1.0
-            };
+        let budget = self
+            .hsl_balance_budget(
+                side,
+                coin,
+                slots,
+                settings.scale_budget_with_excess_allowance,
+            )
+            .ok()?;
         let prior = previous.result.decision.as_ref()?;
         if previous.fill_count != self.fills.len()
             || previous.slots != slots
@@ -173,7 +200,7 @@ impl Backtest<'_> {
         {
             return None;
         }
-        let (upnl, exposed) = self.revised_scope_upnl(k, side, coin)?;
+        let (upnl, exposed) = self.hsl_scope_upnl(k, side, coin)?;
         if exposed != cursor.exposed {
             return None;
         }
@@ -208,7 +235,7 @@ impl Backtest<'_> {
                 d.reason = "drawdown";
                 if d.red_at.is_none() {
                     d.red_at = Some(now);
-                    events.push(crate::hsl_revised_controller::LifecycleEvent {
+                    events.push(crate::hsl_controller::LifecycleEvent {
                         timestamp: now,
                         kind: "red",
                         red_at: now,
@@ -227,11 +254,11 @@ impl Backtest<'_> {
         } else {
             d.reason = "green";
             if d.action == Action::Halted
-                && settings.restart == crate::hsl_revised_controller::Restart::Always
+                && settings.restart == crate::hsl_controller::Restart::Always
                 && d.flat_at
                     .is_some_and(|flat| now >= flat + settings.cooldown_ms)
             {
-                events.push(crate::hsl_revised_controller::LifecycleEvent {
+                events.push(crate::hsl_controller::LifecycleEvent {
                     timestamp: now,
                     kind: "restart",
                     red_at: d.red_at?,
@@ -246,17 +273,17 @@ impl Backtest<'_> {
                 d.flat_at = None;
             }
         }
-        self.revised_hsl_traces
+        self.hsl_traces
             .get_mut(&(side, coin))?
             .append(now, upnl, exposed);
         // All fallible checks precede moving the old result. The outer loop
         // replaces the complete scope batch atomically after successful evaluation.
         let index = self
-            .revised_hsl_scopes
+            .hsl_scopes
             .iter()
             .position(|s| s.side == side && s.coin == coin)
             .unwrap();
-        let mut next = self.revised_hsl_scopes.swap_remove(index);
+        let mut next = self.hsl_scopes.swap_remove(index);
         next.timestamp = now;
         next.result.decision = Some(decision);
         next.result.events = events;
@@ -264,13 +291,13 @@ impl Backtest<'_> {
         next.result.observations += 1;
         Some(next)
     }
-    fn revised_scope_upnl(
+    fn hsl_scope_upnl(
         &self,
         k: usize,
         side: Option<usize>,
         coin: Option<usize>,
     ) -> Option<(f64, bool)> {
-        let mut total = crate::hsl_revised_sum::CurrencySum::new();
+        let mut total = crate::hsl_sum::CurrencySum::new();
         let mut first = None;
         let mut multiple = false;
         for c in 0..self.n_coins {
@@ -339,12 +366,12 @@ impl Backtest<'_> {
         Some((upnl, exposed))
     }
 
-    pub(super) fn seed_revised_trace(
+    pub(super) fn seed_hsl_trace(
         &mut self,
         key: (Option<usize>, Option<usize>),
-        output: &mut crate::hsl_revised_evaluator::Output,
+        output: &mut crate::hsl_evaluator::Output,
     ) {
-        self.revised_hsl_traces.remove(&key);
+        self.hsl_traces.remove(&key);
         // With no observed opening, each capture is a fresh current-position
         // estimate. Extending yesterday's estimate would invent episode age.
         if output.reasons.contains("estimated_current_opening") {
@@ -360,12 +387,12 @@ impl Backtest<'_> {
                 return;
             }
             let reference = episodes[0].entry_reference_delta;
-            self.revised_hsl_traces.insert(
+            self.hsl_traces.insert(
                 key,
                 Trace {
                     episodes,
                     reference,
-                    realized: crate::hsl_revised_sum::CurrencySum::new(),
+                    realized: crate::hsl_sum::CurrencySum::new(),
                     cashflow: 0.0,
                     fill_count: self.fills.len(),
                 },
@@ -375,16 +402,16 @@ impl Backtest<'_> {
 
     /// Reuse reconstructed facts after cashflow/budget changes, evaluating the
     /// unchanged shared controller again rather than translating its permission.
-    pub(super) fn replay_revised_trace(
+    pub(super) fn replay_hsl_trace(
         &mut self,
         k: usize,
         side: Option<usize>,
         coin: Option<usize>,
         settings: SignalSettings,
     ) -> Option<Scope> {
-        use crate::hsl_revised_controller as controller;
+        use crate::hsl_controller as controller;
         let previous = self
-            .revised_hsl_scopes
+            .hsl_scopes
             .iter()
             .find(|s| s.side == side && s.coin == coin)?;
         let cursor = previous.result.cursor.as_ref()?;
@@ -395,9 +422,15 @@ impl Backtest<'_> {
         if coin.is_some() && slots == 0 {
             return None;
         }
-        let budget =
-            self.balance.usd_total_balance / if coin.is_some() { slots as f64 } else { 1.0 };
-        let (upnl, exposed) = self.revised_scope_upnl(k, side, coin)?;
+        let budget = self
+            .hsl_balance_budget(
+                side,
+                coin,
+                slots,
+                settings.scale_budget_with_excess_allowance,
+            )
+            .ok()?;
+        let (upnl, exposed) = self.hsl_scope_upnl(k, side, coin)?;
         if !budget.is_finite()
             || budget <= 0.0
             || budget > 1e100
@@ -412,7 +445,7 @@ impl Backtest<'_> {
         {
             return None;
         }
-        let trace = self.revised_hsl_traces.get_mut(&(side, coin))?;
+        let trace = self.hsl_traces.get_mut(&(side, coin))?;
         // Estimated missing-opening tapes can change when new fills arrive.
         // Reconstruct those instead of extending an estimate with new evidence.
         if trace.reference.is_some() && trace.fill_count != self.fills.len() {
@@ -464,11 +497,11 @@ impl Backtest<'_> {
         }
         let decision = replay.decisions.into_iter().last()?;
         let index = self
-            .revised_hsl_scopes
+            .hsl_scopes
             .iter()
             .position(|s| s.side == side && s.coin == coin)
             .unwrap();
-        let mut result = self.revised_hsl_scopes.swap_remove(index).result;
+        let mut result = self.hsl_scopes.swap_remove(index).result;
         result.decision = Some(decision);
         result.events = replay.events;
         result.observations = replay.observations;

@@ -7,7 +7,7 @@ It schedules tail fetches after position changes and temporarily defers affected
 it is not the trailing reconstruction or historical-PnL proof described below. A successful
 qualifying fetch need not contain the expected fill. Its 15-second maximum cannot be renewed by
 repeated changes, failures or a hung request. Expiry releases the settling gate, not required
-strategy inputs; revised HSL still uses the Rust best-effort reconciler independently.
+strategy inputs; HSL still uses the Rust best-effort reconciler independently.
 
 1. Build a deduplicated fill-event stream per exchange/account.
 2. Preserve source data needed for realized PnL reconstruction.
@@ -90,7 +90,7 @@ strategy inputs; revised HSL still uses the Rust best-effort reconciler independ
     Structured `cycle.degraded` diagnostics preserve bounded `pending_pnl_count` and
     `degraded_pnl_count` fields through the centralized payload sanitizer.
 11. `FillEventsManager` owns the canonical fill-history coverage verdict used by
-    refresh, staged readiness, HSL replay, and realized-PnL consumers. Orchestration
+    refresh, staged readiness, HSL reconstruction, and realized-PnL consumers. Orchestration
     may choose retry timing or whether a proven-incomplete history is explicitly
     allowed, but it must not reinterpret cache metadata or known gaps. Metadata
     claiming cached rows when no rows loaded, and malformed known-gap bounds, are
@@ -115,6 +115,14 @@ strategy inputs; revised HSL still uses the Rust best-effort reconciler independ
     effective per-coin HSL policy and cooldown. Recompute both coverage and PnL
     requirements after fetching so delayed fills cannot be accepted under the
     earlier boundary and older discarded episodes cannot remain PnL blockers.
+
+## Empty-refresh replay reuse
+
+A successful empty fetch may skip reconstruction only after a full replay proved the same history
+was unchanged, with the same fee policy and no new PnL observations. The disposable proof owns a
+deep copy including mutable raw/fee/provenance data. Fetched duplicates and all enrichment still
+use the full path. Fetches, failure propagation, coverage repair, metadata and refresh checkpoints
+remain unconditional; restart or loss of the proof simply repeats full reconstruction.
 
 ## Runtime Provenance
 

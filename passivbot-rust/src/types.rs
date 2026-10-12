@@ -254,51 +254,14 @@ impl ExchangeParams {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct EquityHardStopLossTierRatios {
-    pub yellow: f64,
-    pub orange: f64,
-}
-
-impl Default for EquityHardStopLossTierRatios {
-    fn default() -> Self {
-        Self {
-            yellow: 0.5,
-            orange: 0.75,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct EquityHardStopLossConfig {
-    pub revised: Option<crate::backtest::revised_runtime::Config>,
-    pub enabled: bool,
-    pub signal_mode: String,
-    pub red_threshold: f64,
-    pub ema_span_minutes: f64,
-    pub cooldown_minutes_after_red: f64,
-    pub no_restart_drawdown_threshold: f64,
-    pub restart_after_red_policy: String,
-    pub tier_ratios: EquityHardStopLossTierRatios,
-    pub orange_tier_mode: String,
-    #[allow(dead_code)]
-    // Parsed in Rust for config parity; consumed by Python live order handling.
-    pub panic_close_order_type: String,
+    pub hsl: Option<crate::backtest::hsl_runtime::Config>,
 }
 
 impl Default for EquityHardStopLossConfig {
     fn default() -> Self {
         Self {
-            revised: None,
-            enabled: false,
-            signal_mode: "unified".to_string(),
-            red_threshold: 0.25,
-            ema_span_minutes: 60.0,
-            cooldown_minutes_after_red: 0.0,
-            no_restart_drawdown_threshold: 1.0,
-            restart_after_red_policy: "threshold".to_string(),
-            tier_ratios: EquityHardStopLossTierRatios::default(),
-            orange_tier_mode: "tp_only_with_active_entry_cancellation".to_string(),
-            panic_close_order_type: "market".to_string(),
+            hsl: Some(crate::backtest::hsl_runtime::Config::default()),
         }
     }
 }
@@ -420,55 +383,12 @@ fn default_hsl_enabled() -> bool {
     false
 }
 
-fn default_hsl_red_threshold() -> f64 {
-    0.25
-}
-
-fn default_hsl_ema_span_minutes() -> f64 {
-    60.0
-}
-
-fn default_hsl_cooldown_minutes_after_red() -> f64 {
-    0.0
-}
-
-fn default_hsl_no_restart_drawdown_threshold() -> f64 {
-    1.0
-}
-
-fn default_hsl_restart_after_red_policy() -> String {
-    "threshold".to_string()
-}
-
-fn default_hsl_tier_ratio_yellow() -> f64 {
-    0.5
-}
-
-fn default_hsl_tier_ratio_orange() -> f64 {
-    0.75
-}
-
-fn default_hsl_orange_tier_mode() -> String {
-    "tp_only_with_active_entry_cancellation".to_string()
-}
-
 fn default_hsl_panic_close_order_type() -> String {
     "market".to_string()
 }
 
 fn default_true() -> bool {
     true
-}
-
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, EnumString, Display,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum WeExcessAllowanceMode {
-    #[default]
-    Bounded,
-    LegacyRaw,
 }
 
 #[derive(
@@ -488,6 +408,8 @@ pub struct ForagerScoreWeights {
     pub volume: f64,
     pub ema_readiness: f64,
     pub volatility: f64,
+    #[serde(default)]
+    pub unilateralness: f64,
 }
 
 impl Default for ForagerScoreWeights {
@@ -496,31 +418,39 @@ impl Default for ForagerScoreWeights {
             volume: 0.0,
             ema_readiness: 0.0,
             volatility: 1.0,
+            unilateralness: 0.0,
         }
     }
 }
 
 impl ForagerScoreWeights {
     pub fn canonicalize(&self) -> Result<Self, String> {
-        let values = [self.volume, self.ema_readiness, self.volatility];
+        let values = [
+            self.volume,
+            self.ema_readiness,
+            self.volatility,
+            self.unilateralness,
+        ];
         if values
             .iter()
             .any(|value| !value.is_finite() || *value < 0.0)
         {
             return Err("forager_score_weights must be finite and non-negative".to_string());
         }
-        let total = self.volume + self.ema_readiness + self.volatility;
+        let total = self.volume + self.ema_readiness + self.volatility + self.unilateralness;
         if total <= 0.0 {
             return Ok(Self {
                 volume: 0.0,
                 ema_readiness: 1.0,
                 volatility: 0.0,
+                unilateralness: 0.0,
             });
         }
         Ok(Self {
             volume: self.volume / total,
             ema_readiness: self.ema_readiness / total,
             volatility: self.volatility / total,
+            unilateralness: self.unilateralness / total,
         })
     }
 }
@@ -587,26 +517,18 @@ pub struct BotParams {
     pub ema_span_1: f64,
     #[serde(default = "default_hsl_enabled")]
     pub hsl_enabled: bool,
-    #[serde(default = "default_hsl_red_threshold")]
-    pub hsl_red_threshold: f64,
-    #[serde(default = "default_hsl_ema_span_minutes")]
-    pub hsl_ema_span_minutes: f64,
-    #[serde(default = "default_hsl_cooldown_minutes_after_red")]
-    pub hsl_cooldown_minutes_after_red: f64,
-    #[serde(default = "default_hsl_no_restart_drawdown_threshold")]
-    pub hsl_no_restart_drawdown_threshold: f64,
-    #[serde(default = "default_hsl_restart_after_red_policy")]
-    pub hsl_restart_after_red_policy: String,
-    #[serde(default = "default_hsl_tier_ratio_yellow")]
-    pub hsl_tier_ratio_yellow: f64,
-    #[serde(default = "default_hsl_tier_ratio_orange")]
-    pub hsl_tier_ratio_orange: f64,
-    #[serde(default = "default_hsl_orange_tier_mode")]
-    pub hsl_orange_tier_mode: String,
     #[serde(default = "default_hsl_panic_close_order_type")]
     pub hsl_panic_close_order_type: String,
     #[serde(default)]
     pub risk_entry_cooldown_minutes: f64,
+    #[serde(default)]
+    pub entry_cooldown_min_duration_minutes: f64,
+    #[serde(default)]
+    pub entry_cooldown_max_duration_minutes: Option<f64>,
+    #[serde(default)]
+    pub entry_cooldown_weights_minutes: crate::entry_cooldown::CooldownWeights,
+    #[serde(default = "default_unilateralness_span")]
+    pub unilateralness_ema_span_1m: f64,
     pub n_positions: usize,
     pub total_wallet_exposure_limit: f64,
     pub wallet_exposure_limit: f64, // per-position base limit (without excess allowance)
@@ -621,8 +543,6 @@ pub struct BotParams {
     pub risk_twel_enforcer_policy: TwelEnforcerPolicy,
     pub risk_twel_enforcer_threshold: f64,
     pub risk_we_excess_allowance_pct: f64,
-    #[serde(default)]
-    pub risk_we_excess_allowance_mode: WeExcessAllowanceMode,
     #[serde(default = "default_true")]
     pub unstuck_enabled: bool,
     #[serde(default = "default_true")]
@@ -666,16 +586,12 @@ impl Default for BotParams {
             ema_span_0: 0.0,
             ema_span_1: 0.0,
             hsl_enabled: default_hsl_enabled(),
-            hsl_red_threshold: default_hsl_red_threshold(),
-            hsl_ema_span_minutes: default_hsl_ema_span_minutes(),
-            hsl_cooldown_minutes_after_red: default_hsl_cooldown_minutes_after_red(),
-            hsl_no_restart_drawdown_threshold: default_hsl_no_restart_drawdown_threshold(),
-            hsl_restart_after_red_policy: default_hsl_restart_after_red_policy(),
-            hsl_tier_ratio_yellow: default_hsl_tier_ratio_yellow(),
-            hsl_tier_ratio_orange: default_hsl_tier_ratio_orange(),
-            hsl_orange_tier_mode: default_hsl_orange_tier_mode(),
             hsl_panic_close_order_type: default_hsl_panic_close_order_type(),
             risk_entry_cooldown_minutes: 0.0,
+            entry_cooldown_min_duration_minutes: 0.0,
+            entry_cooldown_max_duration_minutes: None,
+            entry_cooldown_weights_minutes: Default::default(),
+            unilateralness_ema_span_1m: 60.0,
             n_positions: 0,
             total_wallet_exposure_limit: 0.0,
             wallet_exposure_limit: 0.0,
@@ -686,7 +602,6 @@ impl Default for BotParams {
             risk_twel_enforcer_policy: TwelEnforcerPolicy::default(),
             risk_twel_enforcer_threshold: 0.0,
             risk_we_excess_allowance_pct: 0.0,
-            risk_we_excess_allowance_mode: WeExcessAllowanceMode::default(),
             unstuck_enabled: true,
             unstuck_ema_gating_enabled: true,
             unstuck_close_pct: 0.0,
@@ -1084,8 +999,6 @@ pub struct Analysis {
     pub hard_stop_restarts_per_year_short: f64,
     pub hard_stop_restarts_long: u32,
     pub hard_stop_restarts_short: u32,
-    pub hard_stop_time_in_yellow_pct: f64,
-    pub hard_stop_time_in_orange_pct: f64,
     pub hard_stop_time_in_red_pct: f64,
     pub hard_stop_duration_minutes_mean: f64,
     pub hard_stop_duration_minutes_max: f64,
@@ -1276,8 +1189,6 @@ impl Default for Analysis {
             hard_stop_restarts_per_year_short: 0.0,
             hard_stop_restarts_long: 0,
             hard_stop_restarts_short: 0,
-            hard_stop_time_in_yellow_pct: 0.0,
-            hard_stop_time_in_orange_pct: 0.0,
             hard_stop_time_in_red_pct: 0.0,
             hard_stop_duration_minutes_mean: 0.0,
             hard_stop_duration_minutes_max: 0.0,
@@ -1291,4 +1202,8 @@ impl Default for Analysis {
             hard_stop_post_restart_retrigger_pct: 0.0,
         }
     }
+}
+
+fn default_unilateralness_span() -> f64 {
+    60.0
 }

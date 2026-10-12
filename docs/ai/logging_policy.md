@@ -110,7 +110,7 @@ must not alter event production, trading decisions, counters, or monitor history
 Each family that uses numeric materiality or hysteresis must define that boundary explicitly and
 test values on both sides; the console sink must not invent a generic threshold after emission.
 
-Revised-HSL console state includes every scope's identity, action/tier, availability and unavailable
+HSL console state includes every scope's identity, action/tier, availability and unavailable
 reason, plus whether estimates are in use. Estimation-reason churn and ordinary numeric/timestamp
 movement remain structured detail. Current-observation freshness, account availability and severity changes print
 immediately; equivalent degraded observations get an event-driven repeat summary at most every
@@ -156,6 +156,54 @@ These are review and VPS-smoke acceptance budgets, not hard runtime drop limits.
 timestamped logical records and terminal rows after wrapping. If the budget is exceeded, change the
 producer's transition, aggregation, routing, or formatting policy; do not add a global sampler that
 can hide unrelated events. Startup is assessed separately because readiness milestones are bursty.
+
+## Optimizer Console
+
+Every accepted Pareto member prints immediately, including tradeoffs that improve none of the
+objective extremes. Include exact evaluation count, front size, feasible members, additions/removals,
+constraint range, and the full range of every configured objective in ascending `[min,max]` order. Split
+metrics into bounded, individually timestamped records with evaluation count and goal; never hide
+configured objectives behind a `+N metrics` abbreviation. `*` marks only the goal-directed best
+endpoint (minimum for min goals, maximum for max goals) when it improves relative to the preceding
+update in that scope, including its initial baseline. Widening the worse endpoint does not earn a
+marker. These are independent metric extrema, which may come from different configs; they do not
+describe the distribution inside the range. Derive both endpoints from the same scope: prefer the
+feasible front and explicitly label an infeasible front until feasibility is found. Historical
+reconstruction emits no updates and primes the restored best-value baseline; resumed updates use
+the restored evaluation count. Per-candidate objectives and duplicate rejection detail are DEBUG.
+Explicit flushes emit no additional updates.
+Seed clamps print one warning per collected context with counts and at most three key samples;
+original values, bounds, adjusted values and source details are DEBUG.
+
+GPU logs identify generation and work phase: seed proxy screening, seed exact validation, evolution
+proxy screening/full evaluation, exact-worker waits, generation completion, and completion. An
+event-driven minute snapshot separates evolution proxy candidates completed in finished evaluations
+in this invocation, proxy-screened and exact seeds, evolution exact budget/completions/pending,
+current Pareto size/feasibility, accepted
+members in this invocation, time since its last Pareto change (unknown after resume until a new
+change), and run elapsed time. Phase transitions are immediate. Full optimizer options are DEBUG.
+
+Temporal replay prints scenario-group/stage context at start and correlates compact updates and
+completion with a replay ID. A replay evaluates one candidate batch across its historical bars
+(candle time steps); these bars and bars/second are batch-wide time steps, not candidate evaluations.
+History chunks bound the bars handled by each GPU kernel dispatch. Start logs show chunk size and
+updates/completion show actual kernel dispatch counts. Scenario-group progress separately reports
+completed candidate batches and candidate-scenario evaluations; with adaptive batching it does not
+invent a total batch count. Group context identifies scenarios sharing a compatible evaluation pass.
+Replay and group INFO progress are at most once per minute; intermediate replay updates are DEBUG.
+Use readable durations and explicitly scoped estimates: `eta_batch`, `eta_group`, and `eta_seed`;
+none is a whole-run estimate. `eta_generation` estimates the current ask/tell generation
+from the median of up to five completed generations in this invocation. It is unknown for the first
+generation, outside an active generation, and after an overrun; it does not predict CPU admission
+waits or the whole optimization. Include the currently applied exact-worker count. Exact seed validation reports minute-spaced completed/in-flight/queued counts
+while waiting, and immediate start/completion. Its ETA uses only completions in the current run;
+without such evidence it is unknown. Auto-tune logs distinguish requested/effective batch limits,
+starting batch/source, trial/retained/accepted width, throughput evidence and reason. Proxy drift
+warnings show condition, action, sample evidence and thresholds on transition and at most once per
+minute for unchanged conditions; numeric churn does not create new warning signatures. Recovery
+and safety halts are immediate, with full diagnostic detail at DEBUG and unchanged halt decisions.
+Presentation state is transient and never affects selection,
+result persistence, checkpoints, interruption, or worker failure policy.
 
 ## Fallback Visibility
 

@@ -15,6 +15,7 @@ import passivbot_rust as pbr
 from config.limits import resolve_reducer_mode
 from config.metrics import canonicalize_metric_name, resolve_metric_value
 from config.scoring import extract_objective_specs
+from optimization.progress import duration, log_tokens
 from pure_funcs import calc_hash
 from utils import json_dumps_streamlined
 from metrics_schema import flatten_metric_stats
@@ -187,13 +188,21 @@ class ParetoStore:
         # ------------------------------------------------------------------
         self.n_iters = 0
         self._last_flush_ts = time.time()
+        self._last_best = None
+        self._last_best_scope = None
+        self.last_front_change_at = None
+        self.front_additions = 0
         self._lock = threading.RLock()
 
         self.scoring_keys = None
         self.scoring_specs = None
 
-        # bootstrap from disk if any
+        # Reconstruction is historical state, not new optimizer progress.
+        # ResultRecorder installs the resume evaluation baseline after construction.
+        self._bootstrapping = True
         self._bootstrap_from_disk()
+        self._bootstrapping = False
+        self._last_best_scope, self._last_best, _ = self._front_objective_summary()
 
     @staticmethod
     def _scoring_signature(specs: Sequence[Any]) -> tuple[tuple[Any, ...], ...]:
@@ -258,6 +267,7 @@ class ParetoStore:
         self._apply_entry_scoring_specs(entry)
         h = calc_hash(entry)
         with self._lock:
+            previous_front_size = len(self._front)
             if h in self._entries:  # fast‑dedupe
                 return False
 
@@ -275,7 +285,7 @@ class ParetoStore:
             if existing_hash:
                 existing_violation = self._violations.get(existing_hash, 0.0)
                 if violation >= existing_violation - 1e-12:
-                    self._log.info(
+                    self._log.debug(
                         "Dropping candidate whose obj score is already present with <= violation: %s",
                         obj,
                     )
@@ -320,7 +330,7 @@ class ParetoStore:
 
             self._log_front_state(
                 added=1,
-                removed=len(dominated),
+                removed=previous_front_size + 1 - len(self._front),
             )
 
             # maybe flush
@@ -436,7 +446,38 @@ class ParetoStore:
         return tuple(values)
 
     def _log_front_state(self, *, added: int, removed: int) -> None:
-        """Emit a compact one‑liner with min / max / spread per objective."""
+        """Report every accepted member with objective ranges and new bests."""
+        if self._bootstrapping:
+            return
+        self.front_additions += added
+        self.last_front_change_at = time.monotonic()
+        scope, best, ranges = self._front_objective_summary()
+        goals = [spec.goal for spec in self.scoring_specs] if self.scoring_specs else ["min"] * len(best)
+        improved = [
+            self._last_best is None or self._last_best_scope != scope or
+            (value > self._last_best[i] if goals[i] == "max" else value < self._last_best[i])
+            for i, value in enumerate(best)
+        ]
+        log_tokens("Pareto update |", [
+            f"eval={self.n_iters}", f"front={len(self._front)}",
+            f"feasible={sum(self._violations[idx] <= 0 for idx in self._front)}",
+            f"changes=+{added}/-{removed}", f"best_scope={scope}",
+            f"quality={'improved' if any(improved) else 'unchanged_tradeoff'}",
+            f"constraint={min(self._violations[idx] for idx in self._front):.3g}..{max(self._violations[idx] for idx in self._front):.3g}",
+        ], logger=self._log)
+        keys = self.scoring_keys or [f"objective_{i}" for i in range(len(best))]
+        for goal in ("max", "min"):
+            metrics = [
+                f"{key}=[{low:.6g}{'*' if changed and direction == 'min' else ''},"
+                f"{high:.6g}{'*' if changed and direction == 'max' else ''}]"
+                for key, (low, high), direction, changed in zip(keys, ranges, goals, improved)
+                if direction == goal
+            ]
+            if metrics:
+                log_tokens(f"Pareto range | eval={self.n_iters} goal={goal} |", metrics, logger=self._log)
+        self._last_best_scope, self._last_best = scope, best
+        if not self._log.isEnabledFor(logging.DEBUG):
+            return
         objs = [self._objectives[idx] for idx in self._front]
 
         mins = [min(col) for col in zip(*objs)]
@@ -460,9 +501,31 @@ class ParetoStore:
                     f"{pbr.round_dynamic(max(viols), 3)})"
                 )
 
-        self._log.info(
+        self._log.debug(
             f"Iter: {self.n_iters} | Pareto ↑ | +{added}/-{removed} | size:{len(self._front)} | {line}{violation_summary}"
         )
+
+    def _front_objective_summary(self):
+        """Derive both endpoints and goal-directed bests from the same front."""
+        if not self._front:
+            return "empty", None, None
+        feasible = [idx for idx in self._front if self._violations[idx] <= 0]
+        members = feasible or self._front
+        columns = list(zip(*(self._objectives[idx] for idx in members)))
+        goals = [spec.goal for spec in self.scoring_specs] if self.scoring_specs else ["min"] * len(columns)
+        ranges = tuple((min(column), max(column)) for column in columns)
+        best = tuple(high if goal == "max" else low for (low, high), goal in zip(ranges, goals))
+        return "feasible_front" if feasible else "infeasible_front", best, ranges
+
+    def progress_snapshot(self):
+        with self._lock:
+            return {
+                "front": len(self._front), "pareto_added": self.front_additions,
+                "feasible": sum(self._violations[idx] <= 0 for idx in self._front),
+                "last_pareto_age": duration(
+                    None if self.last_front_change_at is None else time.monotonic() - self.last_front_change_at
+                ),
+            }
 
     def _prune_front(self, n_prune: int) -> None:
         """Trim the Pareto front down by removing the most crowded entries."""

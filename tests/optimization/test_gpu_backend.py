@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -31,6 +32,7 @@ from optimization.backends.gpu_backend import (
     _checkpoint_gpu_interrupt,
     _constraint_classification_mismatch,
     _constraint_diagnostics,
+    _collect_exact_during_proxy,
     _deduplicate_canonical_seed_vectors,
     _disable_gpu_exact_duplicate_guard,
     _ema_multicoin_bound_map,
@@ -90,7 +92,7 @@ from optimization.backends.gpu_backend import (
     _validate_pinned_scope_bounds,
     _validate_resume_evidence_budget,
     _validate_seed_bootstrap_plan,
-    _validate_seed_side_match,
+    materialize_gpu_preparation_config,
     _validate_scope,
     _validate_tm_market_mode_bounds,
     _validate_tm_market_template_bounds,
@@ -154,12 +156,13 @@ def test_gpu_exact_submission_uses_profiled_worker_only_when_enabled(
     )
 
     _submit_gpu_exact_validation(
-        pool, [1.0], interrupt_check, profile=True
+        pool, [1.0], interrupt_check, profile=True, admission_epoch=3,
+        admission_stalled_since=4.5,
     )
 
     assert pool.apply_async.call_args.args == (
         _profiled_gpu_exact_worker,
-        ([1.0], 12.5),
+        ([1.0], 12.5, 3, 4.5),
     )
 
 
@@ -174,23 +177,23 @@ def test_gpu_profiled_exact_worker_records_actual_queue_wait(monkeypatch):
         lambda vector: {"F": vector},
     )
 
-    payload = _profiled_gpu_exact_worker([1.0], 7.0)
+    payload = _profiled_gpu_exact_worker([1.0], 7.0, 3, 2.0)
 
     assert payload["F"] == [1.0]
     assert payload["__gpu_profile_queue_wait_seconds__"] == pytest.approx(3.0)
     assert payload["__gpu_profile_worker_seconds__"] == pytest.approx(4.0)
+    assert payload["__gpu_profile_worker_started__"] == 10.0
+    assert payload["__gpu_profile_worker_finished__"] == 14.0
+    assert payload["__gpu_profile_admission_epoch__"] == 3
+    assert payload["__gpu_profile_admission_stall__"] == (2.0, 7.0)
 
 
 def test_gpu_profile_log_is_structured_json(caplog):
     with caplog.at_level("INFO"):
-        _log_gpu_profile(
-            "generation", generation=3, timings_seconds={"wall": 1.25}
-        )
+        _log_gpu_profile("generation", generation=3, timings_seconds={"wall": 1.25})
 
     line = next(
-        message
-        for message in caplog.messages
-        if message.startswith("[gpu-profile] ")
+        message for message in caplog.messages if message.startswith("[gpu-profile] ")
     )
     payload = json.loads(line.removeprefix("[gpu-profile] "))
     assert payload == {
@@ -199,6 +202,38 @@ def test_gpu_profile_log_is_structured_json(caplog):
         "generation": 3,
         "timings_seconds": {"wall": 1.25},
     }
+
+
+def test_exact_collector_records_before_proxy_finishes():
+    """Ready exact results are consumed while GPU proxy work remains active."""
+
+    ready = threading.Event()
+    recorded = threading.Event()
+
+    def consume_ready():
+        if ready.is_set():
+            recorded.set()
+
+    with _collect_exact_during_proxy(consume_ready):
+        ready.set()
+        assert recorded.wait(2.0)
+
+
+def test_exact_collector_propagates_errors_and_stops():
+    """A failed exact validation stops collection and reaches the main thread."""
+
+    called = threading.Event()
+
+    def consume_ready():
+        called.set()
+        raise RuntimeError("exact validation failed")
+
+    with pytest.raises(RuntimeError, match="exact validation failed"):
+        with _collect_exact_during_proxy(consume_ready):
+            assert called.wait(2.0)
+    assert not any(
+        thread.name == "gpu-exact-collector" for thread in threading.enumerate()
+    )
 
 
 def test_gpu_profile_elapsed_uses_monotonic_clock(monkeypatch):
@@ -245,6 +280,7 @@ def test_gpu_interrupt_checkpoints_complete_generation_state():
 
 def _long_only_ema_config():
     config = copy.deepcopy(get_template_config())
+    config["bot"]["hsl"] = copy.deepcopy(config["bot"]["long"]["hsl"])
     config["live"]["strategy_kind"] = "ema_anchor"
     # These scope fixtures exercise reducers without an EMA eligibility gate.
     # Independent EMA screening support is covered by its explicit guard tests.
@@ -380,6 +416,15 @@ def test_gpu_options_are_additive_and_validate_ranges():
     config["optimize"]["gpu"]["drift_halt"] = 0.0
     with pytest.raises(ValueError, match="greater than zero"):
         _resolve_options(config)
+
+
+def test_gpu_preflight_accepts_nullable_cpu_count_for_automatic_workers():
+    config = _long_only_ema_config()
+    config["optimize"]["n_cpus"] = None
+    config["optimize"]["gpu"] = {}
+    options = _resolve_options(config)
+    assert options["exact_workers"] is None
+    assert options["max_pending_exact"] is None
 
 
 def test_gpu_seed_bootstrap_options_are_explicit_and_fail_closed():
@@ -672,9 +717,7 @@ def test_gpu_lean_tm_parallelism_requires_complete_compileout_proof():
     ema_config = copy.deepcopy(config)
     ema_config["live"]["strategy_kind"] = "ema_anchor"
     assert not eligible(candidate=ema_config)
-    short_config = _directional_tm_config(
-        long_enabled=False, short_enabled=True
-    )
+    short_config = _directional_tm_config(long_enabled=False, short_enabled=True)
     short_config["live"]["market_orders_allowed"] = False
     short_config["live"]["max_realized_loss_pct"] = 1.0
     assert _gpu_lean_tm_parallelism_eligible(
@@ -719,9 +762,7 @@ def test_gpu_lean_tm_parallelism_requires_complete_compileout_proof():
     recursive_bounds["long_entry_retracement_base_pct"] = Bound(0.0, 0.02)
     assert not eligible(candidate_bounds=recursive_bounds)
     volatile_bounds = dict(bounds)
-    volatile_bounds["long_close_threshold_volatility_1h_weight"] = Bound(
-        0.0, 1.0
-    )
+    volatile_bounds["long_close_threshold_volatility_1h_weight"] = Bound(0.0, 1.0)
     assert not eligible(candidate_bounds=volatile_bounds)
 
 
@@ -852,9 +893,10 @@ def test_apple_mps_chip_probe_does_not_depend_on_shell_path(monkeypatch):
     ),
 )
 def test_gpu_lean_tm_metric_feature_detection(metric, expected_features):
-    assert mps_requested_metric_features(
-        {metric}, strategy_kind="trailing_martingale"
-    ) == expected_features
+    assert (
+        mps_requested_metric_features({metric}, strategy_kind="trailing_martingale")
+        == expected_features
+    )
 
 
 def test_gpu_lean_tm_metric_feature_detection_is_torch_free(monkeypatch):
@@ -867,9 +909,14 @@ def test_gpu_lean_tm_metric_feature_detection_is_torch_free(monkeypatch):
 def test_gpu_screening_options_are_opt_in_and_fail_closed():
     config = _long_only_ema_config()
     assert _resolve_options(config)["screening"] == {
-        "scenarios": [], "survival_fraction": 0.1, "min_survivors": 64,
+        "scenarios": [],
+        "survival_fraction": 0.1,
+        "min_survivors": 64,
     }
-    config["optimize"]["gpu"]["screening"] = {"scenarios": ["recent"], "min_survivors": 7}
+    config["optimize"]["gpu"]["screening"] = {
+        "scenarios": ["recent"],
+        "min_survivors": 7,
+    }
     with pytest.raises(ValueError, match="validate_per_generation"):
         _resolve_options(config)
     config["optimize"]["gpu"]["screening"] = {"history_fractions": [0.1, 1.0]}
@@ -930,9 +977,7 @@ def test_screening_survivors_prioritize_feasibility_then_violation():
     objectives = np.asarray([[0.0], [1.0], [2.0], [3.0]])
     violations = np.asarray([0.0, 0.0, 0.2, 0.1])
 
-    survivors = _screening_survivor_indices(
-        objectives, violations, count=3
-    )
+    survivors = _screening_survivor_indices(objectives, violations, count=3)
 
     assert set(survivors[:2]) == {0, 1}
     assert survivors[2] == 3
@@ -982,9 +1027,7 @@ def test_exact_results_are_consumed_only_as_ready_submission_prefix():
     first._ready = True
     second._ready = False
     third = _PendingResult(True)
-    assert _ready_submission_prefix({first: None, second: None, third: None}) == [
-        first
-    ]
+    assert _ready_submission_prefix({first: None, second: None, third: None}) == [first]
 
 
 def _drift_pair(*, front: bool):
@@ -1060,9 +1103,7 @@ def test_gpu_nsga2_uses_configured_pymoo_variation_operators():
     assert algorithm.mating.mutation.prob.value == 0.2
     assert type(algorithm.eliminate_duplicates).__name__ == "NoDuplicateElimination"
 
-    contract = _gpu_nsga2_checkpoint_contract(
-        config, population_size=8, n_params=5
-    )
+    contract = _gpu_nsga2_checkpoint_contract(config, population_size=8, n_params=5)
     assert contract == {
         "version": 1,
         "algorithm": "nsga2",
@@ -1129,6 +1170,12 @@ def test_trailing_martingale_bound_map_covers_both_directional_shapes():
         "close_retracement_volatility_1h_weight",
         "close_retracement_volatility_1m_weight",
         "risk_entry_cooldown_minutes",
+        "entry_cooldown_min_duration_minutes",
+        "entry_cooldown_max_duration_minutes",
+        "entry_cooldown_weights_minutes_exposure_ratio",
+        "entry_cooldown_weights_minutes_adverse_directionality",
+        "unilateralness_ema_span_1m",
+        "forager_score_weights_unilateralness",
         "risk_twel_enforcer_threshold",
         "risk_we_excess_allowance_pct",
         "risk_wel_enforcer_threshold",
@@ -1145,9 +1192,7 @@ def test_trailing_martingale_bound_map_covers_both_directional_shapes():
     }
 
     assert set(TRAILING_MARTINGALE_BOUND_MAP) == {
-        f"{side}_{suffix}"
-        for side in ("long", "short")
-        for suffix in expected_suffixes
+        f"{side}_{suffix}" for side in ("long", "short") for suffix in expected_suffixes
     }
 
 
@@ -1179,11 +1224,7 @@ def test_cpu_runtime_imports_do_not_import_torch_or_mps_kernel():
 @pytest.mark.parametrize(
     "raw_optimize",
     [
-        {
-            "scoring": [
-                {"goal": "min", "metric": "peak_recovery_days_strategy_eq"}
-            ]
-        },
+        {"scoring": [{"goal": "min", "metric": "peak_recovery_days_strategy_eq"}]},
         {
             "limits": [
                 {
@@ -1193,26 +1234,10 @@ def test_cpu_runtime_imports_do_not_import_torch_or_mps_kernel():
                 }
             ]
         },
-        {
-            "limits": {
-                "penalize_if_greater_than_peak_recovery_days_strategy_eq": 30.0
-            }
-        },
-        {
-            "limits": {
-                "lower_bound_peak_recovery_days_strategy_eq": 30.0
-            }
-        },
-        {
-            "limits": {
-                "upper_bound_peak_recovery_days_strategy_eq": 30.0
-            }
-        },
-        {
-            "limits": (
-                "--penalize_if_greater_than_peak_recovery_days_strategy_eq 30"
-            )
-        },
+        {"limits": {"penalize_if_greater_than_peak_recovery_days_strategy_eq": 30.0}},
+        {"limits": {"lower_bound_peak_recovery_days_strategy_eq": 30.0}},
+        {"limits": {"upper_bound_peak_recovery_days_strategy_eq": 30.0}},
+        {"limits": ("--penalize_if_greater_than_peak_recovery_days_strategy_eq 30")},
         {
             "limits": (
                 '[{"metric": "peak_recovery_days_strategy_eq", '
@@ -1232,9 +1257,7 @@ def test_gpu_metric_provenance_recovers_exact_only_alias_before_canonicalization
 ):
     config = {
         "optimize": {
-            "scoring": [
-                {"goal": "min", "metric": "strategy_eq_recovery_days_max"}
-            ],
+            "scoring": [{"goal": "min", "metric": "strategy_eq_recovery_days_max"}],
             "limits": [],
         },
         "_raw_effective": {"optimize": raw_optimize},
@@ -1316,9 +1339,7 @@ def test_gpu_metric_provenance_prefers_effective_over_superseded_raw_config():
         },
         "_raw_effective": {
             "optimize": {
-                "scoring": [
-                    {"goal": "max", "metric": "adg_strategy_eq"}
-                ],
+                "scoring": [{"goal": "max", "metric": "adg_strategy_eq"}],
                 "limits": [],
             }
         },
@@ -1413,7 +1434,8 @@ def test_gpu_suite_inputs_materialize_one_selected_coin():
     assert prepared[0]["coin_count"] == 1
 
 
-def test_gpu_suite_inputs_materialize_multicoin_subset():
+@pytest.mark.parametrize("device", [None, "cuda", "mps"])
+def test_gpu_suite_inputs_materialize_multicoin_subset(device, monkeypatch):
     config = _long_only_ema_config()
     config["backtest"]["suite_enabled"] = True
     config["live"]["forager_score_hysteresis_pct"] = 0.0
@@ -1439,11 +1461,25 @@ def test_gpu_suite_inputs_materialize_multicoin_subset():
         def build_scenario_candidate_config(proxy_config, _ctx):
             return copy.deepcopy(proxy_config)
 
-    prepared = _gpu_suite_scenario_inputs(config, Suite())
+    from optimization.gpu.residency import cuda_suite_residency_scope, current_cuda_residency
 
-    assert prepared[0]["coin_count"] == 3
-    assert prepared[0]["hlcvs"].shape == (10, 3, 4)
-    assert np.array_equal(prepared[0]["hlcvs"][:, 1], master[:, 2])
+    def check():
+        prepared = _gpu_suite_scenario_inputs(config, Suite())
+        assert prepared[0]["coin_count"] == 3
+        assert prepared[0]["hlcvs"].shape == (10, 3, 4)
+        np.testing.assert_array_equal(prepared[0]["hlcvs"], master[:, [0, 2, 3]])
+        if device is not None:
+            subsets = current_cuda_residency()._subset_arrays
+            assert len(subsets) == int(device == "cuda")
+            if subsets:
+                assert np.shares_memory(prepared[0]["hlcvs"], subsets[0])
+                assert not prepared[0]["hlcvs"].flags.writeable
+
+    if device is None:
+        check()
+    else:
+        monkeypatch.setattr("optimization.backends.gpu_backend.gpu_device", lambda: device)
+        cuda_suite_residency_scope(check)()
 
 
 def test_gpu_suite_inputs_accept_dual_side_multicoin_hedge_scenario():
@@ -1497,7 +1533,12 @@ def test_gpu_suite_inputs_accept_dual_side_multicoin_hedge_scenario():
 @pytest.mark.parametrize(
     ("overrides", "exchanges", "coin_indices", "message"),
     [
-        ({"live.strategy_kind": "trailing_martingale"}, ["bybit"], [0], "outside the supported"),
+        (
+            {"live.strategy_kind": "trailing_martingale"},
+            ["bybit"],
+            [0],
+            "outside the supported",
+        ),
     ],
 )
 def test_gpu_suite_inputs_reject_unsupported_scenario_scope(
@@ -1544,9 +1585,7 @@ def test_gpu_suite_inputs_materialize_each_exchange_in_one_scenario():
             }
             for exchange in exchanges
         },
-        timestamps={
-            exchange: np.arange(10, dtype=np.int64) for exchange in exchanges
-        },
+        timestamps={exchange: np.arange(10, dtype=np.int64) for exchange in exchanges},
     )
 
     class Suite:
@@ -1585,6 +1624,11 @@ def test_gpu_suite_inputs_materialize_each_exchange_in_one_scenario():
         ("backtest.starting_balance", 12_345.0, ("backtest", "starting_balance")),
         ("backtest.maker_fee_override", 0.0002, ("backtest", "maker_fee_override")),
         ("backtest.taker_fee_override", 0.0007, ("backtest", "taker_fee_override")),
+        (
+            "backtest.limit_order_fill_buffer_pct",
+            0.0015,
+            ("backtest", "limit_order_fill_buffer_pct"),
+        ),
         (
             "backtest.market_order_slippage_pct",
             0.0015,
@@ -1705,9 +1749,7 @@ def test_gpu_suite_inputs_accept_single_coin_tm_market_hsl_min_cost_and_risk():
     config["live"]["max_realized_loss_pct"] = 0.05
     config["bot"]["long"]["hsl"]["enabled"] = True
     config["bot"]["long"]["unstuck"]["enabled"] = True
-    config["bot"]["long"]["risk"][
-        "position_exposure_enforcer_enabled"
-    ] = True
+    config["bot"]["long"]["risk"]["position_exposure_enforcer_enabled"] = True
     config["bot"]["long"]["risk"]["total_exposure_enforcer_enabled"] = True
     ctx = SimpleNamespace(
         label="tm_market_hsl",
@@ -1741,10 +1783,7 @@ def test_gpu_suite_inputs_accept_single_coin_tm_market_hsl_min_cost_and_risk():
         ]
         is True
     )
-    assert (
-        prepared[0]["config"]["backtest"]["filter_by_min_effective_cost"]
-        is True
-    )
+    assert prepared[0]["config"]["backtest"]["filter_by_min_effective_cost"] is True
 
 
 def test_gpu_suite_inputs_accept_scenario_local_modeled_coin_overrides():
@@ -1758,7 +1797,7 @@ def test_gpu_suite_inputs_accept_scenario_local_modeled_coin_overrides():
                 "bot": {
                     "long": {
                         "strategy": {"ema_anchor": {"offset": 0.012}},
-                        "risk": {"entry_cooldown_minutes": 15.0},
+                        "entry_cooldown": {"base_duration_minutes": 15.0},
                     }
                 }
             }
@@ -1788,9 +1827,9 @@ def test_gpu_suite_inputs_accept_scenario_local_modeled_coin_overrides():
     prepared = _gpu_suite_scenario_inputs(config, Suite())
 
     assert prepared[0]["overrides"] == overrides
-    assert prepared[0]["config"]["coin_overrides"]["ETH"]["bot"]["long"][
-        "strategy"
-    ]["ema_anchor"]["offset"] == pytest.approx(0.012)
+    assert prepared[0]["config"]["coin_overrides"]["ETH"]["bot"]["long"]["strategy"][
+        "ema_anchor"
+    ]["offset"] == pytest.approx(0.012)
 
 
 def test_gpu_suite_inputs_accept_scenario_local_tm_coin_overrides():
@@ -1838,11 +1877,9 @@ def test_gpu_suite_inputs_accept_scenario_local_tm_coin_overrides():
     prepared = _gpu_suite_scenario_inputs(config, Suite())
 
     assert prepared[0]["overrides"] == overrides
-    assert prepared[0]["config"]["coin_overrides"]["ETH"]["bot"]["long"][
-        "strategy"
-    ]["trailing_martingale"]["entry"]["threshold_base_pct"] == pytest.approx(
-        0.012
-    )
+    assert prepared[0]["config"]["coin_overrides"]["ETH"]["bot"]["long"]["strategy"][
+        "trailing_martingale"
+    ]["entry"]["threshold_base_pct"] == pytest.approx(0.012)
 
 
 def test_gpu_suite_inputs_accept_modeled_scenario_coin_hsl_overrides():
@@ -1851,9 +1888,7 @@ def test_gpu_suite_inputs_accept_modeled_scenario_coin_hsl_overrides():
     config["live"]["approved_coins"]["long"] = ["BTC", "ETH"]
     config["bot"]["long"]["risk"]["n_positions"] = 2
     overrides = {
-        "coin_overrides": {
-            "ETH": {"bot": {"long": {"hsl": {"enabled": True}}}}
-        }
+        "coin_overrides": {"ETH": {"bot": {"long": {"hsl": {"enabled": True}}}}}
     }
     ctx = SimpleNamespace(
         label="unsupported_coin_risk",
@@ -1887,17 +1922,7 @@ def test_gpu_suite_inputs_reject_invalid_scenario_coin_hsl_values():
     config["live"]["approved_coins"]["long"] = ["BTC", "ETH"]
     config["bot"]["long"]["risk"]["n_positions"] = 2
     overrides = {
-        "coin_overrides": {
-            "ETH": {
-                "bot": {
-                    "long": {
-                        "hsl": {
-                            "tier_ratios": {"yellow": 0.9, "orange": 0.2}
-                        }
-                    }
-                }
-            }
-        }
+        "coin_overrides": {"ETH": {"bot": {"long": {"hsl": {"red_threshold": -1.0}}}}}
     }
     ctx = SimpleNamespace(
         label="invalid_coin_hsl",
@@ -1917,12 +1942,10 @@ def test_gpu_suite_inputs_reject_invalid_scenario_coin_hsl_values():
         @staticmethod
         def build_scenario_candidate_config(proxy_config, _ctx):
             scenario = copy.deepcopy(proxy_config)
-            scenario["coin_overrides"] = copy.deepcopy(
-                overrides["coin_overrides"]
-            )
+            scenario["coin_overrides"] = copy.deepcopy(overrides["coin_overrides"])
             return scenario
 
-    with pytest.raises(ValueError, match="tier_ratios must satisfy"):
+    with pytest.raises(ValueError, match="red_threshold"):
         _gpu_suite_scenario_inputs(config, Suite())
 
 
@@ -1994,18 +2017,22 @@ def test_gpu_suite_search_context_allows_legacy_single_coin_topologies():
 def test_gpu_suite_search_context_accepts_single_side_multicoin_trailing_martingale():
     config = _directional_tm_config(long_enabled=True, short_enabled=False)
 
-    assert _gpu_suite_search_context(
-        [_suite_search_input("multi", config, 2)]
-    ) == (2, 2, ("long",))
+    assert _gpu_suite_search_context([_suite_search_input("multi", config, 2)]) == (
+        2,
+        2,
+        ("long",),
+    )
 
 
 def test_gpu_suite_search_context_accepts_dual_side_multicoin_trailing_martingale():
     config = _directional_tm_config(long_enabled=True, short_enabled=True)
     config["live"]["hedge_mode"] = True
 
-    assert _gpu_suite_search_context(
-        [_suite_search_input("multi", config, 2)]
-    ) == (2, 2, ("long", "short"))
+    assert _gpu_suite_search_context([_suite_search_input("multi", config, 2)]) == (
+        2,
+        2,
+        ("long", "short"),
+    )
 
 
 def test_gpu_suite_search_context_rejects_mixed_multicoin_strategy_kinds():
@@ -2123,9 +2150,7 @@ def test_gpu_suite_inputs_accept_and_preserve_bot_override_scope():
 
     assert prepared[0]["overrides"] == overrides
     assert (
-        prepared[0]["config"]["bot"]["long"]["strategy"]["ema_anchor"][
-            "base_qty_pct"
-        ]
+        prepared[0]["config"]["bot"]["long"]["strategy"]["ema_anchor"]["base_qty_pct"]
         == 0.025
     )
 
@@ -2151,9 +2176,7 @@ def test_gpu_suite_inputs_accept_ema_single_coin_total_exposure_repair_override(
         @staticmethod
         def build_scenario_candidate_config(proxy_config, _ctx):
             scenario = copy.deepcopy(proxy_config)
-            scenario["bot"]["long"]["risk"][
-                "total_exposure_enforcer_enabled"
-            ] = True
+            scenario["bot"]["long"]["risk"]["total_exposure_enforcer_enabled"] = True
             return scenario
 
     prepared = _gpu_suite_scenario_inputs(config, Suite())
@@ -2217,9 +2240,7 @@ def test_gpu_suite_inputs_accept_combined_dataset_and_coin_sources():
     config["backtest"]["coin_sources"] = {"BTC": "bybit", "ETH": "binance"}
     ctx = SimpleNamespace(
         label="mixed_sources",
-        config={
-            "backtest": {"coin_sources": {"BTC": "bybit", "ETH": "binance"}}
-        },
+        config={"backtest": {"coin_sources": {"BTC": "bybit", "ETH": "binance"}}},
         overrides={},
         exchanges=["combined"],
         msss={
@@ -2287,11 +2308,7 @@ def test_gpu_suite_inputs_ignore_conflicting_source_for_excluded_coin():
     config["backtest"]["suite_enabled"] = True
     ctx = SimpleNamespace(
         label="bybit_btc_only",
-        config={
-            "backtest": {
-                "coin_sources": {"BTC": "bybit", "ETH": "binance"}
-            }
-        },
+        config={"backtest": {"coin_sources": {"BTC": "bybit", "ETH": "binance"}}},
         overrides={},
         exchanges=["bybit"],
         msss={"bybit": {"BTC": {}, "__meta__": {}}},
@@ -2386,8 +2403,7 @@ def test_gpu_suite_proxy_rows_use_canonical_suite_scorer():
         @staticmethod
         def score_scenario_results(results):
             values = [
-                result.metrics["stats"]["adg_strategy_eq"]["mean"]
-                for result in results
+                result.metrics["stats"]["adg_strategy_eq"]["mean"] for result in results
             ]
             return {
                 "objectives": (-min(values),),
@@ -2528,22 +2544,28 @@ def test_suite_limit_metric_value_respects_reducer_and_scenario():
         }
     }
 
-    assert _suite_limit_metric_value(
-        payload,
-        {
-            "metric": "drawdown_worst_strategy_eq",
-            "reducer": "max",
-            "scenario": None,
-        },
-    ) == 0.4
-    assert _suite_limit_metric_value(
-        payload,
-        {
-            "metric": "drawdown_worst_strategy_eq",
-            "reducer": "mean",
-            "scenario": "stress",
-        },
-    ) == 0.4
+    assert (
+        _suite_limit_metric_value(
+            payload,
+            {
+                "metric": "drawdown_worst_strategy_eq",
+                "reducer": "max",
+                "scenario": None,
+            },
+        )
+        == 0.4
+    )
+    assert (
+        _suite_limit_metric_value(
+            payload,
+            {
+                "metric": "drawdown_worst_strategy_eq",
+                "reducer": "mean",
+                "scenario": "stress",
+            },
+        )
+        == 0.4
+    )
 
 
 @pytest.mark.parametrize(
@@ -2557,9 +2579,7 @@ def test_suite_limit_metric_value_respects_reducer_and_scenario():
             "trailing_martingale",
         ),
         (
-            lambda config: config["backtest"].__setitem__(
-                "btc_collateral_cap", 0.5
-            ),
+            lambda config: config["backtest"].__setitem__("btc_collateral_cap", 0.5),
             "btc_collateral_cap",
         ),
         (
@@ -2646,7 +2666,8 @@ def test_gpu_preparation_preflight_screening_requires_suite_and_allows_ema():
     with pytest.raises(ValueError, match="requires backtest.suite_enabled"):
         validate_gpu_preparation_scope(config, torch_module=_fake_torch_with_mps())
     validate_gpu_preparation_scope(
-        config, {"enabled": True, "scenarios": [{"label": "recent"}]},
+        config,
+        {"enabled": True, "scenarios": [{"label": "recent"}]},
         torch_module=_fake_torch_with_mps(),
     )
 
@@ -2691,9 +2712,7 @@ def test_gpu_preparation_preflight_validates_effective_bot_suite_values():
 
     with pytest.raises(
         ValueError,
-        match=(
-            r"bot\.long\.risk\.position_exposure_enforcer_enabled=false"
-        ),
+        match=(r"bot\.long\.risk\.position_exposure_enforcer_enabled=false"),
     ):
         validate_gpu_preparation_scope(
             config,
@@ -2778,9 +2797,7 @@ def test_gpu_foundation_accepts_baseline_tm_single_coin_market_execution():
         ("long_entry_retracement_base_pct", 1.0e-50, 0.1),
     ],
 )
-def test_gpu_tm_market_execution_accepts_entry_or_close_mode_crossing(
-    key, low, high
-):
+def test_gpu_tm_market_execution_accepts_entry_or_close_mode_crossing(key, low, high):
     config = _long_only_ema_config()
     config["live"]["strategy_kind"] = "trailing_martingale"
     config["live"]["market_orders_allowed"] = True
@@ -2860,9 +2877,7 @@ def test_gpu_multicoin_tm_market_execution_accepts_recursive_entry_mode_bounds()
     }
     bounds["long_entry_retracement_base_pct"] = Bound(0.0, 0.0)
 
-    _validate_tm_market_mode_bounds(
-        bounds, {}, {"long"}, config, coin_count=3
-    )
+    _validate_tm_market_mode_bounds(bounds, {}, {"long"}, config, coin_count=3)
 
 
 @pytest.mark.parametrize("close_bounds", [Bound(0.0, 0.0), Bound(-0.1, 0.0)])
@@ -2877,9 +2892,7 @@ def test_gpu_multicoin_tm_market_execution_accepts_recursive_close_bounds(
         "long_close_retracement_base_pct": close_bounds,
     }
 
-    _validate_tm_market_mode_bounds(
-        bounds, {}, {"long"}, config, coin_count=3
-    )
+    _validate_tm_market_mode_bounds(bounds, {}, {"long"}, config, coin_count=3)
 
 
 def test_gpu_multicoin_tm_market_execution_accepts_unstuck_config():
@@ -2973,12 +2986,8 @@ def test_gpu_multicoin_tm_market_execution_accepts_trailing_baseline():
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda config: config["live"].__setitem__(
-            "max_realized_loss_pct", 0.5
-        ),
-        lambda config: config["bot"]["long"]["unstuck"].__setitem__(
-            "enabled", True
-        ),
+        lambda config: config["live"].__setitem__("max_realized_loss_pct", 0.5),
+        lambda config: config["bot"]["long"]["unstuck"].__setitem__("enabled", True),
         lambda config: config["bot"]["long"]["risk"].__setitem__(
             "position_exposure_enforcer_enabled", True
         ),
@@ -3012,9 +3021,7 @@ def test_gpu_market_execution_accepts_single_coin_ema_risk_ordering(risk_feature
 
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("signal_mode", ["unified", "pside", "coin"])
-def test_gpu_market_execution_accepts_single_coin_hsl(
-    strategy_kind, signal_mode
-):
+def test_gpu_market_execution_accepts_single_coin_hsl(strategy_kind, signal_mode):
     config = _long_only_ema_config()
     config["live"]["strategy_kind"] = strategy_kind
     config["live"]["market_orders_allowed"] = True
@@ -3082,7 +3089,7 @@ def test_gpu_hsl_fails_closed_for_unknown_panic_close_type():
     )
     config["live"]["pnls_max_lookback_days"] = "all"
 
-    with pytest.raises(ValueError, match="to be limit or market"):
+    with pytest.raises(ValueError, match="panic_close_order_type"):
         _validate_scope(config, _Evaluator())
 
 
@@ -3094,6 +3101,8 @@ def test_gpu_hsl_accepts_dual_side_single_coin_signal_modes(signal_mode):
     config["live"]["hsl_signal_mode"] = signal_mode
 
     assert _validate_scope(config, _Evaluator()) == "bybit"
+
+
 @pytest.mark.parametrize("signal_mode", ["unified", "pside", "coin"])
 def test_gpu_hsl_accepts_one_sided_multicoin_signal_modes(signal_mode):
     config = _long_only_ema_config()
@@ -3189,9 +3198,7 @@ def test_gpu_hsl_metrics_reject_only_dual_multicoin_tier_overlap():
             {"hard_stop_panic_close_loss_drawdown_pct_mean"},
             coin_count=3,
             enabled_sides=["long", "short"],
-            hard_stop_metrics={
-                "hard_stop_panic_close_loss_drawdown_pct_mean"
-            },
+            hard_stop_metrics={"hard_stop_panic_close_loss_drawdown_pct_mean"},
         )
 
     _validate_hsl_metric_topology(
@@ -3262,9 +3269,9 @@ def test_gpu_tm_realized_loss_gate_accepts_multicoin():
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("entry_gate", [False, True])
-@pytest.mark.parametrize("allowance_mode", ["bounded", "legacy_raw"])
+@pytest.mark.parametrize("scale_budget", [False, True])
 def test_gpu_foundation_accepts_single_coin_exposure_headroom_policy(
-    strategy_kind, side, entry_gate, allowance_mode
+    strategy_kind, side, entry_gate, scale_budget
 ):
     builder = (
         _directional_tm_config
@@ -3274,7 +3281,7 @@ def test_gpu_foundation_accepts_single_coin_exposure_headroom_policy(
     config = builder(long_enabled=side == "long", short_enabled=side == "short")
     risk = config["bot"][side]["risk"]
     risk["we_excess_allowance_pct"] = 0.25
-    risk["we_excess_allowance_mode"] = allowance_mode
+    config["bot"][side]["hsl"]["scale_budget_with_excess_allowance"] = scale_budget
     risk["total_exposure_entry_gate_enabled"] = entry_gate
     risk["total_exposure_enforcer_threshold"] = 0.8
 
@@ -3291,9 +3298,7 @@ def test_gpu_foundation_accepts_tm_position_exposure_repair(side, suite_enabled)
     config["bot"][side]["risk"]["position_exposure_enforcer_threshold"] = 0.8
     config["backtest"]["suite_enabled"] = suite_enabled
 
-    assert (
-        _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
-    )
+    assert _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
 
 
 def test_gpu_foundation_keeps_ema_position_exposure_repair_fail_closed():
@@ -3306,13 +3311,9 @@ def test_gpu_foundation_keeps_ema_position_exposure_repair_fail_closed():
 
 
 @pytest.mark.parametrize("side", ["long", "short"])
-@pytest.mark.parametrize(
-    "policy", ["reduce_overweight", "reduce_portfolio"]
-)
+@pytest.mark.parametrize("policy", ["reduce_overweight", "reduce_portfolio"])
 @pytest.mark.parametrize("suite_enabled", [False, True])
-def test_gpu_foundation_accepts_tm_total_exposure_repair(
-    side, policy, suite_enabled
-):
+def test_gpu_foundation_accepts_tm_total_exposure_repair(side, policy, suite_enabled):
     config = _directional_tm_config(
         long_enabled=side == "long", short_enabled=side == "short"
     )
@@ -3322,16 +3323,11 @@ def test_gpu_foundation_accepts_tm_total_exposure_repair(
     risk["total_exposure_enforcer_threshold"] = 0.8
     config["backtest"]["suite_enabled"] = suite_enabled
 
-    assert (
-        _validate_scope(config, _Evaluator(), allow_suite=suite_enabled)
-        == "bybit"
-    )
+    assert _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
 
 
 @pytest.mark.parametrize("side", ["long", "short"])
-@pytest.mark.parametrize(
-    "policy", ["reduce_overweight", "reduce_portfolio"]
-)
+@pytest.mark.parametrize("policy", ["reduce_overweight", "reduce_portfolio"])
 def test_gpu_multicoin_accepts_tm_total_exposure_repair(side, policy):
     config = _directional_tm_config(
         long_enabled=side == "long", short_enabled=side == "short"
@@ -3379,22 +3375,14 @@ def test_gpu_dual_multicoin_accepts_tm_coin_override_exposure_repair():
     config["live"]["hedge_mode"] = True
     config["backtest"]["dynamic_wel_by_tradability"] = True
     config["coin_overrides"] = {
-        "ETH": {
-            "bot": {
-                "long": {
-                    "risk": {"position_exposure_enforcer_enabled": True}
-                }
-            }
-        }
+        "ETH": {"bot": {"long": {"risk": {"position_exposure_enforcer_enabled": True}}}}
     }
 
     assert _validate_scope(config, _MulticoinEvaluator()) == "bybit"
 
 
 @pytest.mark.parametrize("side", ["long", "short"])
-@pytest.mark.parametrize(
-    "policy", ["reduce_overweight", "reduce_portfolio"]
-)
+@pytest.mark.parametrize("policy", ["reduce_overweight", "reduce_portfolio"])
 @pytest.mark.parametrize("suite_enabled", [False, True])
 def test_gpu_foundation_accepts_ema_single_coin_total_exposure_repair(
     side, policy, suite_enabled
@@ -3408,10 +3396,7 @@ def test_gpu_foundation_accepts_ema_single_coin_total_exposure_repair(
     risk["total_exposure_enforcer_threshold"] = 0.8
     config["backtest"]["suite_enabled"] = suite_enabled
 
-    assert (
-        _validate_scope(config, _Evaluator(), allow_suite=suite_enabled)
-        == "bybit"
-    )
+    assert _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
 
 
 @pytest.mark.parametrize("hedge_mode", [False, True])
@@ -3429,13 +3414,9 @@ def test_gpu_foundation_accepts_ema_dual_single_coin_total_exposure_repair(
 
 
 @pytest.mark.parametrize("side", ["long", "short"])
-@pytest.mark.parametrize(
-    "policy", ["reduce_overweight", "reduce_portfolio"]
-)
+@pytest.mark.parametrize("policy", ["reduce_overweight", "reduce_portfolio"])
 @pytest.mark.parametrize("suite_enabled", [False, True])
-def test_gpu_multicoin_accepts_ema_total_exposure_repair(
-    side, policy, suite_enabled
-):
+def test_gpu_multicoin_accepts_ema_total_exposure_repair(side, policy, suite_enabled):
     config = _directional_ema_config(
         long_enabled=side == "long", short_enabled=side == "short"
     )
@@ -3456,9 +3437,7 @@ def test_gpu_multicoin_accepts_ema_total_exposure_repair(
     config["backtest"]["suite_enabled"] = suite_enabled
 
     assert (
-        _validate_scope(
-            config, _MulticoinEvaluator(), allow_suite=suite_enabled
-        )
+        _validate_scope(config, _MulticoinEvaluator(), allow_suite=suite_enabled)
         == "bybit"
     )
 
@@ -3482,9 +3461,9 @@ def test_gpu_dual_multicoin_accepts_ema_total_exposure_repair():
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("entry_gate", [False, True])
-@pytest.mark.parametrize("allowance_mode", ["bounded", "legacy_raw"])
+@pytest.mark.parametrize("scale_budget", [False, True])
 def test_gpu_multicoin_accepts_exposure_headroom_policy(
-    strategy_kind, side, entry_gate, allowance_mode
+    strategy_kind, side, entry_gate, scale_budget
 ):
     builder = (
         _directional_tm_config
@@ -3496,7 +3475,7 @@ def test_gpu_multicoin_accepts_exposure_headroom_policy(
     risk = config["bot"][side]["risk"]
     risk["n_positions"] = 2
     risk["we_excess_allowance_pct"] = 0.25
-    risk["we_excess_allowance_mode"] = allowance_mode
+    config["bot"][side]["hsl"]["scale_budget_with_excess_allowance"] = scale_budget
     risk["total_exposure_entry_gate_enabled"] = entry_gate
     risk["total_exposure_enforcer_threshold"] = 0.8
     config["backtest"]["dynamic_wel_by_tradability"] = True
@@ -3519,9 +3498,7 @@ def test_gpu_foundation_accepts_single_coin_min_effective_cost_filter(
     config["backtest"]["filter_by_min_effective_cost"] = True
     config["backtest"]["suite_enabled"] = suite_enabled
 
-    assert (
-        _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
-    )
+    assert _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
 
 
 def test_gpu_foundation_rejects_min_effective_cost_without_positive_liquidation_floor():
@@ -3547,10 +3524,7 @@ def test_gpu_foundation_accepts_dual_side_min_effective_cost_filter(
     config["backtest"]["filter_by_min_effective_cost"] = True
     config["backtest"]["suite_enabled"] = suite_enabled
 
-    assert (
-        _validate_scope(config, _Evaluator(), allow_suite=suite_enabled)
-        == "bybit"
-    )
+    assert _validate_scope(config, _Evaluator(), allow_suite=suite_enabled) == "bybit"
 
 
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
@@ -3608,8 +3582,8 @@ def test_gpu_multicoin_accepts_static_ema_coin_overrides(side):
             "bot": {
                 side: {
                     "strategy": {"ema_anchor": {"offset": 0.02, "ema_span_0": 90}},
+                    "entry_cooldown": {"base_duration_minutes": 15},
                     "risk": {
-                        "entry_cooldown_minutes": 15,
                         "we_excess_allowance_pct": 0.25,
                     },
                     "wallet_exposure_limit": 0.4,
@@ -3666,9 +3640,7 @@ def test_gpu_coin_override_policy_covers_cpu_backtest_effective_allowlist(
         path = tuple(dotted_path.split("."))
         config["coin_overrides"] = {
             "ETH": {
-                "bot": {
-                    "long": _nested_patch(path, _nested_value(side_config, path))
-                }
+                "bot": {"long": _nested_patch(path, _nested_value(side_config, path))}
             }
         }
         _validate_gpu_coin_overrides(
@@ -3777,9 +3749,7 @@ def test_gpu_coin_overrides_accept_disabled_side_inert_forced_mode(
         coin_count=3,
     )
 
-    assert (
-        f"coin_overrides.ETH.live.forced_mode_{disabled_side}" in caplog.text
-    )
+    assert f"coin_overrides.ETH.live.forced_mode_{disabled_side}" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -3820,9 +3790,7 @@ def test_gpu_ema_coin_overrides_reject_exact_inapplicable_position_enforcer(
     config["coin_overrides"] = {
         "ETH": {
             "bot": {
-                "long": {
-                    "risk": {risk_key: config["bot"]["long"]["risk"][risk_key]}
-                }
+                "long": {"risk": {risk_key: config["bot"]["long"]["risk"][risk_key]}}
             }
         }
     }
@@ -3840,20 +3808,8 @@ def test_gpu_ema_coin_overrides_reject_exact_inapplicable_position_enforcer(
     "patch",
     [
         {"bot": {"long": {"risk": {"n_positions": 2}}}},
-        {
-            "bot": {
-                "long": {
-                    "risk": {"we_excess_allowance_mode": "legacy_raw"}
-                }
-            }
-        },
-        {
-            "bot": {
-                "long": {
-                    "risk": {"position_exposure_enforcer_enabled": True}
-                }
-            }
-        },
+        {"bot": {"long": {"risk": {"we_excess_allowance_mode": "legacy_raw"}}}},
+        {"bot": {"long": {"risk": {"position_exposure_enforcer_enabled": True}}}},
         {"bot": {"short": {"strategy": {"ema_anchor": {"offset": 0.02}}}}},
     ],
 )
@@ -3882,12 +3838,8 @@ def test_gpu_multicoin_coin_overrides_reject_unmodeled_leaves(patch):
 def test_gpu_multicoin_accepts_enabled_side_forced_normal_override(
     strategy_kind, config_factory, side
 ):
-    config = config_factory(
-        long_enabled=side == "long", short_enabled=side == "short"
-    )
-    config["coin_overrides"] = {
-        "ETH": {"live": {f"forced_mode_{side}": "normal"}}
-    }
+    config = config_factory(long_enabled=side == "long", short_enabled=side == "short")
+    config["coin_overrides"] = {"ETH": {"live": {f"forced_mode_{side}": "normal"}}}
 
     _validate_gpu_coin_overrides(
         config,
@@ -3909,10 +3861,7 @@ def test_gpu_multicoin_accepts_complete_coin_hsl_override_group():
                         "red_threshold": 0.2,
                         "ema_span_minutes": 5.5,
                         "cooldown_minutes_after_red": 12.5,
-                        "no_restart_drawdown_threshold": 0.8,
                         "restart_after_red_policy": "always",
-                        "tier_ratios": {"yellow": 0.4, "orange": 0.75},
-                        "orange_tier_mode": "graceful_stop",
                         "panic_close_order_type": "market",
                     }
                 }
@@ -3932,8 +3881,8 @@ def test_gpu_multicoin_accepts_complete_coin_hsl_override_group():
     ("hsl_patch", "match"),
     [
         ({"enabled": "yes"}, "enabled must be a boolean"),
-        ({"red_threshold": -0.2}, "red_threshold must satisfy"),
-        ({"ema_span_minutes": 0.0}, "ema_span_minutes must be >= 1"),
+        ({"red_threshold": -0.2}, "red_threshold.*finite supported range"),
+        ({"ema_span_minutes": 0.0}, "ema_span_minutes.*finite supported range"),
         (
             {"ema_span_minutes": float(np.finfo(np.float32).max) * 2.0},
             "representable as float32",
@@ -3943,38 +3892,14 @@ def test_gpu_multicoin_accepts_complete_coin_hsl_override_group():
             {"cooldown_minutes_after_red": float(np.finfo(np.float32).max) * 2.0},
             "representable as float32",
         ),
-        (
-            {"no_restart_drawdown_threshold": 0.01},
-            "no_restart_drawdown_threshold must satisfy",
-        ),
         ({"restart_after_red_policy": "sometimes"}, "restart_after_red_policy"),
-        ({"restart_after_red_policy": " ALWAYS "}, "restart_after_red_policy"),
-        (
-            {"tier_ratios": {"yellow": 0.8, "orange": 0.4}},
-            "tier_ratios must satisfy",
-        ),
-        (
-            {
-                "tier_ratios": {
-                    "yellow": 0.50000001,
-                    "orange": 0.50000002,
-                }
-            },
-            "remain strictly ordered.*float32",
-        ),
-        ({"tier_ratios": None}, "tier_ratios must be a dictionary"),
-        ({"orange_tier_mode": "tp_only"}, "orange_tier_mode"),
-        ({"orange_tier_mode": "GRACEFUL_STOP"}, "orange_tier_mode"),
-        ({"panic_close_order_type": "makret"}, "to be limit or market"),
-        ({"panic_close_order_type": " market "}, "to be limit or market"),
+        ({"panic_close_order_type": "makret"}, "panic_close_order_type"),
     ],
 )
 def test_gpu_multicoin_rejects_invalid_coin_hsl_values(hsl_patch, match):
     config = _directional_ema_config(long_enabled=True, short_enabled=False)
     config["live"]["hsl_signal_mode"] = "coin"
-    config["coin_overrides"] = {
-        "ETH": {"bot": {"long": {"hsl": hsl_patch}}}
-    }
+    config["coin_overrides"] = {"ETH": {"bot": {"long": {"hsl": hsl_patch}}}}
 
     with pytest.raises((TypeError, ValueError), match=match):
         _validate_gpu_coin_overrides(
@@ -3996,9 +3921,7 @@ def test_gpu_multicoin_coin_hsl_overrides_fail_closed_outside_one_side_coin_mode
         long_enabled=True, short_enabled="short" in enabled_sides
     )
     config["live"]["hsl_signal_mode"] = signal_mode
-    config["coin_overrides"] = {
-        "ETH": {"bot": {"long": {"hsl": {"enabled": True}}}}
-    }
+    config["coin_overrides"] = {"ETH": {"bot": {"long": {"hsl": {"enabled": True}}}}}
 
     with pytest.raises(ValueError, match="require live.hsl_signal_mode=coin"):
         _validate_gpu_coin_overrides(
@@ -4083,8 +4006,8 @@ def test_gpu_multicoin_accepts_static_tm_coin_overrides(side):
                             "close": {"qty_pct": 0.25},
                         }
                     },
+                    "entry_cooldown": {"base_duration_minutes": 15},
                     "risk": {
-                        "entry_cooldown_minutes": 15,
                         "we_excess_allowance_pct": 0.25,
                         "position_exposure_enforcer_enabled": True,
                         "position_exposure_enforcer_threshold": 0.8,
@@ -4133,9 +4056,7 @@ def test_gpu_multicoin_tm_coin_overrides_accept_entry_ema_gate_mode(mode):
             "bot": {
                 "long": {
                     "strategy": {
-                        "trailing_martingale": {
-                            "entry": {"ema_gate_mode": mode}
-                        }
+                        "trailing_martingale": {"entry": {"ema_gate_mode": mode}}
                     }
                 }
             }
@@ -4250,9 +4171,7 @@ def test_gpu_multicoin_ema_market_execution_accepts_protective_reducers(feature)
     if feature == "loss_gate":
         config["live"]["max_realized_loss_pct"] = 0.05
     elif feature == "twel":
-        config["bot"]["long"]["risk"][
-            "total_exposure_enforcer_enabled"
-        ] = True
+        config["bot"]["long"]["risk"]["total_exposure_enforcer_enabled"] = True
     elif feature == "unstuck":
         config["bot"]["long"]["unstuck"]["enabled"] = True
     else:
@@ -4388,9 +4307,7 @@ def test_gpu_multicoin_tm_recursive_entry_accepts_twel_entry_gate():
     strategy["entry"]["retracement_base_pct"] = 0.01
     strategy["close"]["retracement_base_pct"] = 0.01
     strategy["entry"]["retracement_base_pct"] = 0.0
-    config["bot"]["long"]["risk"][
-        "total_exposure_entry_gate_enabled"
-    ] = True
+    config["bot"]["long"]["risk"]["total_exposure_entry_gate_enabled"] = True
 
     assert _validate_scope(config, _MulticoinEvaluator()) == "bybit"
 
@@ -4401,9 +4318,7 @@ def test_gpu_multicoin_tm_market_execution_accepts_recursive_entry():
     config["live"]["approved_coins"] = {"long": coins, "short": coins}
     config["live"]["market_orders_allowed"] = True
     for side in ("long", "short"):
-        config["bot"][side]["risk"][
-            "total_exposure_entry_gate_enabled"
-        ] = False
+        config["bot"][side]["risk"]["total_exposure_entry_gate_enabled"] = False
         strategy = config["bot"][side]["strategy"]["trailing_martingale"]
         strategy["entry"]["retracement_base_pct"] = 0.0
         strategy["close"]["retracement_base_pct"] = 0.01
@@ -4440,9 +4355,7 @@ def test_gpu_multicoin_tm_market_execution_validates_static_override_modes(
             "bot": {
                 "long": {
                     "strategy": {
-                        "trailing_martingale": {
-                            branch: {"retracement_base_pct": value}
-                        }
+                        "trailing_martingale": {branch: {"retracement_base_pct": value}}
                     }
                 }
             }
@@ -4489,7 +4402,7 @@ def test_gpu_multicoin_foundation_accepts_dual_side_coin_overrides():
                 },
                 "short": {
                     "strategy": {"ema_anchor": {"offset": 0.03}},
-                    "risk": {"entry_cooldown_minutes": 15},
+                    "entry_cooldown": {"base_duration_minutes": 15},
                 },
             }
         }
@@ -4545,9 +4458,7 @@ def test_gpu_foundation_accepts_weighted_daily_series_metrics(metric, goal):
         ("omega_ratio_w_btc", "max"),
     ],
 )
-def test_gpu_foundation_accepts_btc_account_metrics_without_collateral(
-    metric, goal
-):
+def test_gpu_foundation_accepts_btc_account_metrics_without_collateral(metric, goal):
     config = _long_only_ema_config()
     config["backtest"]["btc_collateral_cap"] = 0.0
     config["optimize"]["scoring"] = [{"goal": goal, "metric": metric}]
@@ -4765,9 +4676,7 @@ def test_gpu_recovery_distribution_metrics_accept_supported_multicoin(metric):
         config["live"]["hedge_mode"] = True
         config["live"]["forager_score_hysteresis_pct"] = 0.0
         config["backtest"]["dynamic_wel_by_tradability"] = True
-        config["optimize"]["scoring"] = [
-            {"goal": "min", "metric": metric}
-        ]
+        config["optimize"]["scoring"] = [{"goal": "min", "metric": metric}]
 
         assert _validate_scope(config, _MulticoinEvaluator()) == "bybit"
 
@@ -4851,9 +4760,7 @@ def test_gpu_tm_multicoin_bound_map_exposes_strategy_forager_and_positions(side)
 
 
 def test_gpu_short_multicoin_mirror_includes_long_forager_source_dimensions():
-    bound_map = _ema_multicoin_bound_map(
-        "short", {"mirror_short_from_long"}
-    )
+    bound_map = _ema_multicoin_bound_map("short", {"mirror_short_from_long"})
 
     for suffix in (
         "forager_volume_ema_span_1m",
@@ -4872,9 +4779,7 @@ def test_gpu_short_multicoin_mirror_includes_long_forager_source_dimensions():
     ("long_enabled", "short_enabled"),
     [(True, False), (False, True), (True, True)],
 )
-def test_gpu_foundation_accepts_each_directional_ema_mode(
-    long_enabled, short_enabled
-):
+def test_gpu_foundation_accepts_each_directional_ema_mode(long_enabled, short_enabled):
     config = _directional_ema_config(
         long_enabled=long_enabled, short_enabled=short_enabled
     )
@@ -4900,9 +4805,9 @@ def test_gpu_foundation_accepts_recursive_trailing_martingale_bounds():
     config = _directional_tm_config(long_enabled=True, short_enabled=True)
     for side in ("long", "short"):
         for mode in ("entry", "close"):
-            config["optimize"]["bounds"][side]["strategy"][
-                "trailing_martingale"
-            ][mode]["retracement_base_pct"] = [-0.01, 0.01, 0.0001]
+            config["optimize"]["bounds"][side]["strategy"]["trailing_martingale"][mode][
+                "retracement_base_pct"
+            ] = [-0.01, 0.01, 0.0001]
 
     assert _validate_scope(config, _Evaluator()) == "bybit"
 
@@ -4918,20 +4823,14 @@ def test_gpu_unstuck_search_excludes_disabled_side_genes():
     config = _directional_ema_config(long_enabled=True, short_enabled=True)
 
     assert _gpu_unstuck_search_sides(config, []) == set()
-    assert not _gpu_unstuck_parameter_active(
-        "long_unstuck_close_pct", set()
-    )
+    assert not _gpu_unstuck_parameter_active("long_unstuck_close_pct", set())
     assert _gpu_unstuck_parameter_active("long_offset", set())
 
     config["bot"]["short"]["unstuck"]["enabled"] = True
     search_sides = _gpu_unstuck_search_sides(config, [])
     assert search_sides == {"short"}
-    assert not _gpu_unstuck_parameter_active(
-        "long_unstuck_threshold", search_sides
-    )
-    assert _gpu_unstuck_parameter_active(
-        "short_unstuck_threshold", search_sides
-    )
+    assert not _gpu_unstuck_parameter_active("long_unstuck_threshold", search_sides)
+    assert _gpu_unstuck_parameter_active("short_unstuck_threshold", search_sides)
 
 
 def test_gpu_unstuck_search_keeps_genes_enabled_by_coin_override():
@@ -4953,9 +4852,7 @@ def test_gpu_suite_keeps_unstuck_genes_used_by_any_scenario():
     scenario = copy.deepcopy(base)
     scenario["bot"]["long"]["unstuck"]["enabled"] = True
 
-    assert _gpu_unstuck_search_sides(
-        base, [{"config": scenario}]
-    ) == {"long"}
+    assert _gpu_unstuck_search_sides(base, [{"config": scenario}]) == {"long"}
 
 
 def test_gpu_suite_keeps_mirrored_unstuck_source_genes():
@@ -4970,9 +4867,7 @@ def test_gpu_suite_keeps_mirrored_unstuck_source_genes():
     )
 
     assert search_sides == {"long", "short"}
-    assert _gpu_unstuck_parameter_active(
-        "long_unstuck_close_pct", search_sides
-    )
+    assert _gpu_unstuck_parameter_active("long_unstuck_close_pct", search_sides)
 
 
 def test_gpu_foundation_accepts_single_side_multicoin_unstuck():
@@ -5047,9 +4942,7 @@ def test_validation_selection_includes_front_and_broad_probes():
 
 
 def test_validation_selection_uses_true_front_when_no_off_front_evidence_exists():
-    objectives = np.array(
-        [[0.0, 3.0], [1.0, 2.0], [2.0, 1.0], [3.0, 0.0]]
-    )
+    objectives = np.array([[0.0, 3.0], [1.0, 2.0], [2.0, 1.0], [3.0, 0.0]])
     scores = objectives.mean(axis=1)
 
     selected = _select_validation_indices(objectives, scores, total=3, probes=1)
@@ -5087,18 +4980,14 @@ def test_validation_selection_uses_all_available_off_front_probes():
     chosen = selected[:8]
     assert sum(is_probe for _index, is_probe, _front in chosen) == 2
     assert sum(is_front for _index, _probe, is_front in chosen) == 6
-    assert {
-        index for index, is_probe, _front in chosen if is_probe
-    } == {8, 9}
-    assert {
-        index for index, _is_probe, is_front in chosen if is_front
-    } == {index for index, _is_probe, _front in diversity_baseline[:6]}
+    assert {index for index, is_probe, _front in chosen if is_probe} == {8, 9}
+    assert {index for index, _is_probe, is_front in chosen if is_front} == {
+        index for index, _is_probe, _front in diversity_baseline[:6]
+    }
 
 
 def test_validation_selection_prefers_feasible_candidates():
-    objectives = np.array(
-        [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]
-    )
+    objectives = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]])
     scores = objectives.mean(axis=1)
     violations = np.array([2.0, 0.0, -1.0, 3.0, 0.0])
 
@@ -5125,9 +5014,7 @@ def test_validation_broad_probes_exclude_the_entire_proxy_front():
 
     selected = _select_validation_indices(objectives, scores, total=5, probes=2)
 
-    assert {
-        index for index, is_probe, _front in selected[:5] if is_probe
-    } == {5, 6}
+    assert {index for index, is_probe, _front in selected[:5] if is_probe} == {5, 6}
 
 
 def test_duplicate_broad_probe_is_replaced_by_novel_off_front_candidate():
@@ -5148,10 +5035,9 @@ def test_duplicate_broad_probe_is_replaced_by_novel_off_front_candidate():
     )
 
     assert len(chosen) == 2
-    assert sum(
-        is_probe
-        for _index, is_probe, _front, _candidate, _digest in chosen
-    ) == 1
+    assert (
+        sum(is_probe for _index, is_probe, _front, _candidate, _digest in chosen) == 1
+    )
     assert chosen[0][0] == 3
 
 
@@ -5167,8 +5053,7 @@ def test_duplicate_broad_probe_falls_back_to_novel_true_front_candidates():
 
     assert [item[0] for item in chosen] == [0, 2]
     assert all(
-        not is_probe and is_front
-        for _index, is_probe, is_front, *_rest in chosen
+        not is_probe and is_front for _index, is_probe, is_front, *_rest in chosen
     )
 
 
@@ -5246,9 +5131,7 @@ def test_validation_batch_preserves_true_front_and_off_front_classification():
         [[float(index), float(index)] for index in range(12)], dtype=np.float64
     )
     scores = objectives.mean(axis=1)
-    selections = _select_validation_indices(
-        objectives, scores, total=8, probes=4
-    )
+    selections = _select_validation_indices(objectives, scores, total=8, probes=4)
 
     # The complete feasible Pareto front has one member. The remaining seven
     # candidates must stay truthfully classified as broad/off-front evidence.
@@ -5262,10 +5145,9 @@ def test_validation_batch_preserves_true_front_and_off_front_classification():
     )
 
     assert len(chosen) == 8
-    assert sum(
-        is_probe
-        for _index, is_probe, _front, _candidate, _digest in chosen
-    ) == 7
+    assert (
+        sum(is_probe for _index, is_probe, _front, _candidate, _digest in chosen) == 7
+    )
 
 
 def test_all_infeasible_validation_fallback_keeps_front_membership_explicit():
@@ -5642,9 +5524,7 @@ def test_gpu_mirror_hash_ignores_shadowed_short_genes_during_recovery():
     submitted = [0.9, 0.7, 1.0, 0.0]
     recovered_from_mirrored_result = [0.9, 0.9, 1.0, 1.0]
 
-    submitted = _canonicalize_mirrored_hash_vector(
-        submitted, base_vector, key_paths
-    )
+    submitted = _canonicalize_mirrored_hash_vector(submitted, base_vector, key_paths)
     recovered = _canonicalize_mirrored_hash_vector(
         recovered_from_mirrored_result,
         base_vector,
@@ -5665,12 +5545,8 @@ def test_gpu_mirror_hash_neutralizes_anchor_shadow_without_long_shape_key():
     ]
     base_vector = [0.0, 0.7]
 
-    submitted = _canonicalize_mirrored_hash_vector(
-        [1.0, 0.7], base_vector, key_paths
-    )
-    recovered = _canonicalize_mirrored_hash_vector(
-        [1.0, 0.2], base_vector, key_paths
-    )
+    submitted = _canonicalize_mirrored_hash_vector([1.0, 0.7], base_vector, key_paths)
+    recovered = _canonicalize_mirrored_hash_vector([1.0, 0.2], base_vector, key_paths)
 
     assert submitted == recovered == [1.0, 0.7]
 
@@ -5824,12 +5700,11 @@ def test_gpu_hash_uses_runtime_fixed_value_before_lossless_override():
 
 
 def test_gpu_short_only_mirror_keeps_long_source_genes_active():
-    assert _gpu_candidate_source_sides(
-        {"short"}, {"mirror_short_from_long"}
-    ) == {"long", "short"}
-    assert _gpu_candidate_source_sides(
-        {"long"}, {"mirror_short_from_long"}
-    ) == {"long"}
+    assert _gpu_candidate_source_sides({"short"}, {"mirror_short_from_long"}) == {
+        "long",
+        "short",
+    }
+    assert _gpu_candidate_source_sides({"long"}, {"mirror_short_from_long"}) == {"long"}
 
 
 def test_proxy_parameters_include_canonical_pinned_ema_values():
@@ -5846,6 +5721,150 @@ def test_proxy_parameters_include_canonical_pinned_ema_values():
     )
 
     assert parameters == [{"base_qty_pct": 0.25, "offset": 0.75}]
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("step,sig_digits", [(0.01, 6), (None, 3)])
+@pytest.mark.parametrize("weights", [(0.31, 0.72, 0.18, 0.4), (0.0, 0.0, 0.0, 0.0)])
+def test_proxy_forager_weights_match_exact_vector_roundtrip(side, step, sig_digits, weights):
+    from config.bot import normalize_forager_score_weights
+    from optimize import _canonicalize_optimizer_individual
+
+    keys = ("volume", "ema_readiness", "volatility", "unilateralness")
+    paths = [(f"{side}_forager_score_weights_{key}",
+              ("bot", side, "forager", "score_weights", key)) for key in keys]
+    bounds = [Bound(0.0, 1.0, step) for _ in keys]
+    mapped = {name: (index, bounds[index]) for index, (name, _) in enumerate(paths)}
+    active = [(name, index, bound) for name, (index, bound) in mapped.items()]
+    config = get_template_config()
+    vector = list(weights)
+    exact = _canonicalize_optimizer_individual(
+        vector, config, bounds, sig_digits, paths, []
+    )
+    proxy = _build_proxy_parameter_dicts(
+        weights, mapped, active, np.array([weights]), sig_digits=sig_digits
+    )[0]
+    effective = normalize_forager_score_weights(
+        {key: proxy[f"{side}_forager_score_weights_{key}"] for key in keys},
+        path="proxy weights",
+    )
+    assert effective == pytest.approx(exact["bot"][side]["forager"]["score_weights"])
+
+
+@pytest.mark.parametrize("fixed_volume", [False, True])
+def test_proxy_forager_roundtrip_reapplies_fixed_and_mirrored_weights(fixed_volume):
+    from config.bot import normalize_forager_score_weights
+    from optimize import _canonicalize_optimizer_individual
+
+    config = get_template_config()
+    keys = ("volume", "ema_readiness", "volatility", "unilateralness")
+    paths = [
+        (
+            f"{side}_forager_score_weights_{key}",
+            ("bot", side, "forager", "score_weights", key),
+        )
+        for side in ("long", "short")
+        for key in keys
+    ]
+    bounds = [Bound(0.0, 1.0, 0.01)] * 4 + [Bound(0.0, 1.0, 0.2)] * 4
+    mapped = {name: (index, bounds[index]) for index, (name, _) in enumerate(paths)}
+    active = [(name, index, bound) for name, (index, bound) in mapped.items()]
+    weights = [0.31, 0.72, 0.18, 0.4, 0.8, 0.4, 0.6, 0.2]
+    fixed = {}
+    if fixed_volume:
+        config["optimize"]["fixed_runtime_overrides"] = {
+            "bot.long.forager.score_weights.volume": 0.4,
+        }
+    overrides = ["mirror_short_from_long"]
+    _, fixed = _gpu_fixed_bound_context(
+        config,
+        _materialize_gpu_override_template(config, overrides),
+        paths,
+        {name: name for name, _ in paths},
+    )
+    exact = _canonicalize_optimizer_individual(
+        list(weights), config, bounds, 6, paths, overrides
+    )
+    proxy = _build_proxy_parameter_dicts(
+        weights,
+        mapped,
+        active,
+        np.array([weights]),
+        sig_digits=6,
+        fixed_parameter_overrides=fixed,
+        optimizer_overrides=set(overrides),
+    )[0]
+    for side in ("long", "short"):
+        effective = normalize_forager_score_weights(
+            {key: proxy[f"{side}_forager_score_weights_{key}"] for key in keys},
+            path="proxy weights",
+        )
+        assert effective == pytest.approx(
+            exact["bot"][side]["forager"]["score_weights"]
+        )
+
+
+def test_proxy_forager_roundtrip_preserves_anchor_fixed_weights():
+    from config.bot import normalize_forager_score_weights
+    from config.optimize_bounds import set_flat_optimize_bound
+    from optimization.shape import build_optimization_shape
+    from optimize import _canonicalize_optimizer_individual
+
+    config = get_template_config()
+    prefix = "long_forager_score_weights_"
+    path = ("bot", "long", "forager", "score_weights", "volume")
+    fixed = {"ema_readiness": 0.72, "volatility": 0.18, "unilateralness": 0.4}
+    config[ANCHOR_PLAN_KEY] = {
+        "fixed_keys": [prefix + key for key in fixed],
+        "tunable_keys": [prefix + "volume"],
+        "key_paths": [list(path)],
+        "anchors": [
+            {
+                "source": "anchor.json",
+                "fixed_values": [
+                    {"key": prefix + key, "path": [*path[:-1], key], "value": value}
+                    for key, value in fixed.items()
+                ],
+            }
+        ],
+    }
+    set_flat_optimize_bound(
+        config["optimize"]["bounds"],
+        config["live"]["strategy_kind"],
+        prefix + "volume",
+        [0.0, 1.0, 0.01],
+    )
+    shape = build_optimization_shape(config)
+    bounds, paths = shape.bounds, shape.key_paths
+    mapped = {
+        name: (index, bounds[index])
+        for index, (name, _) in enumerate(paths)
+        if name.startswith(prefix)
+    }
+    # Real anchored shapes exclude fixed weights from the optimizer vector.
+    assert set(mapped) == {prefix + "volume"}
+    exact = _canonicalize_optimizer_individual(
+        [0.0, 0.31], config, bounds, 6, paths, []
+    )
+    proxy = _build_proxy_parameter_dicts(
+        [0.0, 0.31],
+        mapped,
+        [(ANCHOR_GENE_KEY, 0, bounds[0]), (prefix + "volume", 1, bounds[1])],
+        np.array([[0.0, 0.31]]),
+        sig_digits=6,
+        anchor_parameter_overrides=[
+            {prefix + key: value for key, value in fixed.items()}
+        ],
+    )[0]
+    assert {key: proxy[prefix + key] for key in fixed} == fixed
+    effective = normalize_forager_score_weights(
+        {
+            key: proxy[prefix + key]
+            for key in ("volume", "ema_readiness", "volatility", "unilateralness")
+        },
+        path="proxy weights",
+    )
+    assert effective == pytest.approx(exact["bot"]["long"]["forager"]["score_weights"])
 
 
 def test_proxy_parameters_keep_directional_names_distinct():
@@ -5934,7 +5953,11 @@ def test_gpu_proxy_parameter_builder_applies_fixed_runtime_after_tunables():
         "long_close_retracement_base_pct": (1, Bound(0.0, 1.0)),
     }
     active = [
-        ("long_close_threshold_base_pct", 0, mapped["long_close_threshold_base_pct"][1]),
+        (
+            "long_close_threshold_base_pct",
+            0,
+            mapped["long_close_threshold_base_pct"][1],
+        ),
         (
             "long_close_retracement_base_pct",
             1,
@@ -5971,10 +5994,9 @@ def test_gpu_optimizer_override_template_uses_exact_materializer():
         ["mirror_short_from_long"],
     )
 
-    assert (
-        proxy_config["bot"]["short"]["strategy"]["ema_anchor"]["base_qty_pct"]
-        == pytest.approx(0.123)
-    )
+    assert proxy_config["bot"]["short"]["strategy"]["ema_anchor"][
+        "base_qty_pct"
+    ] == pytest.approx(0.123)
     assert short_strategy["base_qty_pct"] == pytest.approx(0.456)
 
 
@@ -5989,14 +6011,12 @@ def test_gpu_runtime_template_applies_fixed_values_before_optimizer_overrides():
         ["mirror_short_from_long"],
     )
 
-    assert (
-        proxy_config["bot"]["long"]["strategy"]["ema_anchor"]["base_qty_pct"]
-        == pytest.approx(0.321)
-    )
-    assert (
-        proxy_config["bot"]["short"]["strategy"]["ema_anchor"]["base_qty_pct"]
-        == pytest.approx(0.321)
-    )
+    assert proxy_config["bot"]["long"]["strategy"]["ema_anchor"][
+        "base_qty_pct"
+    ] == pytest.approx(0.321)
+    assert proxy_config["bot"]["short"]["strategy"]["ema_anchor"][
+        "base_qty_pct"
+    ] == pytest.approx(0.321)
 
 
 def test_gpu_runtime_template_rejects_fixed_strategy_kind_change():
@@ -6022,7 +6042,7 @@ def test_gpu_fixed_bound_context_maps_effective_candidate_shadows():
     }
     effective = copy.deepcopy(config)
     effective["bot"]["long"]["strategy"]["ema_anchor"]["offset"] = 0.123
-    effective["bot"]["long"]["risk"]["entry_cooldown_minutes"] = 17.0
+    effective["bot"]["long"]["entry_cooldown"]["base_duration_minutes"] = 17.0
 
     bound_values, parameters = _gpu_fixed_bound_context(
         config,
@@ -6093,9 +6113,7 @@ def test_gpu_fixed_disabled_retracement_canonicalizes_dead_weight_genes():
     ) == [0.0, 0.01, 0.01]
 
     materialized = _materialize_gpu_override_template(config, [])
-    close = materialized["bot"]["long"]["strategy"]["trailing_martingale"][
-        "close"
-    ]
+    close = materialized["bot"]["long"]["strategy"]["trailing_martingale"]["close"]
     assert close["retracement_base_pct"] == 0.0
     assert close["retracement_volatility_1h_weight"] == 0.01
     assert close["retracement_volatility_1m_weight"] == 0.01
@@ -6103,9 +6121,7 @@ def test_gpu_fixed_disabled_retracement_canonicalizes_dead_weight_genes():
 
 def test_gpu_materialized_fixed_runtime_scope_accepts_single_coin_unstuck():
     config = _long_only_ema_config()
-    config["optimize"]["fixed_runtime_overrides"] = {
-        "bot.long.unstuck.enabled": True
-    }
+    config["optimize"]["fixed_runtime_overrides"] = {"bot.long.unstuck.enabled": True}
     proxy_config = _materialize_gpu_override_template(
         config,
         [],
@@ -6125,9 +6141,7 @@ def test_gpu_optimizer_override_scope_fails_closed():
     with pytest.raises(ValueError, match="forward_tp_grid"):
         _validate_gpu_optimizer_overrides(["forward_tp_grid"], "ema_anchor")
     with pytest.raises(ValueError, match="requires.*trailing_martingale"):
-        _validate_gpu_optimizer_overrides(
-            ["lossless_close_trailing"], "ema_anchor"
-        )
+        _validate_gpu_optimizer_overrides(["lossless_close_trailing"], "ema_anchor")
 
 
 def test_gpu_anchor_context_maps_fixed_values_and_preserves_ranges():
@@ -6261,9 +6275,7 @@ def test_gpu_anchor_proxy_values_match_exact_candidate_materialization(
         if strategy_kind == "ema_anchor"
         else TRAILING_MARTINGALE_BOUND_MAP
     )
-    anchor_overrides, _fixed_bounds = _build_anchor_parameter_context(
-        config, bound_map
-    )
+    anchor_overrides, _fixed_bounds = _build_anchor_parameter_context(config, bound_map)
     proxy_tunable_key = bound_map[tunable_key]
     active = [
         (ANCHOR_GENE_KEY, 0, Bound(0.0, 1.0, 1.0)),
@@ -6278,7 +6290,9 @@ def test_gpu_anchor_proxy_values_match_exact_candidate_materialization(
         np.asarray(vectors),
         anchor_parameter_overrides=anchor_overrides,
     )
-    exact_configs = [build_optimizer_vector_config(vector, config) for vector in vectors]
+    exact_configs = [
+        build_optimizer_vector_config(vector, config) for vector in vectors
+    ]
 
     for proxy, exact, expected_fixed, expected_tunable in zip(
         proxy_parameters,
@@ -6300,9 +6314,7 @@ def test_gpu_anchor_context_fails_closed_on_missing_fixed_values():
     config = {
         ANCHOR_PLAN_KEY: {
             "fixed_keys": ["long_base_qty_pct", "long_offset"],
-            "anchors": [
-                {"fixed_values": [{"key": "long_base_qty_pct", "value": 0.1}]}
-            ],
+            "anchors": [{"fixed_values": [{"key": "long_base_qty_pct", "value": 0.1}]}],
         }
     }
 
@@ -6416,7 +6428,9 @@ def test_gpu_anchor_checkpoint_signature_tracks_ordered_fixed_values():
         _checkpoint_signature(active, scoring, anchor_plan=reordered_anchors)
         != original
     )
-    assert _checkpoint_signature(active, scoring, anchor_plan=reordered_items) == original
+    assert (
+        _checkpoint_signature(active, scoring, anchor_plan=reordered_items) == original
+    )
 
 
 def test_gpu_checkpoint_signature_tracks_effective_suite_contract():
@@ -6447,8 +6461,7 @@ def test_gpu_checkpoint_signature_tracks_effective_suite_contract():
         != original
     )
     assert (
-        _checkpoint_signature(active, scoring, suite_contract=changed_date)
-        != original
+        _checkpoint_signature(active, scoring, suite_contract=changed_date) != original
     )
 
 
@@ -6489,9 +6502,7 @@ def test_gpu_checkpoint_signature_tracks_exact_coin_override_precision():
                     {
                         "bot": {
                             "long": {
-                                "strategy": {
-                                    "ema_anchor": {"offset": exact_value}
-                                }
+                                "strategy": {"ema_anchor": {"offset": exact_value}}
                             }
                         }
                     }
@@ -6556,9 +6567,7 @@ def test_gpu_checkpoint_signature_tracks_single_coin_unstuck_contract():
         changed_contract = _gpu_runtime_checkpoint_contract(changed, proxy)
         assert changed_contract != original_contract
         assert (
-            _checkpoint_signature(
-                active, scoring, runtime_contract=changed_contract
-            )
+            _checkpoint_signature(active, scoring, runtime_contract=changed_contract)
             != original
         )
 
@@ -6577,9 +6586,10 @@ def test_gpu_checkpoint_signature_tracks_single_coin_unstuck_contract():
 
     all_history = copy.deepcopy(config)
     all_history["live"]["pnls_max_lookback_days"] = "all"
-    assert _gpu_runtime_checkpoint_contract(all_history, proxy)[
-        "pnls_max_lookback_days"
-    ] == -1.0
+    assert (
+        _gpu_runtime_checkpoint_contract(all_history, proxy)["pnls_max_lookback_days"]
+        == -1.0
+    )
 
     fixed = _long_only_ema_config()
     fixed["optimize"]["fixed_runtime_overrides"] = {
@@ -6610,10 +6620,8 @@ def test_gpu_checkpoint_signature_tracks_single_coin_hsl_contract():
         ("backtest", "dynamic_wel_by_tradability", False),
         ("bot.long.risk", "n_positions", 2),
         ("bot.long.hsl", "enabled", False),
+        ("bot.long.hsl", "scale_budget_with_excess_allowance", True),
         ("bot.long.hsl", "restart_after_red_policy", "never"),
-        ("bot.long.hsl", "no_restart_drawdown_threshold", 0.9),
-        ("bot.long.hsl", "tier_ratio_yellow", 0.4),
-        ("bot.long.hsl", "orange_tier_mode", "graceful_stop"),
         ("bot.long.hsl", "panic_close_order_type", "market"),
     )
     for parent_path, key, value in edits:
@@ -6625,9 +6633,7 @@ def test_gpu_checkpoint_signature_tracks_single_coin_hsl_contract():
         changed_contract = _gpu_runtime_checkpoint_contract(changed, proxy)
         assert changed_contract != original_contract
         assert (
-            _checkpoint_signature(
-                active, scoring, runtime_contract=changed_contract
-            )
+            _checkpoint_signature(active, scoring, runtime_contract=changed_contract)
             != original
         )
 
@@ -6670,9 +6676,7 @@ def test_gpu_hsl_gene_activity_and_pinned_contract_helpers():
         config,
     )
     with pytest.raises(ValueError, match="enablement to match"):
-        _validate_hsl_bound_contracts(
-            {"long_hsl_enabled": Bound(0.0, 0.0)}, config
-        )
+        _validate_hsl_bound_contracts({"long_hsl_enabled": Bound(0.0, 0.0)}, config)
     with pytest.raises(ValueError, match="cannot distinguish from 1.0"):
         _validate_hsl_bound_contracts(
             {"long_hsl_red_threshold": Bound(0.9, 1.0)}, config
@@ -6683,9 +6687,7 @@ def test_gpu_hsl_gene_activity_and_pinned_contract_helpers():
         )
     with pytest.raises(ValueError, match="cooldown_minutes_after_red bounds"):
         _validate_hsl_bound_contracts(
-            {
-                "long_hsl_cooldown_minutes_after_red": Bound(-10.0, 10.0)
-            },
+            {"long_hsl_cooldown_minutes_after_red": Bound(-10.0, 10.0)},
             config,
         )
 
@@ -6703,12 +6705,10 @@ def test_gpu_hsl_gene_activity_and_pinned_contract_helpers():
     base = _long_only_ema_config()
     scenario = copy.deepcopy(base)
     scenario["bot"]["long"]["hsl"]["enabled"] = True
-    search_sides = _gpu_hsl_search_sides(
-        base, [{"config": scenario}], set()
-    )
+    search_sides = _gpu_hsl_search_sides(base, [{"config": scenario}], set())
     assert search_sides == {"long"}
     assert _gpu_hsl_parameter_active(
-        "long_hsl_no_restart_drawdown_threshold", search_sides
+        "long_hsl_cooldown_minutes_after_red", search_sides
     )
 
     switched = copy.deepcopy(base)
@@ -6718,9 +6718,7 @@ def test_gpu_hsl_gene_activity_and_pinned_contract_helpers():
     switched["bot"]["short"]["risk"]["total_wallet_exposure_limit"] = 1.0
     switched["bot"]["short"]["hsl"]["enabled"] = True
     switched["live"]["approved_coins"] = {"long": [], "short": ["BTC"]}
-    assert _gpu_candidate_search_sides(
-        base, [{"config": switched}]
-    ) == {"short"}
+    assert _gpu_candidate_search_sides(base, [{"config": switched}]) == {"short"}
 
 
 def test_gpu_checkpoint_signature_tracks_prepared_coin_override_contract():
@@ -6732,23 +6730,16 @@ def test_gpu_checkpoint_signature_tracks_prepared_coin_override_contract():
         "side": "long",
         "values": [[None] * 12, [None] * 11 + [0.4]],
     }
-    original = _checkpoint_signature(
-        active, scoring, runtime_contract=contract
-    )
+    original = _checkpoint_signature(active, scoring, runtime_contract=contract)
     edited = copy.deepcopy(contract)
     edited["values"][1][11] = 0.5
 
     assert _checkpoint_signature(active, scoring) != original
-    assert (
-        _checkpoint_signature(active, scoring, runtime_contract=edited)
-        != original
-    )
+    assert _checkpoint_signature(active, scoring, runtime_contract=edited) != original
     hysteresis_edited = copy.deepcopy(contract)
     hysteresis_edited["forager_score_hysteresis_pct"] = 0.02
     assert (
-        _checkpoint_signature(
-            active, scoring, runtime_contract=hysteresis_edited
-        )
+        _checkpoint_signature(active, scoring, runtime_contract=hysteresis_edited)
         != original
     )
 
@@ -6773,10 +6764,7 @@ def test_gpu_checkpoint_signature_tracks_dual_side_coin_override_contract():
     edited = copy.deepcopy(contract)
     edited["values_by_side"]["short"][1][10] = 45.0
 
-    assert (
-        _checkpoint_signature(active, scoring, runtime_contract=edited)
-        != original
-    )
+    assert _checkpoint_signature(active, scoring, runtime_contract=edited) != original
 
 
 def test_gpu_suite_checkpoint_contract_tracks_prepared_scenario_identity():
@@ -6836,9 +6824,7 @@ def test_gpu_suite_checkpoint_contract_tracks_prepared_scenario_identity():
     second_exchange["exchange"] = "binance"
     second_exchange["mss"]["BTC"] = {"exchange": "binance"}
     second_exchange["mss"]["ETH"] = {"exchange": "binance"}
-    multi_exchange = _gpu_suite_checkpoint_contract(
-        config, [item, second_exchange]
-    )
+    multi_exchange = _gpu_suite_checkpoint_contract(config, [item, second_exchange])
     assert [
         (entry["label"], entry["exchange"])
         for entry in multi_exchange["prepared_scenarios"]
@@ -6848,9 +6834,7 @@ def test_gpu_suite_checkpoint_contract_tracks_prepared_scenario_identity():
     changed_second_exchange = copy.deepcopy(second_exchange)
     changed_second_exchange["timestamps"] = np.array([1000, 2500, 3500])
     assert (
-        _gpu_suite_checkpoint_contract(
-            config, [item, changed_second_exchange]
-        )
+        _gpu_suite_checkpoint_contract(config, [item, changed_second_exchange])
         != multi_exchange
     )
 
@@ -6894,22 +6878,14 @@ def test_gpu_suite_checkpoint_contract_tracks_prepared_scenario_identity():
     assert _gpu_suite_checkpoint_contract(config, [changed_hsl]) != original
 
     changed_pinned_hsl = copy.deepcopy(item)
-    changed_pinned_hsl["pinned_hsl_bounds"] = {
-        "long_hsl_red_threshold": 0.25
-    }
-    assert (
-        _gpu_suite_checkpoint_contract(config, [changed_pinned_hsl])
-        != original
-    )
+    changed_pinned_hsl["pinned_hsl_bounds"] = {"long_hsl_red_threshold": 0.25}
+    assert _gpu_suite_checkpoint_contract(config, [changed_pinned_hsl]) != original
 
     changed_proxy_execution = copy.deepcopy(item)
     changed_proxy_execution["proxy_checkpoint_contract"] = {
         "backtest": {"starting_balance": 20_000.0}
     }
-    assert (
-        _gpu_suite_checkpoint_contract(config, [changed_proxy_execution])
-        != original
-    )
+    assert _gpu_suite_checkpoint_contract(config, [changed_proxy_execution]) != original
     assert (
         _gpu_suite_checkpoint_contract(
             config,
@@ -6978,9 +6954,7 @@ def test_gpu_checkpoint_signature_tracks_full_fixed_search_contract():
     assert "proxy_evaluation" not in ordinary_contract
     active = [("long_offset", 0, bounds[0])]
     scoring = [{"goal": "max", "metric": "adg_strategy_eq"}]
-    original = _checkpoint_signature(
-        active, scoring, search_contract=contract
-    )
+    original = _checkpoint_signature(active, scoring, search_contract=contract)
 
     mutations = []
     changed_base = copy.deepcopy(contract)
@@ -7008,9 +6982,7 @@ def test_gpu_checkpoint_signature_tracks_full_fixed_search_contract():
     changed_screening_scenarios["proxy_evaluation"]["scenarios"] = ["small"]
     mutations.append(changed_screening_scenarios)
     changed_policy_kind = copy.deepcopy(contract)
-    changed_policy_kind["proxy_evaluation"]["kind"] = (
-        "legacy_halving"
-    )
+    changed_policy_kind["proxy_evaluation"]["kind"] = "legacy_halving"
     mutations.append(changed_policy_kind)
     changed_seed_bootstrap = _gpu_search_checkpoint_contract(
         key_paths=key_paths,
@@ -7037,8 +7009,7 @@ def test_gpu_checkpoint_signature_tracks_full_fixed_search_contract():
     mutations.append(changed_seed_bootstrap)
 
     assert all(
-        _checkpoint_signature(active, scoring, search_contract=changed)
-        != original
+        _checkpoint_signature(active, scoring, search_contract=changed) != original
         for changed in mutations
     )
 
@@ -7080,20 +7051,14 @@ def test_gpu_rejects_pinned_unsupported_exposure_repair_behavior():
 
     with pytest.raises(ValueError, match="position_exposure_enforcer_enabled"):
         _validate_pinned_scope_bounds(
-            {
-                "long_risk_position_exposure_enforcer_enabled": Bound(
-                    1.0, 1.0, None
-                )
-            },
+            {"long_risk_position_exposure_enforcer_enabled": Bound(1.0, 1.0, None)},
             {"long_risk_position_exposure_enforcer_enabled": 1.0},
             coin_count=2,
         )
 
     _validate_pinned_scope_bounds(
         {
-            "long_risk_position_exposure_enforcer_enabled": Bound(
-                1.0, 1.0, None
-            ),
+            "long_risk_position_exposure_enforcer_enabled": Bound(1.0, 1.0, None),
             "long_risk_wel_enforcer_threshold": Bound(0.5, 1.0, None),
         },
         {"long_risk_position_exposure_enforcer_enabled": 1.0},
@@ -7128,11 +7093,7 @@ def test_gpu_rejects_pinned_unsupported_exposure_repair_behavior():
 
     for strategy_kind in ("trailing_martingale", "ema_anchor"):
         _validate_pinned_scope_bounds(
-            {
-                "long_risk_total_exposure_enforcer_enabled": Bound(
-                    0.0, 1.0, None
-                )
-            },
+            {"long_risk_total_exposure_enforcer_enabled": Bound(0.0, 1.0, None)},
             {"long_risk_total_exposure_enforcer_enabled": 0.0},
             {"long", "short"},
             coin_count=2,
@@ -7166,9 +7127,7 @@ def test_gpu_accepts_unstuck_bounds_for_single_and_dual_multicoin():
 
     _validate_pinned_scope_bounds(bounds, base, {"long"}, coin_count=1)
     _validate_pinned_scope_bounds(bounds, base, {"long"}, coin_count=2)
-    _validate_pinned_scope_bounds(
-        bounds, base, {"long", "short"}, coin_count=2
-    )
+    _validate_pinned_scope_bounds(bounds, base, {"long", "short"}, coin_count=2)
 
 
 def test_gpu_accepts_hsl_bounds_for_single_and_dual_multicoin():
@@ -7181,9 +7140,7 @@ def test_gpu_accepts_hsl_bounds_for_single_and_dual_multicoin():
     base = {"long_hsl_enabled": 1.0}
 
     _validate_pinned_scope_bounds(bounds, base, {"long"}, coin_count=2)
-    _validate_pinned_scope_bounds(
-        bounds, base, {"long", "short"}, coin_count=2
-    )
+    _validate_pinned_scope_bounds(bounds, base, {"long", "short"}, coin_count=2)
 
 
 def test_gpu_anchor_constant_twel_threshold_is_supported_for_multicoin():
@@ -7262,14 +7219,11 @@ def test_gpu_multicoin_search_space_allows_bounded_n_positions(side):
         f"{other}_n_positions": Bound(0.0, 0.0, None),
     }
 
-    _validate_directional_search_space(
-        bounds, base, approved, {side}, coin_count=3
-    )
+    _validate_directional_search_space(bounds, base, approved, {side}, coin_count=3)
     bounds[f"{side}_n_positions"] = Bound(1.0, 4.0, 1.0)
     with pytest.raises(ValueError, match=r"within \[1, 3\]"):
-        _validate_directional_search_space(
-            bounds, base, approved, {side}, coin_count=3
-        )
+        _validate_directional_search_space(bounds, base, approved, {side}, coin_count=3)
+
 
 def test_gpu_directional_search_space_rejects_disabled_approved_side_activation():
     from optimization.bounds import Bound
@@ -7288,16 +7242,6 @@ def test_gpu_directional_search_space_rejects_disabled_approved_side_activation(
             {"long": ["BTC"], "short": ["BTC"]},
             {"long"},
         )
-
-
-def test_gpu_rejects_optimizer_bounds_that_change_config_side_enablement():
-    _validate_seed_side_match({"long"}, {"long"})
-
-    with pytest.raises(ValueError, match="activate or disable"):
-        _validate_seed_side_match({"long"}, {"long", "short"})
-
-    with pytest.raises(ValueError, match="activate or disable"):
-        _validate_seed_side_match({"long", "short"}, {"long"})
 
 
 def test_constraint_classification_drift_detects_feasibility_disagreement():
@@ -7459,9 +7403,7 @@ def test_constraint_diagnostics_preserve_invalid_exact_suite_penalty():
     assert diagnostics[0]["exact_value"] is None
     assert diagnostics[0]["exact_violation"] is None
     assert diagnostics[0]["exact_failure_penalty"] == 1.0e18
-    assert "exact_failure_penalty=1e+18" in _format_constraint_diagnostics(
-        diagnostics
-    )
+    assert "exact_failure_penalty=1e+18" in _format_constraint_diagnostics(diagnostics)
 
 
 def test_resume_recovers_hashes_and_drift_for_results_ahead_of_checkpoint():
@@ -7603,7 +7545,9 @@ def test_resume_hash_recovery_fails_if_durable_tail_is_missing():
 
 
 def test_resume_fails_closed_when_durable_tail_lacks_drift_evidence():
-    with pytest.raises(RuntimeError, match="cannot recover proxy/exact safety evidence"):
+    with pytest.raises(
+        RuntimeError, match="cannot recover proxy/exact safety evidence"
+    ):
         _recover_durable_validations(
             [{"id": 0}],
             start_index=0,
@@ -7733,7 +7677,10 @@ def test_gpu_suite_unstuck_scope_validates_effective_scenario_bounds(shadow):
 @pytest.mark.parametrize("roundtrip", [False, True])
 def test_seed_proxy_reuse_preserves_order_and_nested_metric_evidence(roundtrip):
     import pickle
-    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+    from optimization.backends.gpu_backend import (
+        _seed_proxy_key,
+        _evaluate_with_seed_proxy_reuse,
+    )
 
     seed = {"long_span": 17.25, "short_span": 42.5}
     evidence = {"adg": 0.125, "suite_objectives": [1.0, 2.0]}
@@ -7743,9 +7690,11 @@ def test_seed_proxy_reuse_preserves_order_and_nested_metric_evidence(roundtrip):
     changed = dict(seed, short_span=42.50001)
     requested = [changed, dict(reversed(list(seed.items()))), seed]
     calls = []
+
     def evaluate(candidates):
         calls.append(candidates)
         return [{"adg": 0.25} for _ in candidates]
+
     rows, reused = _evaluate_with_seed_proxy_reuse(requested, cached, evaluate)
     assert calls == [[changed]]
     assert reused == 2
@@ -7756,25 +7705,41 @@ def test_seed_proxy_reuse_preserves_order_and_nested_metric_evidence(roundtrip):
 
 
 def test_seed_proxy_reuse_all_hits_avoids_dispatch_and_handles_absent_cache():
-    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+    from optimization.backends.gpu_backend import (
+        _seed_proxy_key,
+        _evaluate_with_seed_proxy_reuse,
+    )
 
     candidate = {"span": 17.25}
     evidence = {"adg": 0.125}
     cached = {_seed_proxy_key(candidate): evidence}
+
     def unexpected(_candidates):
         pytest.fail("cached seed should not be dispatched again")
-    assert _evaluate_with_seed_proxy_reuse([candidate], cached, unexpected) == ([evidence], 1)
-    assert _evaluate_with_seed_proxy_reuse([candidate], {}, lambda c: [evidence]) == ([evidence], 0)
+
+    assert _evaluate_with_seed_proxy_reuse([candidate], cached, unexpected) == (
+        [evidence],
+        1,
+    )
+    assert _evaluate_with_seed_proxy_reuse([candidate], {}, lambda c: [evidence]) == (
+        [evidence],
+        0,
+    )
 
 
 def test_seed_proxy_reuse_interrupted_misses_do_not_commit_partial_evidence():
-    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+    from optimization.backends.gpu_backend import (
+        _seed_proxy_key,
+        _evaluate_with_seed_proxy_reuse,
+    )
 
     candidate = {"span": 17.25}
     evidence = {"adg": 0.125}
     cached = {_seed_proxy_key(candidate): evidence}
+
     def interrupt(_candidates):
         raise KeyboardInterrupt
+
     with pytest.raises(KeyboardInterrupt):
         _evaluate_with_seed_proxy_reuse([candidate, {"span": 99.0}], cached, interrupt)
     assert cached == {_seed_proxy_key(candidate): evidence}
@@ -7786,17 +7751,26 @@ def test_seed_proxy_reuse_preserves_nsga_next_population_after_resume():
     import pickle
     from pymoo.algorithms.moo.nsga2 import NSGA2
     from pymoo.core.problem import Problem
-    from optimization.backends.gpu_backend import _seed_proxy_key, _evaluate_with_seed_proxy_reuse
+    from optimization.backends.gpu_backend import (
+        _seed_proxy_key,
+        _evaluate_with_seed_proxy_reuse,
+    )
 
     sampling = np.linspace(0.05, 0.95, 8).reshape(-1, 1)
     algorithm = NSGA2(pop_size=8, sampling=sampling)
     algorithm.setup(Problem(n_var=1, n_obj=2, n_ieq_constr=1, xl=0.0, xu=1.0), seed=19)
+
     def evaluate(candidates):
-        return [{"F": [c["x"] ** 2, (1.0 - c["x"]) ** 2], "G": c["x"] - 0.7}
-                for c in candidates]
+        return [
+            {"F": [c["x"] ** 2, (1.0 - c["x"]) ** 2], "G": c["x"] - 0.7}
+            for c in candidates
+        ]
+
     seeds = [{"x": float(x)} for x in sampling[1:, 0]]
     cache = {_seed_proxy_key(c): m for c, m in zip(seeds, evaluate(seeds))}
-    checkpoint = pickle.dumps({"algorithm": algorithm, "initial_seed_proxy_rows": cache})
+    checkpoint = pickle.dumps(
+        {"algorithm": algorithm, "initial_seed_proxy_rows": cache}
+    )
     populations = []
     for reuse in (False, True):
         restored = pickle.loads(checkpoint)
@@ -7813,7 +7787,9 @@ def test_seed_proxy_reuse_preserves_nsga_next_population_after_resume():
         population.set("F", np.asarray([row["F"] for row in rows]))
         population.set("G", np.asarray([[row["G"]] for row in rows]))
         algorithm.tell(infills=population)
-        populations.append((algorithm.pop.get("F"), algorithm.pop.get("G"), algorithm.ask().get("X")))
+        populations.append(
+            (algorithm.pop.get("F"), algorithm.pop.get("G"), algorithm.ask().get("X"))
+        )
     for before, after in zip(*populations):
         np.testing.assert_array_equal(before, after)
 
@@ -7824,9 +7800,11 @@ def test_seed_screen_includes_population_base_without_changing_seed_rows(base):
 
     seeds = [{"x": 0.25}, {"x": 0.75}]
     calls = []
+
     def evaluate(candidates):
         calls.append(list(candidates))
         return [{"score": c["x"]} for c in candidates]
+
     rows, base_row, extra = _screen_seed_proxy_candidates(seeds, base, evaluate)
     assert seeds == [{"x": 0.25}, {"x": 0.75}]
     assert rows == [{"score": 0.25}, {"score": 0.75}]
@@ -7845,43 +7823,67 @@ def test_gpu_suite_full_selection_reuses_input_across_scenarios(indices):
     config["bot"]["long"]["risk"]["n_positions"] = 2
     master = np.arange(12 * 3 * 4, dtype=np.float64).reshape(12, 3, 4)
     selected = list(range(3)) if indices is None else indices
-    contexts = [SimpleNamespace(
-        label=f"scenario_{i}", overrides={}, exchanges=["bybit"],
-        msss={"bybit": {coins[j]: {} for j in selected}},
-        timestamps={"bybit": np.arange(10, dtype=np.int64)},
-    ) for i in range(9)]
+    contexts = [
+        SimpleNamespace(
+            label=f"scenario_{i}",
+            overrides={},
+            exchanges=["bybit"],
+            msss={"bybit": {coins[j]: {} for j in selected}},
+            timestamps={"bybit": np.arange(10, dtype=np.int64)},
+        )
+        for i in range(9)
+    ]
+
     class Suite:
-        def __init__(self): self.contexts = contexts
+        def __init__(self):
+            self.contexts = contexts
+
         def get_prepared_context_data(self, ctx, exchange):
             return master[1:11], np.ones(10), indices
+
         def build_scenario_candidate_config(self, proxy_config, ctx):
             return copy.deepcopy(proxy_config)
+
     prepared = _gpu_suite_scenario_inputs(config, Suite())
     for item in prepared:
-        np.testing.assert_array_equal(item["hlcvs"], np.take(master[1:11], selected, axis=1))
+        np.testing.assert_array_equal(
+            item["hlcvs"], np.take(master[1:11], selected, axis=1)
+        )
         assert item["hlcvs"].flags.c_contiguous
         assert np.shares_memory(item["hlcvs"], master) == (selected == [0, 1, 2])
 
 
 def test_suite_full_pass_routes_every_scenario_and_preserves_overrides():
     seen = []
+
     class Proxy:
         def __init__(self, size):
             self.size = size
+
         def evaluate(self, candidates, **kwargs):
             seen.append((self.size, copy.deepcopy(candidates), kwargs))
             return [{"adg_strategy_eq": candidate["value"]} for candidate in candidates]
+
     class Suite:
         @staticmethod
         def score_scenario_results(results):
             values = [r.metrics["stats"]["adg_strategy_eq"]["mean"] for r in results]
-            return dict(objectives=(-min(values),), unpenalized_objectives=(-min(values),),
-                        constraint_violation=0, suite_metrics={})
+            return dict(
+                objectives=(-min(values),),
+                unpenalized_objectives=(-min(values),),
+                constraint_violation=0,
+                suite_metrics={},
+            )
+
     candidates = [{"value": 1}, {"value": 2}]
-    rows = _evaluate_gpu_suite_proxies(Suite(), [
-        (SimpleNamespace(label="small"), [("a", Proxy(100))], {"value": 3}),
-        (SimpleNamespace(label="large"), [("a", Proxy(200))], {}),
-    ], candidates)
+    rows = _evaluate_gpu_suite_proxies(
+        Suite(),
+        [
+            (SimpleNamespace(label="small"), [("a", Proxy(100))], {"value": 3}),
+            (SimpleNamespace(label="large"), [("a", Proxy(200))], {}),
+        ],
+        candidates,
+    )
     assert [r[_GPU_SUITE_OBJECTIVES_KEY] for r in rows] == [(-1,), (-2,)]
     assert seen == [
         (100, [{"value": 3}, {"value": 3}], {}),
@@ -7890,19 +7892,29 @@ def test_suite_full_pass_routes_every_scenario_and_preserves_overrides():
     assert candidates == [{"value": 1}, {"value": 2}]
 
 
-@pytest.mark.parametrize("survival,minimum,count", [(0.1, 8, 103), (0.2, 8, 205), (0.01, 64, 64), (1.0, 8, 1024), (0.1, 2048, 1024)])
-def test_screening_rounds_up_caps_minimum_and_keeps_only_full_suite_eligible(survival, minimum, count):
+@pytest.mark.parametrize(
+    "survival,minimum,count",
+    [(0.1, 8, 103), (0.2, 8, 205), (0.01, 64, 64), (1.0, 8, 1024), (0.1, 2048, 1024)],
+)
+def test_screening_rounds_up_caps_minimum_and_keeps_only_full_suite_eligible(
+    survival, minimum, count
+):
     calls = []
+
     def evaluate(candidates, *, screening=False):
         calls.append((len(candidates), screening))
         # Full-suite scores deliberately differ; they must replace subset scores.
         return [dict(value=c["value"] + (0 if screening else 2000)) for c in candidates]
+
     def fitness(rows):
         return np.array([[r["value"]] for r in rows]), np.zeros(len(rows))
+
     rows, objectives, violations, eligible, trace = _evaluate_scenario_screening(
         [dict(value=i) for i in range(1024)],
         policy=dict(survival_fraction=survival, min_survivors=minimum),
-        evaluate_proxy=evaluate, proxy_fitness=fitness, interrupt_check=lambda: None,
+        evaluate_proxy=evaluate,
+        proxy_fitness=fitness,
+        interrupt_check=lambda: None,
     )
     assert calls == [(1024, True), (count, False)]
     np.testing.assert_array_equal(eligible, np.arange(count))
@@ -7912,124 +7924,318 @@ def test_screening_rounds_up_caps_minimum_and_keeps_only_full_suite_eligible(sur
     assert all(rows[i]["value"] == i + 2000 for i in eligible)
 
 
-@pytest.mark.parametrize('batching,compatible,expected_batches', [
-    (False, True, [2, 2]), (True, False, [2, 2]), (True, True, [4]),
-])
-def test_suite_batches_only_compatible_scenarios_and_resolves_defaults(batching, compatible, expected_batches, caplog):
+@pytest.mark.parametrize(
+    "batching,compatible,expected_batches",
+    [
+        (False, True, [2, 2]),
+        (True, False, [2, 2]),
+        (True, True, [4]),
+    ],
+)
+def test_suite_batches_only_compatible_scenarios_and_resolves_defaults(
+    batching, compatible, expected_batches, caplog
+):
     from optimization.gpu.replay_progress import TemporalReplayProgress
+
     caplog.set_level("INFO")
     calls = []
+
     class Proxy:
         def __init__(self, default, key):
             self.default, self.key = default, key
-            self.last_profile = {'stale': True}
+            self.last_profile = {"stale": True}
+
         def suite_batch_key(self):
             return self.key
+
         def materialize_suite_candidates(self, candidates):
-            return [dict(c, value=c.get('value', self.default)) for c in candidates]
+            return [dict(c, value=c.get("value", self.default)) for c in candidates]
+
         def evaluate(self, candidates):
             calls.append(len(candidates))
             TemporalReplayProgress(len(candidates), 10)
-            self.last_profile = {'count': len(candidates)}
-            return [{'adg_strategy_eq': c.get('value', self.default)} for c in candidates]
+            self.last_profile = {"count": len(candidates)}
+            return [
+                {"adg_strategy_eq": c.get("value", self.default)} for c in candidates
+            ]
+
     class Suite:
         @staticmethod
         def score_scenario_results(results):
-            values = [r.metrics['stats']['adg_strategy_eq']['mean'] for r in results]
-            return dict(objectives=(-min(values),), unpenalized_objectives=(-min(values),),
-                        constraint_violation=0, suite_metrics={})
-    first, second = Proxy(2, 'same'), Proxy(4, 'same' if compatible else None)
-    candidates = [{}, {'value': 5}]
-    rows = _evaluate_gpu_suite_proxies(Suite(), [
-        (SimpleNamespace(label='first'), [('x', first)], {}),
-        (SimpleNamespace(label='second'), [('x', second)], {}),
-    ], candidates, batch_compatible_scenarios=batching)
+            values = [r.metrics["stats"]["adg_strategy_eq"]["mean"] for r in results]
+            return dict(
+                objectives=(-min(values),),
+                unpenalized_objectives=(-min(values),),
+                constraint_violation=0,
+                suite_metrics={},
+            )
+
+    first, second = Proxy(2, "same"), Proxy(4, "same" if compatible else None)
+    candidates = [{}, {"value": 5}]
+    rows = _evaluate_gpu_suite_proxies(
+        Suite(),
+        [
+            (SimpleNamespace(label="first"), [("x", first)], {}),
+            (SimpleNamespace(label="second"), [("x", second)], {}),
+        ],
+        candidates,
+        batch_compatible_scenarios=batching,
+    )
     assert calls == expected_batches
     messages = [record.getMessage() for record in caplog.records]
     if len(expected_batches) == 1:
-        assert any("suite_pass=1/1 scenarios=first,second exchange=x stage=full" in m for m in messages)
+        assert any("group=1/1" in m and "scenarios=first,second exchange=x stage=full" in m for m in messages)
     else:
-        assert any("suite_pass=1/2 scenarios=first exchange=x stage=full" in m for m in messages)
-        assert any("suite_pass=2/2 scenarios=second exchange=x stage=full" in m for m in messages)
+        assert any("group=1/2" in m and "scenarios=first exchange=x stage=full" in m for m in messages)
+        assert any("group=2/2" in m and "scenarios=second exchange=x stage=full" in m for m in messages)
     assert [r[_GPU_SUITE_OBJECTIVES_KEY] for r in rows] == [(-2,), (-5,)]
-    assert candidates == [{}, {'value': 5}]
-    assert sum(p.last_profile.get('count', 0) for p in [first, second]) == 4
-    assert all('stale' not in p.last_profile for p in [first, second])
+    assert candidates == [{}, {"value": 5}]
+    assert sum(p.last_profile.get("count", 0) for p in [first, second]) == 4
+    assert all("stale" not in p.last_profile for p in [first, second])
 
 
-@pytest.mark.parametrize('labels', ['a', None, [None], [['a']], [''], [' '], ['a', 'a']])
+@pytest.mark.parametrize(
+    "labels", ["a", None, [None], [["a"]], [""], [" "], ["a", "a"]]
+)
 def test_gpu_screening_labels_reject_invalid_shapes(labels):
     config = _long_only_ema_config()
-    config['optimize']['gpu']['screening'] = {'scenarios': labels}
-    with pytest.raises(ValueError, match='unique non-empty scenario labels'):
+    config["optimize"]["gpu"]["screening"] = {"scenarios": labels}
+    with pytest.raises(ValueError, match="unique non-empty scenario labels"):
         _resolve_options(config)
 
 
-@pytest.mark.parametrize('screening,expected_labels', [
-    (True, ['first', 'last']), (False, ['first', 'middle', 'last']),
-])
-def test_partial_scenario_screening_restores_full_suite_and_clears_profiles(screening, expected_labels, caplog):
+@pytest.mark.parametrize(
+    "screening,expected_labels",
+    [
+        (True, ["first", "last"]),
+        (False, ["first", "middle", "last"]),
+    ],
+)
+def test_partial_scenario_screening_restores_full_suite_and_clears_profiles(
+    screening, expected_labels, caplog
+):
     from optimization.gpu.replay_progress import TemporalReplayProgress
+
     caplog.set_level("INFO")
     calls = []
+
     class Proxy:
         def __init__(self, label):
             self.label = label
-            self.last_profile = {'stale': 99}
+            self.last_profile = {"stale": 99}
+
         def evaluate(self, candidates, **kwargs):
-            calls.append((self.label, kwargs, [c['x'] for c in candidates]))
+            calls.append((self.label, kwargs, [c["x"] for c in candidates]))
             TemporalReplayProgress(len(candidates), 10)
-            self.last_profile = {'rows': len(candidates)}
-            return [{'adg_strategy_eq': c['x']} for c in candidates]
+            self.last_profile = {"rows": len(candidates)}
+            return [{"adg_strategy_eq": c["x"]} for c in candidates]
+
     class Suite:
-        objective_bases = [SimpleNamespace(scenario='first')]
-        base = SimpleNamespace(limit_checks=[{'scenario': 'last'}])
+        objective_bases = [SimpleNamespace(scenario="first")]
+        base = SimpleNamespace(limit_checks=[{"scenario": "last"}])
+
         @staticmethod
         def score_scenario_results(results):
             assert [r.scenario.label for r in results] == expected_labels
-            values = [r.metrics['stats']['adg_strategy_eq']['mean'] for r in results]
-            return dict(objectives=(-min(values),), unpenalized_objectives=(-min(values),),
-                        constraint_violation=0, suite_metrics={})
-    proxies = [Proxy(label) for label in ['first', 'middle', 'last']]
-    candidates = [{'x': 1}, {'x': 2}]
+            values = [r.metrics["stats"]["adg_strategy_eq"]["mean"] for r in results]
+            return dict(
+                objectives=(-min(values),),
+                unpenalized_objectives=(-min(values),),
+                constraint_violation=0,
+                suite_metrics={},
+            )
+
+    proxies = [Proxy(label) for label in ["first", "middle", "last"]]
+    candidates = [{"x": 1}, {"x": 2}]
     rows = _evaluate_gpu_suite_proxies(
-        Suite(), [(SimpleNamespace(label=p.label), [('x', p)], {'x': 3} if i == 2 else {})
-                  for i, p in enumerate(proxies)], candidates,
-        screening_scenarios=['last', 'first'] if screening else (),
-        evaluation_stage='screening' if screening else 'full',
+        Suite(),
+        [
+            (SimpleNamespace(label=p.label), [("x", p)], {"x": 3} if i == 2 else {})
+            for i, p in enumerate(proxies)
+        ],
+        candidates,
+        screening_scenarios=["last", "first"] if screening else (),
+        evaluation_stage="screening" if screening else "full",
     )
     assert [c[0] for c in calls] == expected_labels
     messages = [record.getMessage() for record in caplog.records]
     for index, label in enumerate(expected_labels, start=1):
-        assert any(f"suite_pass={index}/{len(expected_labels)} scenarios={label} "
+        assert any(f"group={index}/{len(expected_labels)}" in m and f"scenarios={label} "
                    f"exchange=x stage={'screening' if screening else 'full'}" in m for m in messages)
     assert calls[-1][2] == [3, 3]
     assert all(c[1] == {} for c in calls)
     assert [r[_GPU_SUITE_OBJECTIVES_KEY] for r in rows] == [(-1,), (-2,)]
-    assert all('stale' not in p.last_profile for p in proxies)
+    assert all("stale" not in p.last_profile for p in proxies)
     if screening:
         assert proxies[1].last_profile == {}
-    assert candidates == [{'x': 1}, {'x': 2}]
+    assert candidates == [{"x": 1}, {"x": 2}]
 
 
-@pytest.mark.parametrize('labels,basis,checks,error', [
-    (['unknown'], None, [], 'unknown labels'),
-    (['first'], 'second', [], 'explicitly selected'),
-    (['first'], None, [{'scenario': 'second'}], 'explicitly selected'),
-])
-def test_partial_scenario_screening_rejects_missing_required_scenarios_before_dispatch(labels, basis, checks, error):
-    suite = SimpleNamespace(objective_bases=[SimpleNamespace(scenario=basis)],
-                            base=SimpleNamespace(limit_checks=checks))
+@pytest.mark.parametrize(
+    "labels,basis,checks,error",
+    [
+        (["unknown"], None, [], "unknown labels"),
+        (["first"], "second", [], "explicitly selected"),
+        (["first"], None, [{"scenario": "second"}], "explicitly selected"),
+    ],
+)
+def test_partial_scenario_screening_rejects_missing_required_scenarios_before_dispatch(
+    labels, basis, checks, error
+):
+    suite = SimpleNamespace(
+        objective_bases=[SimpleNamespace(scenario=basis)],
+        base=SimpleNamespace(limit_checks=checks),
+    )
     with pytest.raises(ValueError, match=error):
-        _evaluate_gpu_suite_proxies(suite, [
-            (SimpleNamespace(label='first'), [('x', object())], {}),
-            (SimpleNamespace(label='second'), [('x', object())], {}),
-        ], [{}], screening_scenarios=labels)
+        _evaluate_gpu_suite_proxies(
+            suite,
+            [
+                (SimpleNamespace(label="first"), [("x", object())], {}),
+                (SimpleNamespace(label="second"), [("x", object())], {}),
+            ],
+            [{}],
+            screening_scenarios=labels,
+        )
 
 
 def test_screening_scenario_labels_survive_canonical_config_roundtrip():
     from config_utils import format_config
+
     config = _long_only_ema_config()
-    config['optimize']['gpu']['screening']['scenarios'] = ['a', 'b']
+    config["optimize"]["gpu"]["screening"]["scenarios"] = ["a", "b"]
     normalized = format_config(config, verbose=False)
     assert _resolve_options(normalized)['screening']['scenarios'] == ['a', 'b']
+
+
+def test_proxy_forager_roundtrip_retains_unsearched_unilateralness_weight():
+    from config.bot import normalize_forager_score_weights
+    from optimize import _canonicalize_optimizer_individual
+
+    config = get_template_config()
+    config["bot"]["long"]["forager"]["score_weights"]["unilateralness"] = 0.4
+    keys = ("volume", "ema_readiness", "volatility")
+    paths = [
+        (
+            f"long_forager_score_weights_{key}",
+            ("bot", "long", "forager", "score_weights", key),
+        )
+        for key in keys
+    ]
+    bounds = [Bound(0, 1, 0.01)] * 3
+    mapped = {name: (i, bounds[i]) for i, (name, _) in enumerate(paths)}
+    weights = [0.31, 0.72, 0.18]
+    exact = _canonicalize_optimizer_individual(
+        weights.copy(), config, bounds, 6, paths, []
+    )
+    proxy = _build_proxy_parameter_dicts(
+        weights,
+        mapped,
+        [(name, i, bound) for name, (i, bound) in mapped.items()],
+        np.array([weights]),
+        sig_digits=6,
+        base_forager_weights={
+            "long": config["bot"]["long"]["forager"]["score_weights"]
+        },
+    )[0]
+    actual = normalize_forager_score_weights(
+        {
+            key: proxy[f"long_forager_score_weights_{key}"]
+            for key in (*keys, "unilateralness")
+        },
+        path="proxy weights",
+    )
+    assert actual == pytest.approx(exact["bot"]["long"]["forager"]["score_weights"])
+
+
+@pytest.mark.parametrize("strategy", ["ema_anchor", "trailing_martingale"])
+def test_gpu_optional_adaptive_parameters_keep_configured_values_without_bounds(strategy):
+    from config.schema import get_template_config
+    from optimization.backends.gpu_backend import (
+        GPU_STRATEGY_BOUND_MAPS, _gpu_fixed_adaptive_parameters,
+    )
+
+    cfg = get_template_config()
+    cfg["bot"]["long"]["entry_cooldown"].update(
+        min_duration_minutes=2.0, max_duration_minutes=90.0,
+        weights_minutes={"exposure_ratio": 4.0, "adverse_directionality": 8.0},
+    )
+    cfg["bot"]["long"]["forager"]["unilateralness_ema_span_1m"] = 3.25
+    cfg["bot"]["long"]["forager"]["score_weights"]["unilateralness"] = 0.75
+    mapped = {"long_entry_cooldown_exposure_weight": object()}
+    fixed = _gpu_fixed_adaptive_parameters(cfg, GPU_STRATEGY_BOUND_MAPS[strategy], mapped)
+    assert "long_entry_cooldown_exposure_weight" not in fixed
+    assert fixed["long_entry_cooldown_min_duration_minutes"] == 2.0
+    assert fixed["long_entry_cooldown_max_duration_minutes"] == 90.0
+    assert fixed["long_entry_cooldown_adverse_weight"] == 8.0
+    assert fixed["long_unilateralness_ema_span_1m"] == 3.25
+    assert fixed["long_forager_score_weights_unilateralness"] == 0.75
+    assert fixed["short_entry_cooldown_max_duration_minutes"] == -1.0
+    assert fixed["short_entry_cooldown_adverse_weight"] == 0.0
+
+
+def test_gpu_anchor_optional_adaptive_defaults_preserve_explicit_anchor_values():
+    from config.schema import get_template_config
+    from optimization.backends.gpu_backend import GPU_STRATEGY_BOUND_MAPS, _gpu_fixed_adaptive_parameters
+
+    cfg = get_template_config()
+    cfg[ANCHOR_PLAN_KEY] = {
+        "fixed_keys": ["long_entry_cooldown_weights_minutes_exposure_ratio"],
+        "anchors": [
+            {"fixed_values": [{"key": "long_entry_cooldown_weights_minutes_exposure_ratio", "value": 4.0}]},
+            {"fixed_values": [{"key": "long_entry_cooldown_weights_minutes_exposure_ratio", "value": 8.0}]},
+        ],
+    }
+    mapping = GPU_STRATEGY_BOUND_MAPS["trailing_martingale"]
+    fixed = _gpu_fixed_adaptive_parameters(cfg, mapping, {})
+    anchors, ranges = _build_anchor_parameter_context(cfg, mapping, fallback_parameters=fixed)
+    assert [a["long_entry_cooldown_exposure_weight"] for a in anchors] == [4.0, 8.0]
+    assert all(set(fixed) <= a.keys() for a in anchors)
+    assert all(a["long_entry_cooldown_max_duration_minutes"] == -1.0 for a in anchors)
+    assert ranges["long_entry_cooldown_weights_minutes_exposure_ratio"] == Bound(4.0, 8.0)
+
+
+@pytest.mark.parametrize("strategy", ["ema_anchor", "trailing_martingale"])
+@pytest.mark.parametrize("enabled", [{"long"}, {"short"}, {"long", "short"}])
+@pytest.mark.parametrize("coin_count", [1, 3])
+def test_gpu_setup_uses_bounds_clamped_side_topology(strategy, enabled, coin_count):
+    from optimize import config_to_individual
+    from optimization.shape import build_optimization_shape
+    from optimization.gpu.model import gpu_side_enabled
+
+    config = _directional_tm_config(long_enabled=True, short_enabled=False)
+    config["live"]["strategy_kind"] = strategy
+    config["live"]["approved_coins"] = {side: ["BTC", "ETH", "SOL"][:coin_count] for side in ("long", "short")}
+    # Deliberately stale flat aliases must not override clamped canonical leaves.
+    config["bot"]["long"]["total_wallet_exposure_limit"] = 2.5
+    config["bot"]["long"]["risk"]["total_wallet_exposure_limit"] = 2.5
+    config["bot"]["short"]["total_wallet_exposure_limit"] = 0.0
+    for side in ("long", "short"):
+        risk = config["optimize"]["bounds"][side]["risk"]
+        risk["total_wallet_exposure_limit"] = [2.0, 2.0] if side in enabled else [0.0, 0.0]
+        risk["n_positions"] = [1, coin_count]
+    original = copy.deepcopy(config)
+    shape = build_optimization_shape(config)
+    vector = config_to_individual(config, shape.bounds, optimization_shape=shape)
+    runtime = _materialize_gpu_override_template(config, [], vector=vector, key_paths=shape.key_paths)
+    preparation = materialize_gpu_preparation_config(config)
+    assert runtime == preparation
+    assert config == original
+    assert {side for side in ("long", "short") if gpu_side_enabled(runtime, side)} == enabled
+    assert _gpu_candidate_search_sides(runtime, []) == enabled
+    bounds = {key: bound for (key, _), bound in zip(shape.key_paths, shape.bounds)}
+    base = {key: value for (key, _), value in zip(shape.key_paths, vector)}
+    _validate_directional_search_space(bounds, base, runtime["live"]["approved_coins"], enabled, coin_count=coin_count)
+
+
+def test_gpu_clamped_template_preserves_fixed_runtime_and_mirror_precedence():
+    from config.shared_bot import flatten_shared_bot_side
+
+    config = _directional_tm_config(long_enabled=True, short_enabled=True)
+    for side in ("long", "short"):
+        config["optimize"]["bounds"][side]["risk"]["total_wallet_exposure_limit"] = [0, 0]
+    config["optimize"]["fixed_runtime_overrides"] = {"bot.long.risk.total_wallet_exposure_limit": 1.5}
+    config["optimize"]["enable_overrides"] = ["mirror_short_from_long"]
+    effective = materialize_gpu_preparation_config(config)
+    for side in ("long", "short"):
+        assert effective["bot"][side]["risk"]["total_wallet_exposure_limit"] == 1.5
+        assert flatten_shared_bot_side(effective["bot"][side])["total_wallet_exposure_limit"] == 1.5

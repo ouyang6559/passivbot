@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from config import load_prepared_config
+from config.load import load_input_config, prepare_config
 from config.access import require_config_value, require_live_value
 from config.overrides import parse_overrides
 from config_utils import format_config
@@ -20,6 +20,7 @@ from optimization.warmup import (
     compute_optimizer_backtest_warmup_minutes,
     compute_optimizer_per_coin_warmup_minutes,
     stamp_warmup_metadata,
+    validate_optimizer_dataset_intervals,
 )
 from shared_arrays import attach_shared_array
 from suite_runner import (
@@ -212,7 +213,9 @@ async def prepare_suite_contexts(
             coin: deepcopy(dataset.mss.get(coin, {})) for coin in selected_coins
         }
         # Adjust per-coin indices relative to the time slice to avoid full hlcvs copies.
-        warmup_map = compute_optimizer_per_coin_warmup_minutes(scenario_config)
+        warmup_map = compute_optimizer_per_coin_warmup_minutes(
+            scenario_config, for_trade_activation=True
+        )
         for coin, meta in mss_slice.items():
             first_idx = int(meta.get("first_valid_index", 0))
             last_idx = int(meta.get("last_valid_index", total_steps_1m - 1))
@@ -352,6 +355,7 @@ async def prepare_suite_contexts(
                     f"Suite scenario {scenario.label} has no coins after applying exchange filters."
                 )
             scenario_config["backtest"]["coins"][dataset.exchange] = list(selected_coins)
+            validate_optimizer_dataset_intervals(scenario_config, dataset.mss, dataset.exchange)
             if dataset.hlcvs_spec is not None:
                 start_idx, end_idx, coin_indices = _compute_slice_indices(
                     dataset,
@@ -457,6 +461,7 @@ async def prepare_suite_contexts(
                 continue
             exchanges_for_scenario.append(exchange_key)
             scenario_config["backtest"]["coins"][exchange_key] = list(coins_for_exchange)
+            validate_optimizer_dataset_intervals(scenario_config, dataset.mss, exchange_key)
             if dataset.hlcvs_spec is not None:
                 start_idx, end_idx, coin_indices = _compute_slice_indices(
                     dataset,
@@ -562,11 +567,16 @@ async def prepare_suite_contexts(
 
 
 def ensure_suite_config(config_path: Path, suite_path: Optional[Path]) -> Dict[str, Any]:
-    config = load_prepared_config(str(config_path), verbose=False)
-    config = parse_overrides(config, verbose=False)
+    source, base_path, raw = load_input_config(str(config_path))
     suite_override = None
     if suite_path:
-        suite_override = load_suite_override_config(suite_path)
+        suite_override = load_suite_override_config(
+            suite_path, source_config=source, base_config_path=base_path
+        )
+    config = prepare_config(
+        source, base_config_path=base_path, raw_snapshot=raw, verbose=False
+    )
+    config = parse_overrides(config, verbose=False)
     return extract_suite_config(config, suite_override)
 
 

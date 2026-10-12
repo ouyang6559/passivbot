@@ -108,27 +108,24 @@
                 "score_weights": {
                     "ema_readiness": 0.0,
                     "volatility": 1.0,
-                    "volume": 0.0
+                    "volume": 0.0,
+                    "unilateralness": 0.0
                 },
                 "volatility_ema_span_1m": 101,
                 "volume_drop_pct": 0.884,
-                "volume_ema_span_1m": 1660
+                "volume_ema_span_1m": 1660,
+                "unilateralness_ema_span_1m": 60.0
             },
             "hsl": {
+                "scale_budget_with_excess_allowance": false,
                 "cooldown_minutes_after_red": 0,
                 "ema_span_minutes": 60,
                 "enabled": false,
-                "no_restart_drawdown_threshold": 1,
-                "orange_tier_mode": "tp_only_with_active_entry_cancellation",
                 "panic_close_order_type": "limit",
                 "red_threshold": 0.2,
-                "tier_ratios": {
-                    "orange": 0.75,
-                    "yellow": 0.5
-                }
+                "restart_after_red_policy": "always"
             },
             "risk": {
-                "entry_cooldown_minutes": 0.0,
                 "n_positions": 4,
                 "total_wallet_exposure_limit": 1,
                 "total_exposure_enforcer_enabled": true,
@@ -176,6 +173,15 @@
                 "enabled": true,
                 "loss_allowance_pct": 0.00523,
                 "threshold": 0.833
+            },
+            "entry_cooldown": {
+                "base_duration_minutes": 0.0,
+                "min_duration_minutes": 0.0,
+                "max_duration_minutes": null,
+                "weights_minutes": {
+                    "exposure_ratio": 0.0,
+                    "adverse_directionality": 0.0
+                }
             }
         },
         "short": {
@@ -183,27 +189,24 @@
                 "score_weights": {
                     "ema_readiness": 0.0,
                     "volatility": 1.0,
-                    "volume": 0.0
+                    "volume": 0.0,
+                    "unilateralness": 0.0
                 },
                 "volatility_ema_span_1m": 10,
                 "volume_drop_pct": 0.5,
-                "volume_ema_span_1m": 360
+                "volume_ema_span_1m": 360,
+                "unilateralness_ema_span_1m": 60.0
             },
             "hsl": {
+                "scale_budget_with_excess_allowance": false,
                 "cooldown_minutes_after_red": 0,
                 "ema_span_minutes": 60,
                 "enabled": false,
-                "no_restart_drawdown_threshold": 1,
-                "orange_tier_mode": "tp_only_with_active_entry_cancellation",
                 "panic_close_order_type": "limit",
                 "red_threshold": 0.2,
-                "tier_ratios": {
-                    "orange": 0.75,
-                    "yellow": 0.5
-                }
+                "restart_after_red_policy": "always"
             },
             "risk": {
-                "entry_cooldown_minutes": 0.0,
                 "n_positions": 7,
                 "total_wallet_exposure_limit": 0,
                 "total_exposure_enforcer_enabled": true,
@@ -251,11 +254,29 @@
                 "enabled": true,
                 "loss_allowance_pct": 0.001,
                 "threshold": 0.4
+            },
+            "entry_cooldown": {
+                "base_duration_minutes": 0.0,
+                "min_duration_minutes": 0.0,
+                "max_duration_minutes": null,
+                "weights_minutes": {
+                    "exposure_ratio": 0.0,
+                    "adverse_directionality": 0.0
+                }
             }
+        },
+        "hsl": {
+            "scale_budget_with_excess_allowance": false,
+            "cooldown_minutes_after_red": 0,
+            "ema_span_minutes": 60,
+            "enabled": false,
+            "panic_close_order_type": "limit",
+            "red_threshold": 0.2,
+            "restart_after_red_policy": "always"
         }
     },
     "coin_overrides": {},
-    "config_version": "v8.4.0",
+    "config_version": "v8.6.0",
     "live": {
         "approved_coins": {
             "long": [
@@ -283,7 +304,6 @@
         "forced_mode_long": "",
         "forced_mode_short": "",
         "hedge_mode": false,
-        "hsl_position_during_cooldown_policy": "panic",
         "hsl_signal_mode": "unified",
         "ignored_coins": {
             "long": [],
@@ -378,29 +398,7 @@
                         10
                     ]
                 },
-                "hsl": {
-                    "cooldown_minutes_after_red": [
-                        1,
-                        2880,
-                        10
-                    ],
-                    "ema_span_minutes": [
-                        1,
-                        2880,
-                        10
-                    ],
-                    "red_threshold": [
-                        0.01,
-                        0.12,
-                        0.001
-                    ]
-                },
                 "risk": {
-                    "entry_cooldown_minutes": [
-                        0.0,
-                        60.0,
-                        0.1
-                    ],
                     "n_positions": [
                         10,
                         10,
@@ -550,8 +548,14 @@
                     }
                 },
                 "unstuck": {
-                    "ema_span_0": [770, 770],
-                    "ema_span_1": [210, 210],
+                    "ema_span_0": [
+                        770,
+                        770
+                    ],
+                    "ema_span_1": [
+                        210,
+                        210
+                    ],
                     "close_pct": [
                         0.05,
                         0.12,
@@ -571,6 +575,13 @@
                         0.4,
                         0.9,
                         0.001
+                    ]
+                },
+                "entry_cooldown": {
+                    "base_duration_minutes": [
+                        0.0,
+                        60.0,
+                        0.1
                     ]
                 }
             },
@@ -607,29 +618,7 @@
                         10
                     ]
                 },
-                "hsl": {
-                    "cooldown_minutes_after_red": [
-                        1,
-                        2880,
-                        10
-                    ],
-                    "ema_span_minutes": [
-                        1,
-                        2880,
-                        10
-                    ],
-                    "red_threshold": [
-                        0.01,
-                        0.12,
-                        0.001
-                    ]
-                },
                 "risk": {
-                    "entry_cooldown_minutes": [
-                        0.0,
-                        60.0,
-                        0.1
-                    ],
                     "n_positions": [
                         10,
                         10,
@@ -779,8 +768,14 @@
                     }
                 },
                 "unstuck": {
-                    "ema_span_0": [100, 100],
-                    "ema_span_1": [100, 100],
+                    "ema_span_0": [
+                        100,
+                        100
+                    ],
+                    "ema_span_1": [
+                        100,
+                        100
+                    ],
                     "close_pct": [
                         0.05,
                         0.12,
@@ -801,7 +796,31 @@
                         0.9,
                         0.001
                     ]
+                },
+                "entry_cooldown": {
+                    "base_duration_minutes": [
+                        0.0,
+                        60.0,
+                        0.1
+                    ]
                 }
+            },
+            "hsl": {
+                "cooldown_minutes_after_red": [
+                    1,
+                    2880,
+                    10
+                ],
+                "ema_span_minutes": [
+                    1,
+                    2880,
+                    10
+                ],
+                "red_threshold": [
+                    0.01,
+                    0.12,
+                    0.001
+                ]
             }
         },
         "compress_results_file": true,
@@ -809,10 +828,7 @@
         "crossover_probability": 0.64,
         "enable_overrides": [],
         "fixed_params": [],
-        "fixed_runtime_overrides": {
-            "bot.long.hsl.no_restart_drawdown_threshold": 1,
-            "bot.short.hsl.no_restart_drawdown_threshold": 1
-        },
+        "fixed_runtime_overrides": {},
         "iters": 500000,
         "limits": [
             {

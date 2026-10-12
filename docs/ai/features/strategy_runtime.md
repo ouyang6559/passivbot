@@ -19,7 +19,7 @@ internal compatibility surfaces: ignore them when adding current config fields, 
 production or live support from their presence. The only supported pre-V8 strategy migration path
 is the explicit `passivbot tool migrate-config-v7` workflow for normalized V7 trailing-grid input.
 
-With `entry_cooldown_minutes = 0.0`, `trailing_grid_v7` preserves v7's simultaneous grid-entry
+With an effective entry cooldown of zero, `trailing_grid_v7` preserves v7's simultaneous grid-entry
 ladder even when a later trailing leg uses retracement. Its recursive generator stops expansion
 before stacking retracement-dependent trailing orders. Positive entry cooldowns still stage at
 most one position-adding order and apply their configured post-fill delay.
@@ -66,7 +66,9 @@ Optimizer selector contract:
 Seed evaluation contract:
 
 - Shared ingestion normalizes, clamps, quantizes, and deduplicates starting configs before each
-  backend applies its seed policy.
+  backend applies its seed policy. GPU preparation and proxy setup use the bounds-clamped
+  input seed after fixed runtime and optimizer overrides. Bounds may change its enabled
+  sides relative to the input bot values; enabledness must remain fixed across the search.
 - CPU optimization exact-Rust evaluates every deduplicated seed before population trimming.
 - GPU `seed_bootstrap.mode=auto` exact-evaluates small pools and full-history proxy-screens pools
   larger than `max_exact`. Screened pools exact-Rust validate a capped, constraint-aware diverse
@@ -196,8 +198,13 @@ Limit buys require `low < price * (1 - buffer)` and limit sells require
 filled limit orders retain the original order price and maker fees. Market execution bypasses it.
 The actual fill and next-candle ladder-expansion hint share the same Rust predicate; raw candles
 used for indicators, trailing extrema, equity, and risk remain unchanged. Live inputs do not
-forward this setting. CPU optimization treats it as fixed evaluation policy; GPU screening
-rejects nonzero values until it implements the same contract.
+forward this setting. CPU and GPU optimization treat it as fixed evaluation policy. GPU screening
+encodes buffered strict crossings as immutable integer tick boundaries during data preparation; kernels retain
+the same fill comparisons and original candle/touch inputs. Prepared-data cache keys and
+checkpoint execution identity include the buffer.
+Thresholds above all representable order ticks saturate at the maximum tick: this preserves
+all-sell/no-buy eligibility without rejecting large valid buffers. Executable price range checks
+remain unchanged.
 The native backtest payload loader accepts an absent buffer as `0.0` for payloads from before
 this setting existed; explicit invalid values still fail. Canonical Python loading always supplies
 the field. Orchestrator next-candle hints likewise default absence to zero and reject non-finite
@@ -269,3 +276,70 @@ behavior patches.
 - `tests/test_orchestrator_json_api.py`
 - `tests/test_orchestrator_integration.py`
 - `tests/test_auto_unstuck_allowance.py`
+
+## Adaptive entry timing and unilateralness
+
+Rust owns signed RMS directionality, its use as a lower-is-better Forager component,
+and additive cooldown minutes. The shared side-level float span lives under
+`forager.unilateralness_ema_span_1m`. Both runtimes use the same last
+`ceil(20 * span) + 1` completed one-minute closes with zero-seeded exponential weights.
+Live replays the window. CPU uses rolling aggregate stacks with amortized constant
+work per candle, agreeing with replay within floating-point roundoff; all-flat windows
+are exactly zero. No RAM-only indicator state is needed for restart. Missing history is absent,
+never a neutral score. CPU candle intervals other than one minute are rejected
+when an RMS consumer is enabled. Dormant weights on a statically disabled side do
+not request RMS history, allocate CPU trackers, or restrict candle intervals. Optimizer
+dataset preflight checks finalized per-coin eligibility and overrides across reachable
+boundary configs. Entry-ineligible sides do not restrict intervals or RMS activation.
+
+Canonical loading and cleaning expose missing unilateralness weight/span and
+adaptive cooldown weight/minimum-duration optimizer bounds as fixed ranges at
+the side's configured values (using normalized Forager weights). A missing maximum
+duration bound is hydrated only for a finite ceiling; null remains unbounded.
+Explicit bounds retain their authority. Visibility must not open a search range or
+change optimizer candidate normalization or warmup for unchanged configurations.
+
+Forager may carry a complete cached observation only within the existing candidate
+age budget, without feeding invented flat returns. Cooldown requires a current
+completed window. Their values remain separate in the input envelope. Missing
+RMS is scoped to the consuming entry or ranking branch; closes remain independent.
+Live `unilateralness_unavailable` carries separate `current` and `forager` span
+lists. RMS transport failures must not set the generic missing-strategy-input
+permission. A valid cached ranking value does not satisfy current cooldown input.
+CPU history requests include RMS only for reachable consumers; scoring alone needs no
+history when a known eligible side universe fits fixed slots with dynamic WEL disabled,
+or has at most one coin. Shared trade activation does not wait for RMS.
+Per-coin `warmup_minutes_source` distinguishes producer-stamped `history` from
+`activation` budgets. Only known history metadata may be replaced by a candidate's
+non-RMS activation budget; optimizer activation stamps and untyped external budgets
+remain authoritative. Rust's zero global warmup retains its automatic non-RMS
+fallback. Python sends the minimum positive budget when it explicitly computes a
+zero activation budget for an adverse-RMS consumer.
+The backtest marks exact spans still warming from known listing history in
+`unilateralness_warmup_spans`. A missing score at a marked span defers only required
+ranking or the side/order branch consuming adverse cooldown. If any compared
+candidate lacks required RMS, defer the whole ranking decision, not just that
+candidate; never select from a history-ready subset. Closes and unrelated
+entries remain independent. Once enough closes exist the marker is removed.
+Unmarked missing inputs, unrelated required inputs and invalid scores remain fatal.
+The Python output validator evaluates the submitted cooldown inputs through the
+same pure Rust policy, rather than trusting a producer-echoed duration.
+
+Cooldown uses nonnegative additive weights for existing exposure ratio (without a
+unit cap) and adverse signed RMS. Apply floor/ceiling once after composition.
+A validated policy whose base/floor already reaches its ceiling is constant and
+requires no modifier inputs. Inactive adverse modifiers impose no RMS history or
+interval requirement; optimizer bounds must account for nonconstant corners.
+Enabled weights require a finite ceiling; structural fill coverage, pair activation
+and restart anchors use that horizon even at base zero. Live approval gates initial
+entries, not DCA on held graceful-stop positions. Keep held-side cooldown history and
+adverse inputs conservatively; effective trading modes remain Rust's decision.
+Current effective duration,
+not base alone, governs elapsed-time gating and entry-ladder staging. At effective
+zero retain existing strategy rules. Partial fills remain ordinary increasing fills.
+All new weights default to zero. Metal/CUDA screening supports these settings for
+EMA Anchor and Trailing Martingale, including directional and fused portfolios.
+GPU RMS uses a finite exponential recurrence, reads the expiring return from immutable
+candles, and periodically rebuilds to bound float32 subtraction error. Replay checkpoints
+preserve each candidate/coin/side accumulator; exact Rust validation remains authoritative.
+The GPU parameter-layout revision invalidates older optimizer checkpoints.

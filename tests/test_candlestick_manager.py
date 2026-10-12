@@ -53,6 +53,99 @@ def _resolution_candles(*minutes, close_offset=0.0):
 
 
 @pytest.mark.asyncio
+async def test_native_history_deadlines_resume_persisted_prefix_after_restart(tmp_path):
+    period = 5 * ONE_MIN_MS
+    start = 1_800_000_000_000
+    end = start + 5 * period
+    cache_dir = str(tmp_path / "caches")
+    calls = []
+
+    class Exchange:
+        id = "demo"
+
+    def manager():
+        cm = CandlestickManager(exchange=Exchange(), cache_dir=cache_dir)
+        cm._now_ms_callback = lambda: end + period
+
+        async def budgeted_fetch(symbol, since, until, *, on_batch=None, **kwargs):
+            calls.append((since, until))
+            timestamps = list(range(since, until, period))
+            batch = np.array(
+                [(ts, 100.0, 101.0, 99.0, 100.0, 1.0) for ts in timestamps[:2]],
+                dtype=CANDLE_DTYPE,
+            )
+            on_batch(batch)
+            if len(timestamps) > 2:
+                raise TimeoutError("synthetic acquisition deadline")
+            return batch
+
+        cm._fetch_ohlcv_paginated = budgeted_fetch
+        return cm
+
+    # A fresh manager each time proves progress is durable rather than RAM-only.
+    for attempt in range(5):
+        cm = manager()
+        try:
+            result = await cm.get_candles(
+                "TEST", start_ts=start, end_ts=end, timeframe="5m", standardize=False
+            )
+            break
+        except TimeoutError:
+            assert attempt < 4, "repeated reads must progress beyond the old prefix"
+    assert list(result["ts"]) == list(range(start, end + period, period))
+    assert [since for since, _ in calls] == [start + i * period for i in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_native_missing_spans_keep_sparse_evidence_and_later_failure(tmp_path):
+    period = 5 * ONE_MIN_MS
+    start = 1_800_000_000_000
+    end = start + 11 * period
+
+    class Exchange:
+        id = "kucoinfutures"
+
+    cm = CandlestickManager(exchange=Exchange(), cache_dir=str(tmp_path / "caches"))
+    cm._now_ms_callback = lambda: end + period
+    cached = np.array(
+        [
+            (start + i * period, 100.0, 101.0, 99.0, 100.0, 1.0)
+            for i in [0, 1, 2, 3, 5, 6, 7, 8, 9]
+        ],
+        dtype=CANDLE_DTYPE,
+    )
+    cm._persist_batch("TEST", cached, timeframe="5m")
+    calls = []
+
+    async def fetch(symbol, since, limit, *, end_exclusive_ms=None, **kwargs):
+        calls.append((since, end_exclusive_ms))
+        if end_exclusive_ms == end + period:
+            raise TimeoutError("synthetic tail failure")
+        return [[start + i * period, 100.0, 101.0, 99.0, 100.0, 1.0] for i in [3, 5]]
+
+    cm._ccxt_fetch_ohlcv_once = fetch
+    with pytest.raises(TimeoutError):
+        await cm.get_candles(
+            "TEST", start_ts=start, end_ts=end, timeframe="5m", standardize=False
+        )
+    assert calls == [
+        (start + 2 * period, start + 6 * period),
+        (start + 8 * period, end + period),
+    ]
+    partial = await cm.get_candles(
+        "TEST",
+        start_ts=start,
+        end_ts=end,
+        timeframe="5m",
+        standardize=False,
+        allow_remote_fetch=False,
+    )
+    assert list(partial["ts"]) == list(range(start, start + 10 * period, period))
+    assert partial["bv"][4] == 0.0  # Proven by neighbours in the same response.
+    assert not cm._candle_range_has_full_coverage(partial, start, end, period)
+
+
+@pytest.mark.asyncio
 async def test_resolution_ladder_stops_when_exact_1m_reaches_start():
     calls = []
 
@@ -1729,10 +1822,16 @@ def test_persist_batch_observer_receives_saved_batch(tmp_path):
     assert np.array_equal(batch, arr)
 
 
-def test_disk_load_observer_receives_summary_and_is_best_effort(tmp_path):
+@pytest.mark.parametrize(
+    "minute_offset, expected_days", [(720, 1), (1439, 2)], ids=["same-day", "utc-midnight"]
+)
+def test_disk_load_observer_receives_summary_and_is_best_effort(
+    tmp_path, minute_offset, expected_days
+):
     cm = CandlestickManager(exchange=None, exchange_name="ex", cache_dir=str(tmp_path / "caches"))
     symbol = "LOAD/USDT"
-    ts0 = _floor_minute(int(time.time() * 1000)) - 5 * ONE_MIN_MS
+    # Fixed UTC day: exercise both one shard and a midnight crossing without wall-clock flakiness.
+    ts0 = 1704067200000 + minute_offset * ONE_MIN_MS
     ts1 = ts0 + ONE_MIN_MS
     arr = np.array(
         [
@@ -1761,8 +1860,8 @@ def test_disk_load_observer_receives_summary_and_is_best_effort(tmp_path):
     assert payload["loaded_rows"] == 2
     assert payload["loaded_start_ts"] == ts0
     assert payload["loaded_end_ts"] == ts1
-    assert payload["days"] == 1
-    assert payload["source_days"] == {"primary": 1, "legacy": 0, "merged": 0}
+    assert payload["days"] == expected_days
+    assert payload["source_days"] == {"primary": expected_days, "legacy": 0, "merged": 0}
     assert payload["elapsed_ms"] >= 0
 
     def failing_observer(_payload):
@@ -5865,3 +5964,64 @@ def test_rejected_duplicate_timestamp_is_accepted_when_any_row_is_valid(tmp_path
 
     assert list(normalized["ts"]) == [base]
     assert cm._rejected_ccxt_ohlcv_timestamps(raw, normalized) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("tail", [2, 1], ids=["repeated", "regressed"])
+@pytest.mark.parametrize("corrected_close", [98, 102])
+@pytest.mark.parametrize("timeframe,period", [("1m", ONE_MIN_MS), ("1h", 60 * ONE_MIN_MS)])
+async def test_paginated_sparse_tail_stops_when_response_does_not_advance(
+    tmp_path, strict, tail, corrected_close, timeframe, period
+):
+    class Exchange:
+        id = "kucoinfutures"
+
+    cm = CandlestickManager(exchange=Exchange(), exchange_name="kucoin", cache_dir=str(tmp_path))
+    start = 1000 * period
+    calls = []
+    batches = []
+
+    async def fetch_once(_symbol, since, _limit, **_kwargs):
+        calls.append(since)
+        assert len(calls) <= 2, "pagination repeated an unchanged sparse tail"
+        last = 2 if len(calls) == 1 else tail
+        return [[start + i * period, 100, 103, 97, 100 if len(calls) == 1 else corrected_close, 1] for i in range(last + 1)]
+
+    cm._ccxt_fetch_ohlcv_once = fetch_once
+    request = cm._fetch_ohlcv_paginated(
+        "SPARSE/USDT:USDT", start, start + 20 * period,
+        timeframe=timeframe, on_batch=batches.append, raise_on_partial_empty_page=strict,
+    )
+    if strict:
+        with pytest.raises(OhlcvTerminalEmptyPage, match="did not advance") as caught:
+            await request
+        result = caught.value.partial_rows
+    else:
+        result = await request
+    assert len(calls) == 2
+    assert len(batches) == 2
+    assert batches[1][-1]["c"] == corrected_close
+    assert set(result["ts"]) == {start + i * period for i in range(3)}
+    assert len(result) == 3
+    assert all(row["c"] == corrected_close for row in result if row["ts"] <= start + tail * period)
+
+
+@pytest.mark.asyncio
+async def test_paginated_overlap_with_advancing_tail_completes(tmp_path):
+    class Exchange:
+        id = "kucoinfutures"
+
+    cm = CandlestickManager(exchange=Exchange(), exchange_name="kucoin", cache_dir=str(tmp_path))
+    start = 1000 * ONE_MIN_MS
+    pages = [[0, 1, 2], [1, 2, 3, 4]]
+
+    async def fetch_once(*_args, **_kwargs):
+        return [[start + i * ONE_MIN_MS, 100, 101, 99, 100, 1] for i in pages.pop(0)]
+
+    cm._ccxt_fetch_ohlcv_once = fetch_once
+    result = await cm._fetch_ohlcv_paginated(
+        "SPARSE/USDT:USDT", start, start + 5 * ONE_MIN_MS, raise_on_partial_empty_page=True
+    )
+    assert not pages
+    assert list(result["ts"]) == [start + i * ONE_MIN_MS for i in range(5)]

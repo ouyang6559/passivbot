@@ -359,12 +359,8 @@ def _linear_interpolate(value0: float, value1: float, ratio: float) -> float:
     return float(value0 + (value1 - value0) * ratio)
 
 
-def ohlcv_xm_to_1m(candle: np.void, minutes: int) -> np.ndarray:
-    """Expand one higher-timeframe OHLCV candle into deterministic synthetic 1m candles."""
-    if minutes <= 0:
-        raise ValueError(f"minutes must be > 0, got {minutes}")
-
-    ts = int(candle["ts"])
+def _normalized_coarse_ohlcv(candle: np.void) -> tuple[float, float, float, float, float]:
+    """Use the same finite-value, range and endpoint policy for every expansion."""
     o = float(candle["o"])
     h = float(candle["h"])
     l = float(candle["l"])
@@ -377,6 +373,16 @@ def ohlcv_xm_to_1m(candle: np.void, minutes: int) -> np.ndarray:
         h, l = l, h
     o = min(max(o, l), h)
     c = min(max(c, l), h)
+    return o, h, l, c, bv
+
+
+def ohlcv_xm_to_1m(candle: np.void, minutes: int) -> np.ndarray:
+    """Expand one higher-timeframe OHLCV candle into deterministic synthetic 1m candles."""
+    if minutes <= 0:
+        raise ValueError(f"minutes must be > 0, got {minutes}")
+
+    ts = int(candle["ts"])
+    o, h, l, c, bv = _normalized_coarse_ohlcv(candle)
 
     out = np.zeros(minutes, dtype=CANDLE_DTYPE)
     out["ts"] = np.arange(ts, ts + minutes * ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
@@ -457,6 +463,42 @@ def synthesize_1m_from_higher_tf(candles: np.ndarray, tf_minutes: int) -> np.nda
     return np.sort(np.concatenate(expanded), order="ts")
 
 
+def _synthesize_boundary_prefix(
+    candle: np.void, tf_minutes: int, exact_overlap: np.ndarray, known_prefix: np.ndarray
+) -> np.ndarray:
+    """Expand only the unknown prefix of a bucket with a complete exact suffix.
+
+    An extreme outside all finer rows' range must belong to the unknown prefix.
+    Extrema already observed in finer rows have unknown prefix membership and
+    are not moved backward. Their ordering within the prefix remains approximate.
+    """
+    o, h, l, _, bv = _normalized_coarse_ohlcv(candle)
+    known_rows = np.concatenate([known_prefix, exact_overlap])
+    prefix_minutes = (int(exact_overlap[0]["ts"]) - int(candle["ts"])) // ONE_MIN_MS
+    prefix = candle.copy()
+    prefix["o"] = o
+    prefix["c"] = min(max(float(exact_overlap[0]["o"]), l), h)
+    prefix["h"] = max(float(prefix["o"]), float(prefix["c"]))
+    prefix["l"] = min(float(prefix["o"]), float(prefix["c"]))
+    missing_high = h > float(np.max(known_rows["h"]))
+    missing_low = l < float(np.min(known_rows["l"]))
+    if missing_high:
+        prefix["h"] = max(float(prefix["h"]), h)
+    if missing_low:
+        prefix["l"] = min(float(prefix["l"]), l)
+    # Keep the existing proportional volume approximation for coarse history.
+    prefix["bv"] = bv * prefix_minutes / tf_minutes
+    expanded = ohlcv_xm_to_1m(prefix, prefix_minutes)
+    expanded = expanded[~np.isin(expanded["ts"], known_prefix["ts"])]
+    # Finer rows keep precedence, but must not displace an extreme they lack.
+    if expanded.size:
+        if missing_high:
+            expanded["h"][np.argmax(expanded["h"])] = prefix["h"]
+        if missing_low:
+            expanded["l"][np.argmin(expanded["l"])] = prefix["l"]
+    return expanded
+
+
 async def fetch_candles_with_resolution_ladder(
     fetch_candles: Callable[..., Awaitable[np.ndarray]],
     *,
@@ -467,9 +509,12 @@ async def fetch_candles_with_resolution_ladder(
     """Fetch exact 1m candles, then cover only older leading history coarsely.
 
     The first available 1m candle is the precision boundary. Higher-timeframe
-    candles may supply minutes before that boundary only when their full bucket
-    ends there or earlier; they never patch gaps at or after it. Within the
-    older prefix, the finest successful source wins.
+    candles normally supply only complete buckets ending at or before that
+    boundary. One bucket may straddle the boundary when every overlapping
+    exact 1m minute is already present; only its pre-boundary synthetic rows
+    are then eligible. Coarse candles never patch gaps at or after the
+    precision boundary. Within the older prefix, the finest successful source
+    wins.
     """
     start_minute = _floor_minute(start_ts)
     end_minute = _floor_minute(end_ts)
@@ -488,6 +533,7 @@ async def fetch_candles_with_resolution_ladder(
     rows_by_ts: Dict[int, np.void] = {}
     sources_by_ts: Dict[int, str] = {}
     failures: Dict[str, Exception] = {}
+    exact_timestamps: set[int] = set()
     precision_boundary = end_minute + ONE_MIN_MS
 
     for index, (timeframe, tf_minutes) in enumerate(CANDLE_RESOLUTION_LADDER):
@@ -521,12 +567,41 @@ async def fetch_candles_with_resolution_ladder(
             candidates = synthesize_1m_from_higher_tf(
                 fetched[complete_before_boundary], tf_minutes
             )
+            if exact_timestamps:
+                aligned_boundary = (
+                    (precision_boundary + period_ms - 1) // period_ms
+                ) * period_ms
+                overlap_timestamps = range(
+                    precision_boundary, aligned_boundary, ONE_MIN_MS
+                )
+                if (
+                    precision_boundary < aligned_boundary <= end_minute + ONE_MIN_MS
+                    and all(ts in exact_timestamps for ts in overlap_timestamps)
+                ):
+                    exact_overlap = np.array(
+                        [rows_by_ts[ts] for ts in overlap_timestamps], dtype=CANDLE_DTYPE
+                    )
+                    bucket_start = aligned_boundary - period_ms
+                    boundary_rows = fetched[fetched["ts"] == bucket_start]
+                    if boundary_rows.size:
+                        known_prefix = np.array(
+                            [
+                                rows_by_ts[ts]
+                                for ts in range(bucket_start, precision_boundary, ONE_MIN_MS)
+                                if ts in rows_by_ts
+                            ],
+                            dtype=CANDLE_DTYPE,
+                        )
+                        prefix = _synthesize_boundary_prefix(
+                            boundary_rows[0], tf_minutes, exact_overlap, known_prefix
+                        )
+                        candidates = np.concatenate([candidates, prefix])
         if index == 0:
-            exact_timestamps = [
+            exact_timestamps = {
                 int(row["ts"])
                 for row in candidates
                 if start_minute <= int(row["ts"]) <= end_minute
-            ]
+            }
             if exact_timestamps:
                 precision_boundary = min(exact_timestamps)
 
@@ -2404,27 +2479,39 @@ class CandlestickManager:
             out.append(os.path.join("historical_data", "ohlcvs_bybit", sym_code))
         return out
 
-    def _get_legacy_shard_paths(self, symbol: str, tf: str) -> Dict[str, str]:
-        """Return mapping date_key -> legacy shard path for a symbol+tf (cached)."""
+    def _get_legacy_shard_paths(
+        self, symbol: str, tf: str, *, strict: bool = False
+    ) -> Dict[str, str]:
+        """Discover legacy shards; strict reads refresh and propagate scan failures."""
         ex = str(self.exchange_name or "").lower()
         key = (ex, str(symbol), str(tf))
         cached = self._legacy_shard_paths_cache.get(key)
-        if cached is not None:
+        if cached is not None and not strict:
             return cached
         mapping: Dict[str, str] = {}
         scanned_dirs: List[str] = []
         for d in self._legacy_shard_dirs(symbol, tf):
             try:
                 dp = Path(d)
-                if not dp.exists():
+                if strict:
+                    try:
+                        dp.stat()
+                    except FileNotFoundError:
+                        continue
+                elif not dp.exists():
                     continue
                 scanned_dirs.append(str(dp))
-                for p in dp.glob("*.npy"):
+                paths = dp.iterdir() if strict else dp.glob("*.npy")
+                for p in paths:
+                    if p.suffix != ".npy":
+                        continue
                     name = p.stem
                     if len(name) == 10 and name[4] == "-" and name[7] == "-":
                         # Prefer earlier directories in the list if duplicates exist.
                         mapping.setdefault(name, str(p))
             except Exception:
+                if strict:
+                    raise
                 continue
         self._legacy_shard_paths_cache[key] = mapping
         if mapping:
@@ -2438,8 +2525,8 @@ class CandlestickManager:
             )
         return mapping
 
-    def _load_shard(self, path: str) -> np.ndarray:
-        if not os.path.exists(path):
+    def _load_shard(self, path: str, *, strict: bool = False) -> np.ndarray:
+        if not strict and not os.path.exists(path):
             # Missing file is expected for pre-inception dates - log at debug level
             self.log.debug(f"Shard not found (expected for pre-inception): {path}")
             return np.empty((0,), dtype=CANDLE_DTYPE)
@@ -2462,6 +2549,8 @@ class CandlestickManager:
                 return out
             return _ensure_dtype(arr)
         except Exception as e:  # pragma: no cover - best effort
+            if strict:
+                raise
             self.log.warning(
                 "Failed loading shard %s error_type=%s",
                 path,
@@ -2526,6 +2615,7 @@ class CandlestickManager:
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
         merge_memory_cache: bool = True,
+        strict: bool = False,
     ) -> Optional[np.ndarray]:
         """Load any shards intersecting [start_ts, end_ts] and merge into cache.
 
@@ -2536,13 +2626,19 @@ class CandlestickManager:
         remains as a safety net for any data that wasn't migrated.
 
         Set ``merge_memory_cache=False`` to inspect canonical disk contents
-        without merging their rows into the in-memory candle cache.
+        without merging their rows into the in-memory candle cache. ``strict``
+        propagates shard read failures instead of treating unreadable history
+        as absent; WebSocket ingestion requires this before writing a tail.
         """
         try:
             tf_norm = self._normalize_timeframe_arg(timeframe, tf)
-            shard_paths = self._iter_shard_paths(symbol, tf=tf_norm)
-            legacy_paths = self._get_legacy_shard_paths(symbol, tf_norm)
             days = self._date_keys_between(start_ts, end_ts)
+            if strict:
+                self._invalidate_shard_paths_cache(symbol, tf=tf_norm)
+                for day in days:
+                    self._legacy_day_quality_cache.pop((symbol, tf_norm, day), None)
+            shard_paths = self._iter_shard_paths(symbol, tf=tf_norm)
+            legacy_paths = self._get_legacy_shard_paths(symbol, tf_norm, strict=strict)
             load_keys: List[Tuple[str, str]] = []
             day_ctx: Dict[str, Dict[str, Any]] = {}
             legacy_hits = 0
@@ -2621,18 +2717,20 @@ class CandlestickManager:
                 ctx = day_ctx.get(day_key, {})
                 src = str(ctx.get("source") or "")
                 if tf_norm == "1m" and src == "merge":
-                    legacy_arr = self._load_shard(path)
+                    legacy_arr = self._load_shard(path, strict=strict)
                     primary_arr = np.empty((0,), dtype=CANDLE_DTYPE)
                     try:
                         pp = ctx.get("primary_path")
                         if pp:
-                            primary_arr = self._load_shard(str(pp))
+                            primary_arr = self._load_shard(str(pp), strict=strict)
                     except Exception:
+                        if strict:
+                            raise
                         primary_arr = np.empty((0,), dtype=CANDLE_DTYPE)
                     # Keep legacy canonical: primary should only fill legacy gaps.
                     a = self._merge_overwrite(primary_arr, legacy_arr)
                 else:
-                    a = self._load_shard(path)
+                    a = self._load_shard(path, strict=strict)
 
                 # NOTE: We intentionally do NOT write legacy data into primary shards.
                 # Primary is only used to fill gaps where legacy is missing/incomplete.
@@ -2734,6 +2832,8 @@ class CandlestickManager:
                 # Do not touch 1m cache for higher TF; let caller handle
                 return merged_disk
         except Exception as e:  # pragma: no cover - noncritical
+            if strict:
+                raise
             self._log(
                 "warning",
                 "disk_load_error",
@@ -2751,11 +2851,13 @@ class CandlestickManager:
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
         defer_index: bool = False,
+        strict: bool = False,
     ) -> None:
         """Persist candles by merging with existing shards on disk.
 
         Args:
             defer_index: If True, defer index.json write until flush_deferred_index is called.
+            strict: Propagate existing-shard read failures before overwriting any shard.
         """
         if arr.size == 0:
             return
@@ -2769,9 +2871,19 @@ class CandlestickManager:
                 return
             chunk = np.array(bucket, dtype=CANDLE_DTYPE)
             existing = np.empty((0,), dtype=CANDLE_DTYPE)
-            path = shard_paths.get(key)
-            if path and os.path.exists(path):
-                existing = self._load_shard(path)
+            if strict:
+                # Another manager may have published this day since our last
+                # directory scan. Read the actual write target under the fetch
+                # lock; cached discovery cannot prove that history is absent.
+                path = self._shard_path(symbol, key, tf=tf_norm)
+                try:
+                    existing = self._load_shard(path, strict=True)
+                except FileNotFoundError:
+                    existing = np.empty((0,), dtype=CANDLE_DTYPE)
+            else:
+                path = shard_paths.get(key)
+                if path and os.path.exists(path):
+                    existing = self._load_shard(path)
             merged = self._merge_overwrite(existing, chunk)
             # Defer index write for all but the last shard (or all if defer_index=True)
             should_defer = defer_index or not is_last
@@ -2870,6 +2982,7 @@ class CandlestickManager:
                 arr,
                 timeframe=tf_norm,
                 defer_index=defer_index,
+                strict=True,
             )
             durable = self._load_from_disk(
                 symbol,
@@ -2877,6 +2990,7 @@ class CandlestickManager:
                 int(arr[-1]["ts"]),
                 timeframe=tf_norm,
                 merge_memory_cache=False,
+                strict=True,
             )
             durable_by_ts = (
                 {int(row["ts"]): row for row in durable}
@@ -3091,6 +3205,16 @@ class CandlestickManager:
             return _sorted_candle_copy(existing)
         a = _ensure_dtype(existing)
         b = _ensure_dtype(new)
+        # Common live updates append candles or replace the last open candle.
+        # Require unique, increasing inputs; duplicate and historical overlaps
+        # retain the stable last-write-wins path below. Always detach the result.
+        if (
+            b["ts"][0] >= a["ts"][-1]
+            and np.all(a["ts"][1:] > a["ts"][:-1])
+            and np.all(b["ts"][1:] > b["ts"][:-1])
+        ):
+            prefix = a[:-1] if b["ts"][0] == a["ts"][-1] else a
+            return np.concatenate([prefix, b])
         # Put existing first, then new; then keep last seen per ts to prefer new.
         # Sort the scalar timestamp vector rather than structured rows: NumPy
         # may use unspecified structured fields as tie-breakers even when
@@ -3357,11 +3481,15 @@ class CandlestickManager:
         timestamps = np.unique(np.asarray(rows["ts"], dtype=np.int64))
         if timestamps.size == 0:
             return False
+        first_ts, last_ts = int(timestamps[0]), int(timestamps[-1])
         retained: List[GapEntry] = []
         changed = False
         for gap in gaps:
             start_ts = int(gap["start_ts"])
             end_ts = int(gap["end_ts"])
+            if end_ts < first_ts or start_ts > last_ts:
+                retained.append(gap)
+                continue
             left = int(np.searchsorted(timestamps, start_ts, side="left"))
             right = int(np.searchsorted(timestamps, end_ts, side="right"))
             covered = timestamps[left:right]
@@ -5484,13 +5612,16 @@ class CandlestickManager:
                 int(candidates[0]["ts"]),
                 int(candidates[-1]["ts"]),
                 timeframe="1m",
+                strict=True,
             )
             cached = self._slice_ts_range(
                 self._ensure_symbol_cache(symbol),
                 int(candidates[0]["ts"]),
                 int(candidates[-1]["ts"]),
             )
-            canonical = self._merge_overwrite(disk, cached)
+            # Missing shards contribute no canonical timestamps. Strict reads
+            # above distinguish this from unavailable or corrupt history.
+            canonical = cached if disk is None else self._merge_overwrite(disk, cached)
             canonical_by_ts = {int(row["ts"]): row for row in canonical}
             # Value changes alone can correct a timestamp already admitted by
             # REST or WS. Extending canonical history requires independent
@@ -5849,7 +5980,9 @@ class CandlestickManager:
         def _partial_rows() -> np.ndarray:
             if not all_rows:
                 return np.empty((0,), dtype=CANDLE_DTYPE)
-            return np.sort(np.concatenate(all_rows), order="ts")
+            if len(all_rows) == 1:
+                return all_rows[0].copy()
+            return self._merge_overwrite(all_rows[0], np.concatenate(all_rows[1:]))
 
         def _raise_terminal_empty_page(message: str) -> None:
             raise OhlcvTerminalEmptyPage(
@@ -5995,6 +6128,11 @@ class CandlestickManager:
                         "reaching the requested end"
                     )
                 break
+            # Cursor overlap is intentional on sparse venues, but advancing the
+            # request cursor is not evidence of new data. Still persist a stalled
+            # response below: it may correct already admitted candle values.
+            response_last_ts = int(arr[-1]["ts"])
+            response_stalled = prev_last_ts is not None and response_last_ts <= prev_last_ts
             # Diagnostics: page ts range and step
             try:
                 first_ts = int(arr[0]["ts"])  # type: ignore[index]
@@ -6078,6 +6216,22 @@ class CandlestickManager:
                         },
                     )
                     break
+            if response_stalled:
+                if raise_on_partial_empty_page and not _requested_end_is_covered():
+                    _raise_terminal_empty_page(
+                        "ccxt OHLCV pagination did not advance the response tail "
+                        "before reaching the requested end"
+                    )
+                self._log(
+                    "debug",
+                    "ccxt_pagination_stalled",
+                    symbol=symbol,
+                    tf=tf_norm,
+                    pages=pages,
+                    last_ts=response_last_ts,
+                    previous_last_ts=prev_last_ts,
+                )
+                break
             last_ts = int(arr[-1]["ts"])  # inclusive last
             if last_ts >= end_excl - period_ms:
                 break
@@ -6131,7 +6285,7 @@ class CandlestickManager:
         )
         if not all_rows:
             return np.empty((0,), dtype=CANDLE_DTYPE)
-        return np.sort(np.concatenate(all_rows), order="ts")
+        return _partial_rows()
 
     # ----- Public helpers required by tests -----
 
@@ -7410,8 +7564,9 @@ class CandlestickManager:
     ) -> CandleResolutionResult:
         """Return exact recent 1m candles with a coarser historical prefix.
 
-        Higher-timeframe candles are read through the same manager and may only
-        fill complete buckets ending inside the requested old-history prefix.
+        Higher-timeframe candles are read through the same manager and fill the
+        older prefix. A boundary bucket requires a complete exact overlap and
+        is reconstructed only over its unknown prefix.
         Callers remain responsible for requiring an exact recent 1m suffix when
         their decision contract needs one.
         """
@@ -7640,8 +7795,6 @@ class CandlestickManager:
                         else np.empty((0,), dtype=CANDLE_DTYPE)
                     )
 
-                end_excl = int(end_ts) + period_ms
-
                 async with self._acquire_fetch_lock(symbol, out_tf):
                     try:
                         disk_arr = self._load_from_disk(symbol, start_ts, end_ts, timeframe=out_tf)
@@ -7675,6 +7828,37 @@ class CandlestickManager:
                                 self._tf_range_cache[symbol] = sym_cache
                                 return out_disk
 
+                    fetch_spans = [(int(start_ts), int(end_ts))]
+                    if (
+                        max_age_ms != 0
+                        and isinstance(disk_arr, np.ndarray)
+                        and disk_arr.size
+                    ):
+                        # Resume verified persisted history after a bounded read is
+                        # interrupted. Refetching its entire prefix can consume the
+                        # next deadline again without ever reaching newer candles.
+                        aligned = disk_arr[disk_arr["ts"] % period_ms == 0]
+                        missing = self._missing_spans_step(
+                            aligned, int(start_ts), int(end_ts), int(period_ms)
+                        )
+                        if missing:
+                            fetch_spans = []
+                            for gap_start, gap_end in missing:
+                                # Keep real neighbours in the same response so
+                                # KuCoin can still prove internal no-tick buckets.
+                                span_start = max(int(start_ts), gap_start - period_ms)
+                                span_end = min(int(end_ts), gap_end + period_ms)
+                                if (
+                                    fetch_spans
+                                    and span_start <= fetch_spans[-1][1] + period_ms
+                                ):
+                                    fetch_spans[-1] = (
+                                        fetch_spans[-1][0],
+                                        max(fetch_spans[-1][1], span_end),
+                                    )
+                                else:
+                                    fetch_spans.append((span_start, span_end))
+
                     persisted_batches = False
 
                     def _persist_tf_batch(batch: np.ndarray) -> None:
@@ -7683,22 +7867,35 @@ class CandlestickManager:
                         self._persist_batch(symbol, batch, timeframe=out_tf)
                         self._invalidate_ema_cache(symbol, timeframe=out_tf)
 
-                    try:
-                        fetched = await self._fetch_ohlcv_paginated(
-                            symbol,
-                            int(start_ts),
-                            int(end_excl),
-                            timeframe=out_tf,
-                            on_batch=_persist_tf_batch,
-                            raise_on_partial_empty_page=max_age_ms == 0,
-                        )
-                    except TypeError:
-                        fetched = await self._fetch_ohlcv_paginated(
-                            symbol,
-                            int(start_ts),
-                            int(end_excl),
-                            timeframe=out_tf,
-                        )
+                    fetched_ranges = []
+                    for span_start, span_end in fetch_spans:
+                        persisted_batches = False
+                        try:
+                            batch = await self._fetch_ohlcv_paginated(
+                                symbol,
+                                span_start,
+                                span_end + period_ms,
+                                timeframe=out_tf,
+                                on_batch=_persist_tf_batch,
+                                raise_on_partial_empty_page=max_age_ms == 0,
+                            )
+                        except TypeError:
+                            batch = await self._fetch_ohlcv_paginated(
+                                symbol,
+                                span_start,
+                                span_end + period_ms,
+                                timeframe=out_tf,
+                            )
+                        batch = self._slice_ts_range(batch, span_start, span_end)
+                        if batch.size:
+                            if not persisted_batches:
+                                _persist_tf_batch(batch)
+                            fetched_ranges.append(batch)
+                    fetched = (
+                        np.concatenate(fetched_ranges)
+                        if fetched_ranges
+                        else np.empty((0,), dtype=CANDLE_DTYPE)
+                    )
                     # The fetch may have evicted a previously persisted KuCoin
                     # sparse placeholder after a rejected real payload row
                     # proved that bucket unavailable. Reload before merging so
@@ -7727,8 +7924,6 @@ class CandlestickManager:
                             return out
                         return fetched
                     fetched_out = self._slice_ts_range(fetched, start_ts, end_ts)
-                    if fetched_out.size and not persisted_batches:
-                        self._persist_batch(symbol, fetched_out, timeframe=out_tf)
                     if isinstance(disk_arr, np.ndarray) and disk_arr.size:
                         disk_out = self._slice_ts_range(disk_arr, start_ts, end_ts)
                         out = self._slice_ts_range(

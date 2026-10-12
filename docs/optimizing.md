@@ -43,6 +43,25 @@ Optimization requires the full install profile:
 pip install -e ".[full]"
 ```
 
+## Session identity and output names
+
+Optimizer sessions use the [shared session naming format](backtesting.md#backtest-results)
+under `optimize_results/`. Small suites include their actual coin names and the number of
+prepared scenarios. The deterministic setup fingerprint includes effective settings after CLI
+overrides, fixed evaluation policy, optimizer bounds/objectives/backend settings, resolved dates,
+actual prepared data and evaluator implementation, and selected starting-config contents in
+consumption order. Starting configs are frozen in a bounded-memory disk snapshot before hashing
+and execution; filenames, old metrics and output paths are not seed identity.
+
+An unspecified `optimize.seed` is resolved to a concrete random seed before a fresh search.
+It is recorded in `session.json` and saved candidates. New sessions with different actual seeds
+have different setup fingerprints. An explicit seed can be used to compare otherwise equivalent
+setups. `--resume` retains the original output directory and restores its recorded seed when the
+input seed is unspecified; existing checkpoint/evaluation compatibility checks still apply.
+Legacy sessions without `session.json` keep their original seed policy. Fresh runs always get a
+new random run ID, even when their setup fingerprints match. Full SHA-256 setup fingerprints,
+run IDs and canonical setup inputs are available in `session.json`.
+
 ## Running Optimization
 
 ```bash
@@ -61,6 +80,11 @@ Example:
 ```bash
 passivbot optimize configs/examples/default_trailing_martingale_long.json --start configs/starting_pool/
 ```
+
+Wallet exposure shortcuts `-ltwel` and `-stwel` set
+`optimize.bounds.long.risk.total_wallet_exposure_limit` and the short equivalent.
+Use a single value to fix exposure (for example `-ltwel 0`), or `LOW,HIGH[,STEP]`
+to set its search range. In live and backtest commands these shortcuts still set bot values.
 
 Most config parameters can be modified via CLI. `passivbot optimize -h` for more info.
 
@@ -207,7 +231,7 @@ The supported slice is intentionally narrow:
   an effective assignment for one of its prepared coins selects another exchange
 - static `coin_overrides` for each enabled side of single- and multi-coin EMA-anchor and
   trailing-martingale runs: `live.forced_mode_<side>: normal`, active-strategy parameters,
-  `risk.entry_cooldown_minutes`, and explicit
+  `entry_cooldown.base_duration_minutes`, and explicit
   `wallet_exposure_limit`, `risk.we_excess_allowance_pct`, and all six `unstuck` leaves are
   supported. Static single-coin values are applied after each optimizer candidate, preserving
   exact Rust's override precedence. Checkpoint identity records the resolved exact override values
@@ -217,11 +241,11 @@ The supported slice is intentionally narrow:
   per-coin
   `risk.position_exposure_enforcer_enabled` and
   `risk.position_exposure_enforcer_threshold`; per-coin
-  `risk.we_excess_allowance_mode`, modeled leaves for disabled sides, and other override leaves
+  `hsl.scale_budget_with_excess_allowance`, modeled leaves for disabled sides, and other override leaves
   fail closed. Non-`normal` forced modes remain accepted for either side because they are
   backtest-inert. Trailing
   Martingale also resolves all four `entry.ema_gate_mode` values per coin and side. In one-sided
-  `live.hsl_signal_mode: coin` runs, all ten HSL
+  `live.hsl_signal_mode: coin` runs, all six HSL
   leaves documented in `coin_overrides.md` are also supported. Fused dual-side EMA Anchor and
   Trailing Martingale coin mode resolve the same HSL leaves independently for long and short.
   CPU-compatible per-coin `live.leverage` and non-`normal` forced modes on either side are accepted
@@ -234,27 +258,24 @@ The supported slice is intentionally narrow:
   count. Market panic orders fill on
   the next valid bar at its close shifted adversely by `backtest.market_order_slippage_pct`, rounded
   directionally to the exchange price step, and charged the resolved taker fee. The Metal proxy
-  models tunable RED
-  threshold, drawdown-EMA span, and cooldown, plus fixed yellow/orange ratios, orange entry
-  suppression, RED latching, panic flattening, two-sample flat confirmation,
-  positive-cooldown restart, zero-cooldown indefinite halt, cumulative no-restart peak tracking,
-  effective coin-slot scaling, and terminal no-restart policy. For a finite
-  `live.pnls_max_lookback_days`, the single-coin `coin`-mode directional kernels expire
-  candidate-local realized-PnL fill events with the same rolling-window rule as exact Rust.
-  Other HSL topologies deliberately retain all-history realized-PnL and strategy-equity peaks as
-  a conservative envelope over Rust's rolling peak: they may trigger HSL early after an old peak
-  ages out, but cannot suppress a drawdown for that reason. The selected history must have no
-  internal invalid candles between its first and last valid samples. Thresholds in the
-  float32-unrepresentable interval immediately below `1.0` fail closed. Exact validation and
-  drift gates remain authoritative. Optimization may use normalized HSL lifecycle and risk
-  signals: yearly trigger/restart rates, time in RED, halt-duration summaries, trigger drawdown,
-  post-restart retriggers, panic-loss drawdown mean/max, and halt-to-restart equity loss. Raw event
-  counts, yellow/orange occupancy, absolute panic-loss totals/maxima, minimum panic-loss drawdown,
-  and mean flatten time remain exact-analysis diagnostics.
+  models the same current-equity-anchored drawdown, fractional EMA and latest-episode
+  cooldown contract as Rust. Only current RED authorizes panic; price recovery retires
+  panic orders. Terminal RED can start cooldown, renewed exposure clears it, and
+  `never` expires with the configured lookback. Zero cooldown under `always` allows
+  immediate restart. All modes retain a bounded 1–90 day history with exact window
+  expiration; no old all-history peak is carried forward as an alternative signal.
+  Enabled HSL requires 1m candles. The selected history must have no internal invalid
+  candles between its first and last valid samples. Exact validation and drift gates
+  remain authoritative for float32 screening. Optimization can use supported normalized
+  HSL lifecycle and risk signals, including trigger/restart rates, time in RED,
+  halt-duration summaries and panic-loss drawdown. Raw event counts, absolute panic-loss
+  totals and mean flatten time remain exact-analysis diagnostics. See the
+  [HSL guide](equity_hard_stop_loss.md#offline-gpu-optimization) for the signal and
+  runtime contract and [GPU limitations](#deliberate-current-limitations) for metric support.
   One-sided coin-mode multi-coin runs may resolve all canonical HSL settings independently per
   coin, including HSL enablement and limit/market panic execution. Dual-side multi-coin EMA Anchor
   and Trailing Martingale use fused shared-account kernels for unified, pside, and coin signals,
-  so shared event-loss, warning-tier overlap, and the other HSL lifecycle/panic-loss metrics are
+  so shared event-loss and the other HSL lifecycle/panic-loss metrics are
   available. The worst and mean-worst-1% EMA-smoothed strategy-equity drawdown metrics are also
   available for the account and each side. The mean-worst-1% proxy uses an opt-in bounded
   logarithmic histogram whose only approximation is the partially selected cutoff bin; exact Rust
@@ -287,24 +308,27 @@ The supported slice is intentionally narrow:
   candle interval. Pending directional orders are cleared at a gap before the next valid candle.
   Normal CPU input validation stays strict.
   Finite non-positive, partially invalid, or float32-unrepresentable prices remain fail-closed
-  for GPU screening. The single-coin coin-HSL ring coalesces realized-PnL components from the same
-  candle and retains up to 8,192 event candles in the configured finite lookback; an overflow
-  beyond that bounded capacity still fails closed with a conservative full-horizon recovery
-  penalty. Independent dual-side multi-coin summaries remain
-  fail closed for these metrics because they cannot reconstruct one shared portfolio-equity curve.
+  for GPU screening. HSL history scratch is sized from the finite lookback and
+  candidate batches are bounded to the configured memory budget. Independent dual-side
+  summaries cannot replace a shared portfolio-equity controller; unified uses the fused path.
   Compatible suites may use the supported topologies.
 - single-coin EMA Anchor and Trailing Martingale support auto-unstuck for long-only,
   short-only, hedge-mode dual-side, one-way, and compatible suite runs. One- and dual-side
   multi-coin runs and compatible suites also support auto-unstuck, including static per-coin
   overrides. Metal
   models the enable and EMA-gating toggles, tunable close percentage, EMA distance, loss allowance,
-  and exposure threshold. It derives the allowance from a conservative all-history realized
-  net-PnL peak, admits at most one least-stuck eligible position per portfolio, scales a
+  and exposure threshold. Trailing Martingale multi-coin runs derive the allowance from
+  the configured rolling realized net-PnL window, including fees and a shared long/short
+  history. The history retains at most one event per candle, preserves intrabar peaks,
+  and uses bounded candidate batches when its buffers would exceed the scratch budget.
+  History buffers are omitted when auto-unstuck is disabled on every effective side/coin.
+  Other topologies use a conservative all-history realized net-PnL peak. Metal admits
+  at most one least-stuck eligible position per portfolio, scales a
   losing close to its own allowance subject to exchange minimums, and lets that close compete with
   the position's WEL/TWEL reducer before ordinary closes consume the remaining realized-loss
   budget. The fused dual-side multi-coin kernel chooses globally across both directional surfaces
   using exact Rust's price-difference, symbol-index, and long-before-short tie ordering. Exact Rust
-  remains authoritative for the configured rolling PnL lookback
+  remains authoritative for final validation
 - single- and multi-coin EMA Anchor and Trailing Martingale runs support bounded and legacy-raw
   `risk.we_excess_allowance_pct`, `risk.total_exposure_entry_gate_enabled`, and
   `risk.total_exposure_enforcer_threshold` across long-only, short-only, dual-side, and compatible
@@ -488,6 +512,31 @@ The supported slice is intentionally narrow:
   stricter contiguous-candle requirement documented above, and a forced-delist endpoint must remain
   finite and positive after float32 packing because it supplies an executable close
 
+GPU screening supports `backtest.limit_order_fill_buffer_pct` as a fixed simulation setting,
+including scenario overrides. Its units are a fraction of the limit price: `0.0015` is 15 basis
+points (0.15%). Buffered strict fill boundaries are prepared once; the GPU kernels and their
+per-candidate work are unchanged. Different buffers may change the trading path and therefore
+runtime. Raw candles, market execution, and original limit fill prices remain unchanged.
+Changing the buffer requires a fresh search; checkpoints and prepared suite tensors include it
+in their execution identity. For a fill-sensitivity suite, set `backtest.suite_enabled` to
+`true` and add scenarios such as:
+
+```json
+"scenarios": [
+  {"label": "baseline", "overrides": {"backtest.limit_order_fill_buffer_pct": 0.0}},
+  {"label": "buffer_0_0001", "overrides": {"backtest.limit_order_fill_buffer_pct": 0.0001}},
+  {"label": "buffer_0_0005", "overrides": {"backtest.limit_order_fill_buffer_pct": 0.0005}}
+]
+```
+
+GPU screening supports [adaptive entry cooldown and RMS unilateralness](adaptive_entry_cooldown.md)
+for EMA Anchor and Trailing Martingale, on Metal and CUDA, including single-coin,
+directional multi-coin and fused long/short runs. Cooldown floors, ceilings and additive
+weights accept optimizer bounds and per-coin overrides; the shared fractional RMS span and
+Forager scoring weight accept optimizer bounds. Active RMS requires one-minute candles.
+Defaults leave the features disabled. Exact Rust validation remains authoritative for the
+float32 proxy. Start a fresh GPU search after this layout revision.
+
 #### Deliberate current limitations
 
 Independent unstuck EMA horizons are supported on Apple MPS for EMA Anchor and Trailing Martingale,
@@ -497,8 +546,6 @@ exact CPU validation still owns accepted results. Start a fresh GPU run after th
 change; old screening checkpoints are incompatible.
 
 The following boundaries are intentional rather than silent fallbacks:
-
-- `backtest.limit_order_fill_buffer_pct` must be zero. Use a CPU optimizer (`pymoo` or `deap`) for nonzero limit-fill buffers; the GPU screening model does not implement them.
 
 - `trailing_grid_v7` is outside the Apple MPS implementation. Use `optimize.backend: "pymoo"` or
   `"deap"` for it; GPU optimization never substitutes EMA Anchor or Trailing Martingale behavior.
@@ -561,6 +608,11 @@ effective external suite definition and any `--scenarios` filter are
 stored in the run contract and checkpoint identity, with dynamic scenario dates resolved to the
 prepared concrete dates. The checkpoint signature also records each scenario's ordered effective
 coins, side topology, and prepared candle window, so resume fails closed if preparation changes.
+
+GPU setup clamps the input bot values to optimizer bounds before determining enabled sides.
+For example, `-ltwel 0 -stwel 2,2` can switch a long-only input to short-only optimization
+when short positions and approved coins permit it. Each enabled GPU side must remain enabled
+across the entire search range; bounds that vary between disabled and enabled remain unsupported.
 
 Ordinary `-t/--start` seeding and fine-tuning with `-ft/--fine-tune-params` use the same optimizer
 shape as the CPU backends. When `-t` and `-ft` are combined, the GPU population includes the
@@ -669,6 +721,8 @@ records positive inter-candle gaps
 in a 128-bin logarithmic histogram; the proxy decodes each occupied bin with a float32-safe upper
 edge and adds the exact leading and trailing gaps. This deliberately overestimates the minimizing
 fill-gap summaries when exact Rust has same-candle zero gaps or a value inside a histogram bin.
+P95 is retained as an inactivity-tail signal; the excluded mean, median, and P99 fill-gap summaries
+share this histogram approximation. P95 eligibility does not imply greater numerical accuracy.
 Trailing Martingale also supports `entry_interval_hours_{mean,median,p95,p99,max}` for single-coin
 and multi-coin, long-only, short-only, and fused long+short runs. Metal records gaps between
 normal initial entries independently for each coin and position side. The proxy mean and maximum
@@ -679,17 +733,33 @@ so these metrics retain exact Rust's canonical zero values without allocating th
 surface. Runs that do not request an entry-interval metric keep their existing kernel ABI and
 dispatch cost.
 
-Exact Rust metrics remain authoritative. Metrics intentionally kept for exact analysis rather than
-proxy optimization include raw gain, realized-PnL growth/risk, positive equity-balance divergence,
+Exact Rust metrics remain authoritative. `GPU_EXACT_ONLY_METRICS` is an eligibility policy, not a
+list of known calculation defects. Some exclusions reflect approximation or cost concerns; others
+favor a smaller set of normalized growth, activity, and downside-risk signals:
+
+- Gain shares ADG's smoothed endpoint; ADG is preferred for daily normalization.
+- Positive equity-balance divergence has no universally desirable optimization direction. Negative
+  divergence measures unrealized downside and supplies the retained paper-loss denominators.
+- Raw fill/HSL counts and absolute panic losses are reserved in favor of rates and loss percentages.
+  Realized-PnL-only growth/risk can reward leaving losing positions unrealized.
+
+Exact-only metrics include raw gain, realized-PnL growth/risk, positive equity-balance divergence,
 completed-only account-equity recovery, raw or split fill counts/rates, raw HSL event counts and
 absolute loss totals, the self-relative high-exposure duration family, and the legacy global
-recovery/profit aliases. Requests for these metrics as GPU objectives or proxy-side limits fail
+recovery aliases. Requests for these metrics as GPU objectives or proxy-side limits fail
 before MPS setup. They remain
 available in normal Rust backtests, exact optimizer validation output, and CPU optimization.
+
+Proposals to enable a metric should cover Rust semantics, GPU-versus-Rust parity on supported
+strategies/topologies, aliases, scoring and limits, and explicit numerical tolerances. Include
+ranking and constraint agreement evidence; identify which backends were tested. A useful constraint
+need not be a recommended standalone objective, but current exclusions apply to both.
 
 The backend is hybrid rather than a replacement backtester:
 
 1. pymoo NSGA-II proposes large normalized candidate batches.
+   GPU parameter preparation mirrors exact validation's forager-weight normalization
+   and subsequent optimizer bound/step quantization before screening each candidate.
 2. A Rust-owned Metal screening program evaluates every candidate against candle data resident on
    MPS; Python only prepares buffers and dispatches the program. EMA-anchor and
    trailing-martingale use separate single-coin and multi-coin kernels. Directional runs keep
@@ -700,8 +770,13 @@ The backend is hybrid rather than a replacement backtester:
    from the original float64 data. EMA uses Rust-compatible directional ticks. Trailing-martingale
    uses those ticks to choose the controlling raw/target value before float32 can collapse nearby
    prices, then mirrors Rust's directional entry finalization and nearest-tick close finalization.
+   Entry quantities are sized at the controlling raw/target price, with exposure cropping
+   and exchange minimums checked again after finalizing the executable price.
    The multi-coin trailing-martingale screening kernel retains per-coin EMA, volatility, trailing,
-   position, cooldown, and pending-order state plus shared portfolio allocation. It stages one
+   position, cooldown, and pending-order state plus shared portfolio allocation. Flat candidates
+   are reranked each candle; score hysteresis applies only to coins with outstanding entry
+   orders, while held positions remain selected, matching exact Rust.
+   It stages one
    entry and close per coin per candle; exact Rust validation remains responsible for authoritative
    recursive same-candle ladders, and the normal constraint/rank/drift gates halt if that screening
    approximation stops ordering candidates reliably.
@@ -739,8 +814,9 @@ The backend is hybrid rather than a replacement backtester:
 
 `optimize.iters` remains the number of evolutionary exact Rust validations. Any exact seed-
 bootstrap evaluations are additional and are reported separately. GPU screening counts and
-throughput are also logged separately. `n_cpus` controls the exact-validation worker pool; MPS
-device scheduling is managed by Metal.
+throughput are also logged separately. Exact CPU worker sizing and tuning are automatic by
+default. Set `optimize.gpu.exact_workers` to a positive count to fix the pool, or to `0` to
+inherit `optimize.n_cpus` (the `-c` CLI setting). MPS device scheduling is managed by Metal.
 
 GPU-specific settings live under `optimize.gpu`:
 
@@ -749,6 +825,7 @@ GPU-specific settings live under `optimize.gpu`:
   "optimize": {
     "backend": "gpu",
     "gpu": {
+      "tuning_mode": "auto",
       "auto_lean_parallelism": true,
       "batch_size": null,
       "max_dispatch_candidate_bars": null,
@@ -759,8 +836,8 @@ GPU-specific settings live under `optimize.gpu`:
       "drift_min_samples": 32,
       "drift_probes": 4,
       "drift_window": 128,
-      "exact_workers": 0,
-      "max_pending_exact": 0,
+      "exact_workers": null,
+      "max_pending_exact": null,
       "population_size": null,
       "seed_bootstrap": {
         "max_exact": 128,
@@ -780,6 +857,17 @@ GPU-specific settings live under `optimize.gpu`:
 The CPU-side NSGA-II proposal stage uses the same `optimize.pymoo.shared` crossover, mutation, and
 duplicate-elimination controls as the ordinary pymoo optimizer.
 
+CUDA multicoin suites keep one distinct market dataset resident in VRAM at a time. Immutable
+packed inputs for inactive datasets live in run-local files in the system temporary directory;
+compatible scenarios still share a dataset and can batch together. Inactive proxies sharing that
+dataset release their replay and output buffers when its representative proxy changes. Allow
+temporary disk space for all distinct packed datasets and upload time when switching between them.
+Normal completion,
+errors, and handled interruption remove these files. The existing 45% invariant-memory safety
+limit uses free VRAM before the first upload as its fixed run budget, reserving the remainder for
+replay and CUDA workspace. Each activation also checks currently free VRAM after releasing the
+previous dataset and its replay buffers. MPS suites retain their existing shared tensor allocation.
+
 - `population_size` is the NSGA-II proxy population. The general default is 1024 so long-history
   runs reach their first exact Rust validation batch four times sooner than the former 4096
   default. `null` or an omitted key requests this automatic default. On a detected Apple M3 family
@@ -793,6 +881,42 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   Set `auto_lean_parallelism` to `false`, or set any of `population_size`, `batch_size`, or
   `max_dispatch_candidate_bars` to a number (including the ordinary default number), to retain the
   configured sizing unchanged.
+- `tuning_mode` controls continuous GPU candidate-batch tuning: `auto` (default) starts from
+  compatible local measurements when available; `refresh` ignores saved measurements and learns
+  anew; `off` uses the ordinary fixed dispatch sizing without reading or writing tuning evidence.
+  Tuning activates only when `batch_size` is omitted, `null`, or `"auto"`. An explicit numeric
+  batch size retains its existing behavior and safety caps. `population_size` and
+  `max_dispatch_candidate_bars` also accept `"auto"` as an alias for their existing `null`
+  defaults; they do not continuously change in this first implementation.
+  There is no separate calibration run. Automatic batches start at the existing resource-bounded
+  dispatch-plan width, or a compatible cached width, when device memory headroom permits it.
+  Low headroom retains a start of at most 128 candidates, and cached widths cannot bypass that
+  startup bound. This preserves established throughput on unconstrained devices. Numeric batch
+  sizes remain fixed.
+  Long temporal replays supply a bounded rolling window of completed dispatch timings, normalized
+  by processed history length. Decisions require 24 samples and at least 30 seconds of measured
+  work; cold first dispatches and partial history chunks are excluded. Evidence is committed only
+  after the complete candidate replay, reductions, and host results succeed. Batch changes apply
+  between complete candidate batches, never inside a candidate's strategy replay. Short/non-temporal
+  replays continue to use completed full-batch timings, excluding cold first batches and remainders.
+  The controller uses median throughput, trials at most a doubling/halving within the original
+  ceiling, requires a 5% gain for larger batches, and accepts smaller ones within 2% of previous
+  throughput. It waits one evidence window after acceptance and three after rejection before another
+  trial, consuming at most one decision or cooldown window per completed candidate batch.
+  Correlated temporal chunks cannot compress that cooldown into a single replay. Memory headroom gates growth. No additional replay or GPU synchronization is introduced.
+  Candidate order, evaluation coverage, exact Rust validation, and drift checks remain unchanged.
+  Estimates are advisory: changing candidate costs and thermal state can affect measurements, and
+  a width adjustment must still wait for the current complete candidate replay to finish.
+  Atomic, bounded local records under `caches/gpu_autotune/` retain stable batch sizes and measured
+  throughput. Identity includes hardware/runtime/kernel implementation, prepared workload shape,
+  fixed parameters, metrics, search bounds, CPU worker setting, and suite/screening context. Equal-
+  length new candle data can reuse evidence; history/coin-count or feature changes start separate
+  classes. Cold compilation and allocations are not cached results. Cache corruption or I/O failure
+  logs a warning and leaves optimization running with dispatch-plan/in-memory sizing.
+  Tuning state is advisory and separate from search checkpoints: resume relearns or reuses local
+  measurements without changing population, validation allocation, candidate RNG, or drift policy.
+  Population, validations per generation and dispatch work envelopes retain their existing
+  policies. CPU sizing and exact-queue tuning are described below.
 - `batch_size` is the requested upper bound on candidates per MPS dispatch. Because Apple Silicon
   shares the GPU with WindowServer, the backend transparently splits a batch when its
   candidates-by-candles-by-coins-by-enabled-sides workload would make one Metal command buffer too
@@ -905,17 +1029,93 @@ duplicate-elimination controls as the ordinary pymoo optimizer.
   rolling front gate. `drift_probes` must remain below
   `validate_per_generation` so each generation requests proxy-front safety evidence. A partial
   final validation batch scales its reserved probe count down proportionally.
-- `exact_workers: 0` inherits `optimize.n_cpus`; a positive value overrides it for this backend.
-- `max_pending_exact: 0` defaults to twice the larger of the exact-worker count and
-  `validate_per_generation`. This leaves room for the next validation batch while CPU workers
-  finish the previous one. Explicit positive queue limits keep their configured size.
-  It must be at least `validate_per_generation` so throttling cannot change the configured
-  proxy-front/broad-probe evidence allocation; the backend waits for that capacity before
-  screening another generation.
-- `checkpoint_interval_seconds` bounds generation-level optimizer-state checkpoint writes. Exact
-   result batches are checkpointed immediately, and each durable result carries the proxy/exact
-   safety evidence needed to recover if its flush outruns the companion checkpoint. A final
-   evidence-budget check applies to fresh and resumed runs and includes recovered class membership,
+- Automatic single-coin HSL batches budget active history scratch from current free memory
+  (35%, capped at 2 GiB) while retaining the dispatch work cap and device headroom guard.
+  Completed scenario scratch is released before another scenario and before CPU validation
+  waits. Long single-coin Trailing Martingale replays gather bounded temporal timing evidence
+  on either or both enabled sides, without extra calibration candidates. Fixed batch sizes
+  and `tuning_mode=off` retain their configured execution policy.
+- `exact_workers` defaults to `null`; omitted, `null`, and `"auto"` values select initial
+  hardware/RAM-aware sizing. It counts distinct physical cores within CPU affinity, grouping SMT siblings,
+  and uses cgroup-v2 CPU/memory limits
+  when available, reserves one core for GPU orchestration, and budgets 60% of available RAM using
+  a conservative worker estimate from process RSS before GPU proxy allocation plus twice the
+  largest prepared candle view
+  (at least 512 MiB per worker). Suite scenarios sharing data are not summed as independent
+  copies. A positive fixed queue limit also bounds automatic worker sizing. This is a sizing
+  estimate, not an OOM guarantee or an empirical optimum. Auto mode subsequently trials
+  worker counts one core at a time using completed CPU intervals, coordinated with queue
+  and GPU trials. A regular window requires 24 timings and 30 full-pool-equivalent
+  seconds; expensive jobs require at least four timings (and two per worker), a
+  30-second median, and 120 active seconds. Queue-induced admission stalls count toward
+  measured throughput; unrelated GPU-only pauses do not create evidence.
+  The first window for a replacement pool is cold. Larger pools need a 5% gain;
+  smaller pools can retain throughput within 2%. Growth also requires current RAM
+  headroom. After completed jobs, private worker memory refines the startup estimate:
+  twice the largest observed private footprint plus 256 MiB, with a 512 MiB floor.
+  Shared candle mappings are not charged again for each worker. If private memory accounting
+  is unavailable, the startup estimate remains in use. Worker trials run during exact seed
+  validation as well as evolution. Admitted results are drained and durably collected in order before replacing
+  the pool; no validation is cancelled or repeated to resize it. Changing worker count
+  invalidates GPU/queue evidence and admission epochs. Compatible local measurements
+  are advisory starting points. Worker-cache memory estimates use 128 MiB classes to tolerate
+  ordinary RSS noise; a cached increase still checks the entire startup pool against the
+  current 60% RAM budget. Resource-detection failures warn and inherit `optimize.n_cpus`.
+  `optimize.n_cpus: null` is supported by the GPU backend when delegating to automatic
+  sizing. If sizing is disabled or detection fails with no inherited count, the fallback
+  is one worker. CPU-only backends retain their existing integer worker contract.
+  Explicit `0` retains the legacy rule of inheriting `optimize.n_cpus`; positive numbers stay fixed.
+- `max_pending_exact` also defaults to `null`; omitted, `null`, or `"auto"` values enable
+  continuous exact-validation queue tuning. It starts at twice the larger of workers and
+  `validate_per_generation`, or a compatible cached size. Trials move by that larger count,
+  between one and four times it. Decisions normally require at least 24 completed timings and
+  accumulated worker time equivalent to 30 seconds at full pool capacity. Expensive validations
+  can instead provide at least four timings with a 30-second median duration and a 120-second
+  active validation window. There is no minimum generation count; the first eligible window
+  excludes cold worker startup. Completed worker intervals supply a bounded rolling throughput
+  estimate with median worker/queue times. Queue backpressure intervals, through the next
+  admission's GPU pass, also count so smaller queues cannot hide the CPU idle gaps they cause.
+  Unrelated GPU pauses and collection delays remain excluded.
+  Larger limits require a 5% gain; smaller limits are accepted within 2% of
+  previous throughput. Acceptance waits one evidence window; rejection waits three.
+  CPU collectors only gather timings. Changes happen on the main thread between exact seed
+  admission batches or before the next generation's admission, never cancel submitted work, and
+  always reserve complete validation allocations. Existing work drains naturally after a shrink.
+  An unfinished seed-stage trial
+  returns to its preceding limit before evolution so it cannot block GPU batch tuning.
+  GPU batch and queue trials are coordinated; queue evidence resets when GPU batch sizing changes
+  or a batch trial resolves, including acceptance at the same width. Unfinished GPU trials return
+  to the preceding measured width when their workload class changes or seed screening ends,
+  so a one-shot seed workload cannot block CPU queue tuning. Trials for the same active class
+  can still gather evidence across consecutive replay calls.
+  Admission epochs exclude
+  jobs queued before a queue change or GPU trial from subsequent timing evidence.
+  Population, candidate order,
+  proxy-front/probe allocation, drift gates and exact results retain their existing contracts.
+  Compatible hardware/implementation, workload, bounds and worker-count classes reuse bounded
+  advisory records under `caches/gpu_autotune/`. Timings are removed before result persistence
+  and are not search-checkpoint state.
+  Explicit `0` retains the legacy fixed limit of twice the larger of workers and validations;
+  positive numbers stay fixed and must be at least `validate_per_generation`.
+  `tuning_mode=refresh` ignores saved queue measurements. `off` disables queue tuning and makes
+  automatic workers/queue use the legacy rules without inspecting resources or tuning caches.
+- Completed exact CPU results are recorded in submission order while the next GPU proxy pass
+   runs, with structured `exact_progress` events after each collected batch. A collector failure
+   reaches the main thread when the current proxy pass returns; no next generation or additional
+   exact jobs are submitted after that failure. The collector is joined before shutdown.
+  Progress summaries report unfinished jobs separately from finished but unrecorded results,
+  the oldest pending job's age, and elapsed time in the current phase. `eta_next_exact`
+  estimates the next recordable result from at least four of the last 24 worker-reported
+  completion latencies, including CPU queue wait and excluding collection delays. The estimate
+  becomes unknown if that job exceeds the typical latency; it resets when the worker pool changes.
+  These are transient console hints and do not change result order, fitness or checkpoints.
+- GPU optimizer state is checkpointed after every completed generation and after exact-result
+   batches collected outside a proxy pass. `checkpoint_interval_seconds` does not throttle these
+   forced safety checkpoints. During a proxy pass, only the durable result stream advances;
+   checkpoints wait until the ask/tell transaction is complete. Each durable result carries the
+   candidate identity and proxy/exact safety evidence needed to recover results ahead of the last
+   safe checkpoint after interruption or a failure following a successful result flush. A final evidence-budget check applies
+   to fresh and resumed runs and includes recovered class membership,
    the rolling-window suffix, discarded pending work, and all full or partial validation batches.
    Exact worker results are consumed in submission order even if workers finish out of order,
    preserving the modeled batch sequence. Resume fails closed if the mandatory proxy-front gate can
@@ -983,6 +1183,9 @@ and `min_survivors` if desired, and remove the old block. Remove the block and l
 checkpoints from enabled successive halving are incompatible with scenario screening.
 
 #### Profiling Apple MPS optimization
+
+Metric eligibility changes alone do not demonstrate a speedup. Profile optional output collection,
+host reductions, and dispatches; reuse existing intermediates when adding a metric.
 
 For long multi-coin Trailing Martingale datasets with one active side, MPS can retain each
 candidate's replay state between history chunks. This activates automatically when the full-history
@@ -1395,16 +1598,24 @@ operator-risk settings such as:
 ```json
 "optimize": {
   "fixed_runtime_overrides": {
-    "bot.long.hsl.no_restart_drawdown_threshold": 1.0,
-    "bot.short.hsl.no_restart_drawdown_threshold": 1.0
+    "bot.long.hsl.restart_after_red_policy": "always",
+    "bot.short.hsl.restart_after_red_policy": "always"
   }
 }
 ```
 
-That default override disables terminal no-restart during optimizer evaluations so candidates can
-be constrained through `drawdown_worst_strategy_eq`, `drawdown_worst_ema_strategy_eq`,
+These explicit overrides permit restart after the configured cooldown during optimizer
+evaluations. Use `never` instead when testing a stop that lasts until its evidence expires
+from lookback. For unified mode set `bot.hsl.restart_after_red_policy` instead of side
+paths. Compare risk with `drawdown_worst_strategy_eq`, `drawdown_worst_ema_strategy_eq`,
 `drawdown_worst_mean_1pct_strategy_eq`, `drawdown_worst_mean_1pct_ema_strategy_eq`, and
-`strategy_eq_recovery_days_max` instead of being prematurely truncated.
+`strategy_eq_recovery_days_max`.
+
+Legacy HSL configs supplied as starting seeds for a fresh search are loaded best effort:
+retired HSL fields are discarded and usable numeric parameters enter the current schema.
+HSL enablement and restart choices come from the main optimizer config, and seed fitness
+is reevaluated. The main config still requires explicit migration when legacy HSL is enabled;
+checkpoint/resume compatibility checks remain enforced.
 
 When you provide many starting configs to a CPU optimizer, it bounds how many seed evaluations may
 be in flight at once. For the DEAP backend, the same cap also applies to generation offspring
@@ -1762,11 +1973,11 @@ over all exchanges before scoring.
 |--------|-------------|
 | `adg`, `adg_w` | Average Daily Gain (smoothed geometric) and its recency-biased counterpart |
 | `mdg`, `mdg_w` | Median Daily Gain and its recency-biased counterpart |
-| `gain` | Final balance gain (end/start ratio) |
+| `gain` | Smoothed terminal equity / starting equity; terminal equity averages the last up to three daily values |
 | `adg_strategy_eq`, `adg_strategy_eq_w` | Collateral-agnostic geometric growth on the synthetic strategy-equity curve |
 | `adg_rolling_hmean_strategy_eq` | Harmonic mean of automatic rolling 30/90/180-day-equivalent strategy-equity growth windows, dailyized and combined in log space. Higher values reward growth that survives many start/end windows; retain terminal ADG alongside it. |
 | `adg_time_integrated_strategy_eq` | Dailyized area under log strategy equity. Higher values reward earlier sustained growth; retain terminal ADG alongside it. |
-| `positive_gain_participation_strategy_eq` | Normalized effective participation of positive daily log gains. Higher values mean gains are distributed across more days instead of concentrated in windfalls; pair it with a gain objective. |
+| `positive_gain_participation_strategy_eq` | Normalized effective participation of positive daily log gains. Higher values mean gains are distributed across more days instead of concentrated in windfalls; pair it with a growth objective such as `adg_strategy_eq`. |
 | `mdg_strategy_eq`, `mdg_strategy_eq_w` | Median-day version of the same strategy-equity growth family |
 | `*_per_exposure_{long,short}` | Above metrics divided by the configured exposure limit per side |
 

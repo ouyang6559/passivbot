@@ -657,8 +657,8 @@ def test_apply_scenario_overrides_use_shared_canonical_path_resolver():
         },
         "bot": {
             "long": {
-                "hsl": {"no_restart_drawdown_threshold": 0.3},
-                "hsl_no_restart_drawdown_threshold": 0.1,
+                "hsl": {"red_threshold": 0.3},
+                "hsl_red_threshold": 0.1,
                 "risk": {"entry_cooldown_minutes": 0.0},
                 "risk_entry_cooldown_minutes": 9.0,
             },
@@ -672,7 +672,7 @@ def test_apply_scenario_overrides_use_shared_canonical_path_resolver():
         coins=["BTC"],
         ignored_coins=[],
         overrides={
-            "bot.long.hsl_no_restart_drawdown_threshold": 1.0,
+            "bot.long.hsl_red_threshold": 1.0,
             "bot.long.risk.entry_cooldown_minutes": 2.5,
         },
     )
@@ -687,9 +687,9 @@ def test_apply_scenario_overrides_use_shared_canonical_path_resolver():
         base_coin_sources={"BTC": "binance"},
     )
 
-    assert cfg["bot"]["long"]["hsl"]["no_restart_drawdown_threshold"] == pytest.approx(1.0)
-    assert cfg["bot"]["long"]["risk"]["entry_cooldown_minutes"] == pytest.approx(2.5)
-    assert "hsl_no_restart_drawdown_threshold" not in cfg["bot"]["long"]
+    assert cfg["bot"]["long"]["hsl"]["red_threshold"] == pytest.approx(1.0)
+    assert cfg["bot"]["long"]["entry_cooldown"]["base_duration_minutes"] == pytest.approx(2.5)
+    assert "hsl_red_threshold" not in cfg["bot"]["long"]
     assert "risk_entry_cooldown_minutes" not in cfg["bot"]["long"]
 
 
@@ -1172,7 +1172,18 @@ def test_saved_suite_config_preserves_effective_exchange_defaults(monkeypatch, t
 
     async def run_scenario(scenario, *args, **kwargs):
         observed.append(scenario.exchanges)
-        return ScenarioResult(scenario, {}, {"stats": {}}, 0.0, None)
+        output = args[6] / scenario.label
+        output.mkdir()
+        (output / "config.json").write_text("{}")
+        return ScenarioResult(
+            scenario,
+            {},
+            {"stats": {}},
+            0.0,
+            output,
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:01.000Z",
+        )
 
     for name in ("load_markets", "format_approved_ignored_coins",
                  "reject_cross_exchange_market_identifier_collisions"):
@@ -1183,9 +1194,40 @@ def test_saved_suite_config_preserves_effective_exchange_defaults(monkeypatch, t
     monkeypatch.setattr(suite, "apply_scenario", lambda *a, **kw: (config, ["BTC"]))
     monkeypatch.setattr(suite, "_compute_effective_coin_exchange", lambda *a: {"BTC": "bybit"})
     monkeypatch.setattr(suite, "run_backtest_scenario", run_scenario)
+    monkeypatch.setattr(
+        suite,
+        "_suite_session_inputs",
+        lambda *a: (
+            [],
+            [config],
+            ["BTC"],
+            ["bybit"],
+        ),
+    )
+    monkeypatch.setattr(
+        suite, "evaluation_implementation_identity", lambda: {"test": True}
+    )
     asyncio.run(suite.run_backtest_suite_async(
         config, suite_cfg, disable_plotting=True, suite_output_root=tmp_path,
     ))
+    summary = json.loads((tmp_path / "suite_summary.json").read_text())
+    assert summary["layout_version"] == 2
+    assert summary["per_scenario"]["external"]["output_path"] == "external"
+    assert summary["per_scenario"]["external"]["artifacts"] == {
+        "config.json": "external/config.json",
+    }
+    assert (
+        summary["per_scenario"]["external"]["started_at"] == "2026-01-01T00:00:00.000Z"
+    )
+    with pytest.raises(FileExistsError, match="empty"):
+        asyncio.run(
+            suite.run_backtest_suite_async(
+                config,
+                suite_cfg,
+                disable_plotting=True,
+                suite_output_root=tmp_path,
+            )
+        )
     saved = json.loads((tmp_path / "config.json").read_text())
     resumed, _ = build_scenarios(saved["backtest"], base_exchanges=saved["backtest"]["exchanges"])
     assert observed == [["bybit"]]

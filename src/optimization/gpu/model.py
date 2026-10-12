@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
+from config.validate import validate_limit_order_fill_buffer_pct
 from optimization.gpu.runtime import gpu_device
-
 
 GAP_BINS = 128
 GAP_MAX_MINUTES = 4_000_000.0
@@ -75,6 +76,42 @@ def single_coin_shader_topology(
     return "generic"
 
 
+# Appended to the existing ABI so legacy parameter offsets stay stable.
+ADAPTIVE_PARAM_KEYS = (
+    "entry_cooldown_min_duration_minutes",
+    "entry_cooldown_max_duration_minutes",
+    "entry_cooldown_exposure_weight",
+    "entry_cooldown_adverse_weight",
+    "unilateralness_ema_span_1m",
+    "forager_score_weights_unilateralness",
+    "unilateralness_window",
+)
+ADAPTIVE_OVERRIDE_KEYS = ADAPTIVE_PARAM_KEYS[:4]
+
+
+def adaptive_params(bot: dict) -> dict:
+    """Encode canonical Rust payload leaves; -1 represents an absent ceiling."""
+    from math import ceil
+
+    weights = bot.get("entry_cooldown_weights_minutes", {})
+    span = float(bot.get("unilateralness_ema_span_1m", 60.0))
+    maximum = bot.get("entry_cooldown_max_duration_minutes")
+    return dict(
+        zip(
+            ADAPTIVE_PARAM_KEYS,
+            (
+                float(bot.get("entry_cooldown_min_duration_minutes", 0.0)),
+                -1.0 if maximum is None else float(maximum),
+                float(weights.get("exposure_ratio", 0.0)),
+                float(weights.get("adverse_directionality", 0.0)),
+                span,
+                float(bot.get("forager_score_weights", {}).get("unilateralness", 0.0)),
+                float(ceil(20.0 * span)),
+            ),
+        )
+    )
+
+
 EMA_ANCHOR_PARAM_KEYS = (
     "base_qty_pct",
     "ema_span_0",
@@ -92,7 +129,7 @@ EMA_ANCHOR_PARAM_KEYS = (
 
 EXPOSURE_PARAM_KEYS = (
     "we_excess_allowance_pct",
-    "we_excess_allowance_legacy_raw",
+    "hsl_scale_budget_with_excess_allowance",
     "twel_entry_gate_enabled",
     "twel_enforcer_threshold",
 )
@@ -102,9 +139,7 @@ POSITION_EXPOSURE_ENFORCER_PARAM_KEYS = (
     "wel_enforcer_threshold",
 )
 
-TOTAL_EXPOSURE_ENFORCER_PARAM_KEYS = (
-    "twel_enforcer_enabled",
-)
+TOTAL_EXPOSURE_ENFORCER_PARAM_KEYS = ("twel_enforcer_enabled",)
 
 UNSTUCK_PARAM_KEYS = (
     "unstuck_enabled",
@@ -122,11 +157,7 @@ HSL_PARAM_KEYS = (
     "hsl_red_threshold",
     "hsl_ema_span_minutes",
     "hsl_cooldown_minutes_after_red",
-    "hsl_no_restart_drawdown_threshold",
     "hsl_restart_policy",
-    "hsl_tier_ratio_yellow",
-    "hsl_tier_ratio_orange",
-    "hsl_orange_graceful_stop",
     "hsl_signal_mode",
     "hsl_slot_count",
 )
@@ -136,18 +167,12 @@ HSL_COIN_OVERRIDE_PATHS = (
     ("hsl_red_threshold", ("red_threshold",)),
     ("hsl_ema_span_minutes", ("ema_span_minutes",)),
     ("hsl_cooldown_minutes_after_red", ("cooldown_minutes_after_red",)),
-    ("hsl_no_restart_drawdown_threshold", ("no_restart_drawdown_threshold",)),
     ("hsl_restart_policy", ("restart_after_red_policy",)),
-    ("hsl_tier_ratio_yellow", ("tier_ratios", "yellow")),
-    ("hsl_tier_ratio_orange", ("tier_ratios", "orange")),
-    ("hsl_orange_graceful_stop", ("orange_tier_mode",)),
     ("hsl_panic_market", ("panic_close_order_type",)),
 )
 
 EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS = tuple(EMA_ANCHOR_PARAM_KEYS[:-2])
-EMA_ANCHOR_COIN_OVERRIDE_COOLDOWN_COLUMN = len(
-    EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS
-)
+EMA_ANCHOR_COIN_OVERRIDE_COOLDOWN_COLUMN = len(EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS)
 EMA_ANCHOR_COIN_OVERRIDE_WALLET_EXPOSURE_COLUMN = (
     EMA_ANCHOR_COIN_OVERRIDE_COOLDOWN_COLUMN + 1
 )
@@ -166,8 +191,11 @@ EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN = (
 EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN = (
     EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN + 1
 )
-EMA_ANCHOR_COIN_OVERRIDE_COLS = EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN + len(
-    UNSTUCK_EMA_PARAM_KEYS
+EMA_ANCHOR_COIN_OVERRIDE_ADAPTIVE_START = (
+    EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN + len(UNSTUCK_EMA_PARAM_KEYS)
+)
+EMA_ANCHOR_COIN_OVERRIDE_COLS = EMA_ANCHOR_COIN_OVERRIDE_ADAPTIVE_START + len(
+    ADAPTIVE_OVERRIDE_KEYS
 )
 
 
@@ -176,135 +204,9 @@ def encode_hsl_panic_order_type(value, *, field_name: str) -> float:
         raise TypeError(f"GPU HSL requires {field_name} to be a string")
     if value not in {"limit", "market"}:
         raise ValueError(
-            f"GPU HSL requires {field_name} to be limit or market, got "
-            f"{value!r}"
+            f"GPU HSL requires {field_name} to be limit or market, got " f"{value!r}"
         )
     return float(value == "market")
-
-
-def validate_hsl_settings(settings: dict, *, field_name: str) -> dict:
-    if not isinstance(settings, dict):
-        raise TypeError(f"{field_name} must be a dictionary")
-    enabled = settings.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise TypeError(f"{field_name}.enabled must be a boolean")
-
-    def finite_float(key: str, default: float) -> float:
-        try:
-            value = float(settings.get(key, default))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(f"{field_name}.{key} must be numeric") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"{field_name}.{key} must be finite")
-        if abs(value) > float(np.finfo(np.float32).max):
-            raise ValueError(
-                f"{field_name}.{key} must be representable as float32"
-            )
-        return value
-
-    red_threshold = finite_float("red_threshold", 0.15)
-    ema_span_minutes = finite_float("ema_span_minutes", 720.0)
-    cooldown_minutes = finite_float("cooldown_minutes_after_red", 0.0)
-    no_restart_threshold = finite_float(
-        "no_restart_drawdown_threshold", 1.0
-    )
-    if not 0.0 < red_threshold <= 1.0:
-        raise ValueError(
-            f"{field_name}.red_threshold must satisfy 0 < value <= 1"
-        )
-    if ema_span_minutes < 1.0:
-        raise ValueError(f"{field_name}.ema_span_minutes must be >= 1")
-    if cooldown_minutes < 0.0:
-        raise ValueError(
-            f"{field_name}.cooldown_minutes_after_red must be >= 0"
-        )
-    if not red_threshold <= no_restart_threshold <= 1.0:
-        raise ValueError(
-            f"{field_name}.no_restart_drawdown_threshold must satisfy "
-            "red_threshold <= value <= 1"
-        )
-
-    tier_ratios = settings.get(
-        "tier_ratios", {"yellow": 0.5, "orange": 0.75}
-    )
-    if not isinstance(tier_ratios, dict):
-        raise TypeError(f"{field_name}.tier_ratios must be a dictionary")
-    try:
-        yellow = float(tier_ratios.get("yellow", 0.5))
-        orange = float(tier_ratios.get("orange", 0.75))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{field_name}.tier_ratios values must be numeric") from exc
-    if not (math.isfinite(yellow) and math.isfinite(orange)):
-        raise ValueError(f"{field_name}.tier_ratios values must be finite")
-    if not 0.0 < yellow < orange < 1.0:
-        raise ValueError(
-            f"{field_name}.tier_ratios must satisfy 0 < yellow < orange < 1"
-        )
-    yellow_f32 = float(np.float32(yellow))
-    orange_f32 = float(np.float32(orange))
-    if not 0.0 < yellow_f32 < orange_f32 < 1.0:
-        raise ValueError(
-            f"{field_name}.tier_ratios must remain strictly ordered inside "
-            "(0, 1) when represented as float32"
-        )
-
-    restart_policy = settings.get("restart_after_red_policy", "threshold")
-    if not isinstance(restart_policy, str):
-        raise TypeError(
-            f"{field_name}.restart_after_red_policy must be a string"
-        )
-    if restart_policy not in {"always", "threshold", "never"}:
-        raise ValueError(
-            f"{field_name}.restart_after_red_policy must be always, threshold, "
-            f"or never, got {restart_policy!r}"
-        )
-    orange_mode = settings.get(
-        "orange_tier_mode", "tp_only_with_active_entry_cancellation"
-    )
-    if not isinstance(orange_mode, str):
-        raise TypeError(f"{field_name}.orange_tier_mode must be a string")
-    if orange_mode not in {
-        "graceful_stop",
-        "tp_only_with_active_entry_cancellation",
-    }:
-        raise ValueError(
-            f"{field_name}.orange_tier_mode must be graceful_stop or "
-            "tp_only_with_active_entry_cancellation, got "
-            f"{orange_mode!r}"
-        )
-    panic_order_type = settings.get("panic_close_order_type", "limit")
-    encode_hsl_panic_order_type(
-        panic_order_type,
-        field_name=f"{field_name}.panic_close_order_type",
-    )
-    return {
-        "enabled": enabled,
-        "red_threshold": red_threshold,
-        "ema_span_minutes": ema_span_minutes,
-        "cooldown_minutes_after_red": cooldown_minutes,
-        "no_restart_drawdown_threshold": no_restart_threshold,
-        "restart_after_red_policy": restart_policy,
-        "tier_ratios": {"yellow": yellow, "orange": orange},
-        "orange_tier_mode": orange_mode,
-        "panic_close_order_type": panic_order_type,
-    }
-
-
-def validate_hsl_override_patch(
-    base_hsl: dict, override_hsl: dict, *, field_name: str
-) -> dict:
-    if not isinstance(base_hsl, dict) or not isinstance(override_hsl, dict):
-        raise TypeError(f"{field_name} must be a dictionary")
-    effective = dict(base_hsl)
-    base_ratios = base_hsl.get("tier_ratios", {})
-    override_ratios = override_hsl.get("tier_ratios", {})
-    if not isinstance(base_ratios, dict) or not isinstance(override_ratios, dict):
-        raise TypeError(f"{field_name}.tier_ratios must be a dictionary")
-    effective.update(
-        {key: value for key, value in override_hsl.items() if key != "tier_ratios"}
-    )
-    effective["tier_ratios"] = {**base_ratios, **override_ratios}
-    return validate_hsl_settings(effective, field_name=field_name)
 
 
 MULTICOIN_TOTAL_EXPOSURE_ENFORCER_PARAM_KEYS = (
@@ -323,6 +225,7 @@ EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS = (
     *HSL_PARAM_KEYS,
     "wallet_exposure_limit",
     *UNSTUCK_EMA_PARAM_KEYS,
+    *ADAPTIVE_PARAM_KEYS,
 )
 
 EMA_ANCHOR_MULTICOIN_PARAM_KEYS = (
@@ -339,6 +242,7 @@ EMA_ANCHOR_MULTICOIN_PARAM_KEYS = (
     *UNSTUCK_PARAM_KEYS,
     *HSL_PARAM_KEYS,
     *UNSTUCK_EMA_PARAM_KEYS,
+    *ADAPTIVE_PARAM_KEYS,
 )
 
 TRAILING_MARTINGALE_PARAM_KEYS = (
@@ -380,6 +284,7 @@ TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS = (
     *HSL_PARAM_KEYS,
     "wallet_exposure_limit",
     *UNSTUCK_EMA_PARAM_KEYS,
+    *ADAPTIVE_PARAM_KEYS,
 )
 
 TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS = (
@@ -397,6 +302,7 @@ TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS = (
     *UNSTUCK_PARAM_KEYS,
     *HSL_PARAM_KEYS,
     *UNSTUCK_EMA_PARAM_KEYS,
+    *ADAPTIVE_PARAM_KEYS,
 )
 
 TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS = (
@@ -472,8 +378,7 @@ TRAILING_MARTINGALE_COIN_OVERRIDE_HSL_START_COLUMN = (
     TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_START_COLUMN + 6
 )
 TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN = (
-    TRAILING_MARTINGALE_COIN_OVERRIDE_HSL_START_COLUMN
-    + len(HSL_COIN_OVERRIDE_PATHS)
+    TRAILING_MARTINGALE_COIN_OVERRIDE_HSL_START_COLUMN + len(HSL_COIN_OVERRIDE_PATHS)
 )
 TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_REENTRY_COLUMN = (
     TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN + 1
@@ -484,9 +389,12 @@ TRAILING_MARTINGALE_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN = (
 TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN = (
     TRAILING_MARTINGALE_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN + 1
 )
-TRAILING_MARTINGALE_COIN_OVERRIDE_COLS = (
+TRAILING_MARTINGALE_COIN_OVERRIDE_ADAPTIVE_START = (
     TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN
     + len(UNSTUCK_EMA_PARAM_KEYS)
+)
+TRAILING_MARTINGALE_COIN_OVERRIDE_COLS = (
+    TRAILING_MARTINGALE_COIN_OVERRIDE_ADAPTIVE_START + len(ADAPTIVE_OVERRIDE_KEYS)
 )
 
 
@@ -522,7 +430,9 @@ def flatten_trailing_martingale_params(strategy: dict, risk: dict) -> dict:
     close = strategy.get("close", {})
     mode = str(entry.get("ema_gate_mode", "all")).strip().lower()
     if mode not in {"disabled", "all", "initial", "reentry"}:
-        raise ValueError(f"unsupported trailing_martingale entry.ema_gate_mode={mode!r}")
+        raise ValueError(
+            f"unsupported trailing_martingale entry.ema_gate_mode={mode!r}"
+        )
     flattened = {
         "ema_span_0": entry.get("ema_span_0"),
         "ema_span_1": entry.get("ema_span_1"),
@@ -641,10 +551,7 @@ def _build_hourly_log_range(high, low, timestamps, run: ProxyRun):
         window_start_ms = max(int(timestamps[0]), last_hour_boundary_ms)
         if current_ts > window_start_ms + run.interval_ms:
             start = max(
-                int(
-                    (window_start_ms - int(timestamps[0]))
-                    // run.interval_ms
-                ),
+                int((window_start_ms - int(timestamps[0])) // run.interval_ms),
                 first_valid,
             )
             end = min(k - 1, run.last_valid_idx)
@@ -665,7 +572,7 @@ def _build_hourly_log_range(high, low, timestamps, run: ProxyRun):
 
 
 def _strict_fill_tick_boundaries(
-    high, low, price_step: float
+    high, low, price_step: float, limit_order_fill_buffer_pct: float = 0.0
 ) -> tuple[np.ndarray, np.ndarray]:
     """Encode Rust's strict candle/order comparisons as integer tick boundaries."""
 
@@ -678,17 +585,33 @@ def _strict_fill_tick_boundaries(
     finite = np.isfinite(high) & np.isfinite(low)
     safe_high = np.where(finite, high, 0.0)
     safe_low = np.where(finite, low, 0.0)
-    high_fill_max = np.floor(safe_high / price_step).astype(np.int64)
-    low_nonfill_max = np.floor(safe_low / price_step).astype(np.int64)
+    buffer = validate_limit_order_fill_buffer_pct(limit_order_fill_buffer_pct)
+    sell_factor, buy_factor = 1.0 + buffer, 1.0 - buffer
+    # Solve the strict Rust price comparisons once, before uploading immutable
+    # ticks. Kernels, raw candles, and market-order touch prices stay unchanged.
+    with np.errstate(over="ignore", invalid="ignore"):
+        sell_ticks = np.floor((safe_high / sell_factor) / price_step)
+        buy_ticks = np.floor((safe_low / buy_factor) / price_step)
+    i32 = np.iinfo(np.int32)
+    # Thresholds above every representable order tick mean all sells / no
+    # buys cross. Cap the float estimate before integer conversion (even when
+    # division overflowed), retaining room for the strict-boundary repair.
+    # Actual executable prices are still validated by directional touch packing.
+    for ticks in (sell_ticks, buy_ticks):
+        if not np.all(~np.isnan(ticks) & (ticks >= i32.min - 2)):
+            raise ValueError("MPS proxy candle price ticks exceed signed 32-bit range")
+    high_fill_max = np.minimum(sell_ticks, i32.max + 2).astype(np.int64)
+    low_nonfill_max = np.minimum(buy_ticks, i32.max + 2).astype(np.int64)
 
     decimal_multiplier = None
     multiplier = 1.0
     for places in range(16):
         scaled_step = abs(price_step) * multiplier
         rounded_step = np.floor(scaled_step + 0.5)
-        if rounded_step >= 1.0 and abs(scaled_step - rounded_step) <= max(
-            abs(scaled_step), 1.0
-        ) * 1e-12:
+        if (
+            rounded_step >= 1.0
+            and abs(scaled_step - rounded_step) <= max(abs(scaled_step), 1.0) * 1e-12
+        ):
             decimal_multiplier = 10.0 ** max(places, 10)
             break
         multiplier *= 10.0
@@ -698,35 +621,33 @@ def _strict_fill_tick_boundaries(
         if decimal_multiplier is None:
             return prices
         scaled = prices * decimal_multiplier
-        return (
-            np.copysign(np.floor(np.abs(scaled) + 0.5), scaled)
-            / decimal_multiplier
-        )
+        return np.copysign(np.floor(np.abs(scaled) + 0.5), scaled) / decimal_multiplier
 
     # Division can land one tick to either side near an exact boundary. Repair
     # against Rust's step-decimal-preserving order-price rounding contract.
     for _ in range(2):
-        high_fill_max -= (rust_tick_prices(high_fill_max) >= safe_high).astype(
-            np.int64
-        )
-        high_fill_max += (rust_tick_prices(high_fill_max + 1) < safe_high).astype(
-            np.int64
-        )
-        low_nonfill_max -= (rust_tick_prices(low_nonfill_max) > safe_low).astype(
-            np.int64
-        )
+        high_fill_max -= (
+            rust_tick_prices(high_fill_max) * sell_factor >= safe_high
+        ).astype(np.int64)
+        high_fill_max += (
+            rust_tick_prices(high_fill_max + 1) * sell_factor < safe_high
+        ).astype(np.int64)
+        low_nonfill_max -= (
+            rust_tick_prices(low_nonfill_max) * buy_factor > safe_low
+        ).astype(np.int64)
         low_nonfill_max += (
-            rust_tick_prices(low_nonfill_max + 1) <= safe_low
+            rust_tick_prices(low_nonfill_max + 1) * buy_factor <= safe_low
         ).astype(np.int64)
 
     high_fill_max[~finite] = 0
     low_nonfill_max[~finite] = 0
-    i32 = np.iinfo(np.int32)
+    # Saturation preserves both comparisons over the complete int32 order
+    # domain: order <= high_fill_max and order > low_nonfill_max.
+    high_fill_max = np.minimum(high_fill_max, i32.max)
+    low_nonfill_max = np.minimum(low_nonfill_max, i32.max)
     if (
         high_fill_max.min(initial=0) < i32.min
-        or high_fill_max.max(initial=0) > i32.max
         or low_nonfill_max.min(initial=0) < i32.min
-        or low_nonfill_max.max(initial=0) > i32.max
     ):
         raise ValueError("MPS proxy candle price ticks exceed signed 32-bit range")
     return high_fill_max.astype(np.int32), low_nonfill_max.astype(np.int32)
@@ -752,9 +673,10 @@ def _directional_touch_ticks(
     for places in range(16):
         scaled_step = abs(price_step) * multiplier
         rounded_step = np.floor(scaled_step + 0.5)
-        if rounded_step >= 1.0 and abs(scaled_step - rounded_step) <= max(
-            abs(scaled_step), 1.0
-        ) * 1e-12:
+        if (
+            rounded_step >= 1.0
+            and abs(scaled_step - rounded_step) <= max(abs(scaled_step), 1.0) * 1e-12
+        ):
             decimal_multiplier = 10.0 ** max(places, 10)
             break
         multiplier *= 10.0
@@ -763,8 +685,7 @@ def _directional_touch_ticks(
     if decimal_multiplier is not None:
         scaled = nearest_prices * decimal_multiplier
         nearest_prices = (
-            np.copysign(np.floor(np.abs(scaled) + 0.5), scaled)
-            / decimal_multiplier
+            np.copysign(np.floor(np.abs(scaled) + 0.5), scaled) / decimal_multiplier
         )
     tolerance = (
         np.finfo(np.float64).eps
@@ -882,7 +803,10 @@ def _require_contiguous_mps_hlc(high, low, close, run: ProxyRun, *, coin: int = 
     if first > last:
         return
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        packed = np.asarray([high[first:last + 1], low[first:last + 1], close[first:last + 1]], dtype=np.float32)
+        packed = np.asarray(
+            [high[first : last + 1], low[first : last + 1], close[first : last + 1]],
+            dtype=np.float32,
+        )
     invalid = np.flatnonzero(~np.all(np.isfinite(packed) & (packed > 0.0), axis=0))
     if invalid.size:
         raise ValueError(
@@ -892,7 +816,16 @@ def _require_contiguous_mps_hlc(high, low, close, run: ProxyRun, *, coin: int = 
         )
 
 
-def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: ProxyMarket):
+def build_mps_data(
+    high,
+    low,
+    close,
+    timestamps_ms,
+    run: ProxyRun,
+    market: ProxyMarket,
+    *,
+    limit_order_fill_buffer_pct: float = 0.0,
+):
     """Prepare immutable minute data and keep it resident on Apple MPS.
 
     Torch is imported here, rather than at module import time, so normal CPU
@@ -927,9 +860,7 @@ def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: Proxy
     log_range = np.where(np.isfinite(log_range), log_range, 0.0).astype(np.float32)
 
     first_valid = max(0, run.first_valid_idx)
-    hour_log_range, hour_valid = _build_hourly_log_range(
-        high, low, timestamps, run
-    )
+    hour_log_range, hour_valid = _build_hourly_log_range(high, low, timestamps, run)
 
     day_idx = ((timestamps // 86_400_000) - (timestamps[0] // 86_400_000)).astype(
         np.int32
@@ -952,7 +883,7 @@ def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: Proxy
         & valid
     )
     high_fill_max_tick, low_nonfill_max_tick = _strict_fill_tick_boundaries(
-        high, low, market.price_step
+        high, low, market.price_step, limit_order_fill_buffer_pct
     )
     touch_down_tick, touch_up_tick, touch_nearest_tick = _directional_touch_ticks(
         close, market.price_step
@@ -990,6 +921,92 @@ def build_mps_data(high, low, close, timestamps_ms, run: ProxyRun, market: Proxy
     }
 
 
+def _pack_multicoin_price_arrays(values, markets, relation_dtype, fill_buffer):
+    candle_count, coin_count = values.shape[:2]
+    bars = np.array(values[:, :, :4], dtype=np.float32, order="C", copy=True)
+    for field in (0, 1, 3):
+        field_values = bars[:, :, field]
+        field_values[~np.isfinite(field_values)] = 0.0
+    arrays = {
+        "bars": bars,
+        "fill_ticks": np.empty((candle_count, coin_count, 2), dtype=np.int32),
+        "touch_ticks": np.empty((candle_count, coin_count, 2), dtype=np.int32),
+        "touch_nearest_ticks": np.empty((candle_count, coin_count), dtype=np.int32),
+        "touch_min_qty_bits": np.empty((candle_count, coin_count), dtype=np.int32),
+        "touch_min_qty_relation": np.empty((candle_count, coin_count), dtype=relation_dtype),
+    }
+    max_costs = []
+    for coin, market in enumerate(markets):
+        high, low, close = (values[:, coin, field] for field in range(3))
+        high_fill, low_nonfill = _strict_fill_tick_boundaries(
+            high, low, market.price_step, fill_buffer
+        )
+        touch_down, touch_up, touch_nearest = _directional_touch_ticks(close, market.price_step)
+        arrays["fill_ticks"][:, coin, 0] = high_fill
+        arrays["fill_ticks"][:, coin, 1] = low_nonfill
+        arrays["touch_ticks"][:, coin, 0] = touch_down
+        arrays["touch_ticks"][:, coin, 1] = touch_up
+        arrays["touch_nearest_ticks"][:, coin] = touch_nearest
+        bits, relation = _minimum_entry_qty_encoding(close, market)
+        arrays["touch_min_qty_bits"][:, coin] = bits
+        arrays["touch_min_qty_relation"][:, coin] = relation
+        max_costs.append(_maximum_effective_min_cost(close, market))
+    return arrays, max_costs
+
+
+def _spill_multicoin_arrays(values, timestamps, runs, markets, relation_dtype,
+                          fill_buffer, include_hourly_ranges, directory):
+    from contextlib import ExitStack
+    from tempfile import TemporaryDirectory
+    from optimization.gpu.residency import PREPARATION_CHUNK_BYTES, spill_array_file
+
+    n, coins = values.shape[:2]
+    # Packed output plus per-coin float64 scratch stays independent of history length.
+    chunk_rows = max(1, PREPARATION_CHUNK_BYTES // (coins * 45 + 256))
+    paths = {}
+    max_costs = np.zeros(coins, dtype=np.float64)
+    with TemporaryDirectory(prefix="hourly-", dir=directory) as hourly_directory, ExitStack() as stack:
+        hourly_paths = []
+        if include_hourly_ranges:
+            # Preserve the canonical hourly calculation, including partial hours,
+            # listing tails and the last known valid boundary. Only one coin's
+            # history is allocated at a time; the dense multicoin output is streamed.
+            for coin, run in enumerate(runs):
+                ranges, valid = _build_hourly_log_range(
+                    np.asarray(values[:, coin, 0], dtype=np.float64),
+                    np.asarray(values[:, coin, 1], dtype=np.float64), timestamps, run
+                )
+                path = Path(hourly_directory) / f"{coin}.npy"
+                np.save(path, np.where(valid, ranges, np.float32(-1.0)), allow_pickle=False)
+                hourly_paths.append(path)
+                del ranges, valid
+        handles = {}
+        for start in range(0, n, chunk_rows):
+            end = min(start + chunk_rows, n)
+            arrays, costs = _pack_multicoin_price_arrays(
+                values[start:end], markets, relation_dtype, fill_buffer
+            )
+            max_costs = np.maximum(max_costs, costs)
+            if include_hourly_ranges:
+                hourly = np.empty((end - start, coins), dtype=np.float32)
+                for coin, path in enumerate(hourly_paths):
+                    mapped = np.load(path, mmap_mode="r", allow_pickle=False)
+                    try:
+                        hourly[:, coin] = mapped[start:end]
+                    finally:
+                        mapped._mmap.close()
+                arrays["hour_log_ranges"] = hourly
+            for name, array in arrays.items():
+                if name not in handles:
+                    paths[name] = directory / f"{name}.npy"
+                    handles[name] = stack.enter_context(spill_array_file(
+                        paths[name], (n, *array.shape[1:]), array.dtype,
+                    ))
+                handles[name].write(memoryview(array).cast("B"))
+            del arrays
+    return paths, max_costs
+
+
 def build_mps_multicoin_data(
     hlcvs,
     timestamps_ms,
@@ -997,8 +1014,10 @@ def build_mps_multicoin_data(
     markets: list[ProxyMarket],
     *,
     include_hourly_ranges: bool = True,
+    limit_order_fill_buffer_pct: float = 0.0,
+    spill_dir=None,
 ):
-    """Pack compact multicoin inputs for the persistent Apple MPS kernel.
+    """Pack compact multicoin inputs for the shared MPS/CUDA kernel.
 
     Raw OHLCV stays float32 for unified-memory efficiency. Strict fill and
     order-book touch comparisons are encoded from the original float64 data as
@@ -1050,56 +1069,31 @@ def build_mps_multicoin_data(
         _require_contiguous_mps_hlc(
             values[:, coin, 0], values[:, coin, 1], values[:, coin, 2], run, coin=coin
         )
-    bars = np.ascontiguousarray(values[:, :, :4], dtype=np.float32)
-    # Unavailable listing/delisting tails remain outside the declared valid
-    # range. Internal missing H/L/C is rejected before reaching this packing.
-    for field in (0, 1, 3):
-        field_values = bars[:, :, field]
-        field_values[~np.isfinite(field_values)] = 0.0
-    fill_ticks = np.empty((candle_count, coin_count, 2), dtype=np.int32)
-    touch_ticks = np.empty((candle_count, coin_count, 2), dtype=np.int32)
-    touch_nearest_ticks = np.empty((candle_count, coin_count), dtype=np.int32)
-    touch_min_qty_bits = np.empty((candle_count, coin_count), dtype=np.int32)
-    # Relations encode only -1, 0, +1; CUDA can read them losslessly as bytes.
     relation_dtype = np.int8 if gpu_device(torch) == "cuda" else np.int32
-    touch_min_qty_relation = np.empty((candle_count, coin_count), dtype=relation_dtype)
-    if include_hourly_ranges:
-        # A valid log range is always non-negative, so -1.0 is an unambiguous
-        # sentinel and avoids a second dense per-candle/per-coin validity tensor.
-        hour_log_ranges = np.full(
-            (candle_count, coin_count), -1.0, dtype=np.float32
+    if spill_dir is not None:
+        arrays, max_costs = _spill_multicoin_arrays(
+            values, timestamps, runs, markets, relation_dtype,
+            limit_order_fill_buffer_pct, include_hourly_ranges, spill_dir,
         )
     else:
-        hour_log_ranges = None
+        arrays, max_costs = _pack_multicoin_price_arrays(
+            values, markets, relation_dtype, limit_order_fill_buffer_pct,
+        )
+        if include_hourly_ranges:
+            hourly = np.full((candle_count, coin_count), -1.0, dtype=np.float32)
+            for coin, run in enumerate(runs):
+                ranges, valid = _build_hourly_log_range(
+                    np.asarray(values[:, coin, 0], dtype=np.float64),
+                    np.asarray(values[:, coin, 1], dtype=np.float64), timestamps, run
+                )
+                hourly[valid, coin] = ranges[valid]
+            arrays["hour_log_ranges"] = hourly
     coin_settings = np.empty((coin_count, 13), dtype=np.float32)
     for coin, (run, market) in enumerate(zip(runs, markets)):
         if run.interval_ms != interval_ms:
             raise ValueError("MPS multicoin runs must use one shared candle interval")
-        high = values[:, coin, 0].astype(np.float64, copy=False)
-        low = values[:, coin, 1].astype(np.float64, copy=False)
-        close = values[:, coin, 2].astype(np.float64, copy=False)
-        if hour_log_ranges is not None:
-            coin_hour_log_range, coin_hour_valid = _build_hourly_log_range(
-                high, low, timestamps, run
-            )
-            hour_log_ranges[coin_hour_valid, coin] = coin_hour_log_range[
-                coin_hour_valid
-            ]
-        high_fill, low_nonfill = _strict_fill_tick_boundaries(
-            high, low, market.price_step
-        )
-        touch_down, touch_up, touch_nearest = _directional_touch_ticks(
-            close, market.price_step
-        )
-        fill_ticks[:, coin, 0] = high_fill
-        fill_ticks[:, coin, 1] = low_nonfill
-        touch_ticks[:, coin, 0] = touch_down
-        touch_ticks[:, coin, 1] = touch_up
-        touch_nearest_ticks[:, coin] = touch_nearest
-        min_qty_bits, min_qty_relation = _minimum_entry_qty_encoding(close, market)
-        touch_min_qty_bits[:, coin] = min_qty_bits
-        touch_min_qty_relation[:, coin] = min_qty_relation
-        max_effective_min_cost = _maximum_effective_min_cost(close, market)
+        close = values[:, coin, 2]
+        max_effective_min_cost = max_costs[coin]
         seed_index = min(max(int(run.first_valid_idx), 0), candle_count - 1)
         seed_close = float(close[seed_index])
         high_seed = float(values[seed_index, coin, 0])
@@ -1126,19 +1120,15 @@ def build_mps_multicoin_data(
             max_effective_min_cost,
         )
 
-    invariant_bytes = (
-        bars.nbytes
-        + fill_ticks.nbytes
-        + touch_ticks.nbytes
-        + touch_nearest_ticks.nbytes
-        + touch_min_qty_bits.nbytes
-        + touch_min_qty_relation.nbytes
-        + (hour_log_ranges.nbytes if hour_log_ranges is not None else 0)
+    invariant_bytes = candle_count * coin_count * (
+        16 + 8 + 8 + 4 + 4 + np.dtype(relation_dtype).itemsize
+        + (4 if include_hourly_ranges else 0)
     )
     recommended = None
-    if gpu_device(torch) == "cuda":
-        recommended = int(torch.cuda.mem_get_info()[0])
-    else:
+    if gpu_device(torch) == "cuda" and spill_dir is None:
+        from optimization.gpu.residency import check_cuda_invariant_memory
+        check_cuda_invariant_memory(torch, invariant_bytes)
+    elif gpu_device(torch) != "cuda":
         recommended_fn = getattr(torch.mps, "recommended_max_memory", None)
         if callable(recommended_fn):
             recommended = int(recommended_fn())
@@ -1149,21 +1139,21 @@ def build_mps_multicoin_data(
             f"the device's {recommended / 2**30:.2f} GiB recommended working set"
         )
 
-    def tensor(array, *, dtype=None):
+    def tensor(array, *, dtype=None, name):
+        if spill_dir is not None:
+            path = spill_dir / (name + ".npy")
+            np.save(path, array, allow_pickle=False)
+            return path
         return torch.as_tensor(array, dtype=dtype, device=gpu_device()).contiguous()
 
     first_day = int(timestamps[0] // 86_400_000)
     last_day = int(timestamps[-1] // 86_400_000)
     packed = {
-        "bars": tensor(bars, dtype=torch.float32),
-        "fill_ticks": tensor(fill_ticks, dtype=torch.int32),
-        "touch_ticks": tensor(touch_ticks, dtype=torch.int32),
-        "touch_nearest_ticks": tensor(touch_nearest_ticks, dtype=torch.int32),
-        "touch_min_qty_bits": tensor(touch_min_qty_bits, dtype=torch.int32),
-        "touch_min_qty_relation": tensor(
-            touch_min_qty_relation, dtype=torch.int8 if relation_dtype == np.int8 else torch.int32
-        ),
-        "coin_settings": tensor(coin_settings, dtype=torch.float32),
+        name: value if spill_dir is not None else tensor(value, name=name)
+        for name, value in arrays.items()
+    }
+    packed.update({
+        "coin_settings": tensor(coin_settings, dtype=torch.float32, name="coin_settings"),
         "n": candle_count,
         "n_coins": coin_count,
         "n_days": last_day - first_day + 1,
@@ -1171,9 +1161,5 @@ def build_mps_multicoin_data(
         "start_minute_of_day": int((timestamps[0] // 60_000) % 1440),
         "start_minute_of_hour": int((timestamps[0] // 60_000) % 60),
         "invariant_bytes": invariant_bytes,
-    }
-    if hour_log_ranges is not None:
-        packed["hour_log_ranges"] = tensor(
-            hour_log_ranges, dtype=torch.float32
-        )
+    })
     return packed

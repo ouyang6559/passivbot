@@ -6,15 +6,31 @@ import textwrap
 import numpy as np
 import pytest
 
-
 torch = pytest.importorskip("torch")
 
-from optimization.gpu.runtime import gpu_device, compile_shader, synchronize
+from optimization.gpu.runtime import (
+    gpu_device,
+    compile_shader as _compile_shader,
+    synchronize,
+)
+
+
+def compile_shader(source):
+    # Standalone math probes share the full kernel source but do not allocate
+    # an HSL history window. Production runners specialize these dimensions.
+    if "struct HslState" in source and "#define PASSIVBOT_HSL_CAPACITY" not in source:
+        source = (
+            "#define PASSIVBOT_HSL_CAPACITY 1\n#define PASSIVBOT_HSL_TREE_SIZE 1\n#define PASSIVBOT_HSL_LOOKBACK 0\n"
+            + source
+        )
+    return _compile_shader(source)
+
 
 GPU_AVAILABLE = torch.backends.mps.is_available() or torch.cuda.is_available()
 
 from optimization.gpu.model import (
     EMA_ANCHOR_COIN_OVERRIDE_COLS,
+    EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN,
     EMA_ANCHOR_COIN_OVERRIDE_COOLDOWN_COLUMN,
     EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN,
     EMA_ANCHOR_COIN_OVERRIDE_HSL_START_COLUMN,
@@ -24,6 +40,7 @@ from optimization.gpu.model import (
     ProxyMarket,
     ProxyRun,
     TRAILING_MARTINGALE_COIN_OVERRIDE_COLS,
+    TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN,
     TRAILING_MARTINGALE_COIN_OVERRIDE_COOLDOWN_COLUMN,
     TRAILING_MARTINGALE_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN,
     TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN,
@@ -43,7 +60,6 @@ from optimization.gpu.model import (
     build_mps_multicoin_data,
 )
 from optimization.gpu.mps_kernel import (
-    MPS_DIRECTIONAL_HSL_ROLLING_CAPACITY,
     MpsEmaAnchorMulticoinRunner,
     MpsEmaAnchorRunner,
     MpsEmaAnchorMulticoinFusedRunner,
@@ -63,6 +79,8 @@ from optimization.gpu.mps_kernel import (
     _with_btc_risk,
     _with_dynamic_wel_by_tradability,
     _with_entry_interval,
+    _hsl_layout,
+    _with_hsl,
     _with_hsl_ema_tail,
     _with_hsl_features,
     _with_recovery_distribution,
@@ -95,13 +113,9 @@ def test_strategy_runner_valid_evaluation_has_one_kernel_dispatch(
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and (
-            (
-                isinstance(node.func, ast.Name)
-                and node.func.id == dispatch_name
-            )
+            (isinstance(node.func, ast.Name) and node.func.id == dispatch_name)
             or (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == dispatch_name
+                isinstance(node.func, ast.Attribute) and node.func.attr == dispatch_name
             )
         )
     ]
@@ -129,15 +143,13 @@ def _assert_fill_scalar_contract(output):
     assert (fill_count >= 0.0).all()
     assert (fill_count >= output["fill_count_entry"]).all()
     assert (fill_count >= output["fill_count_long"]).all()
-    assert torch.equal(
-        fill_count, output["day_fill_count"].sum(dim=1)
-    )
+    assert torch.equal(fill_count, output["day_fill_count"].sum(dim=1))
     active_days = output["fills_active_days_count"]
     assert torch.equal(active_days, active_days.round())
     assert (active_days >= 0.0).all()
-    duration_days = (
-        output["last_eq_ts"] - output["first_eq_ts"]
-    ).clamp(min=0.0) / 86_400_000.0
+    duration_days = (output["last_eq_ts"] - output["first_eq_ts"]).clamp(
+        min=0.0
+    ) / 86_400_000.0
     assert (active_days <= duration_days.ceil().clamp(min=1.0)).all()
     pnl_recovery = output["pnl_recovery_max_ms"]
     assert (pnl_recovery >= 0.0).all()
@@ -152,8 +164,7 @@ def _assert_fill_scalar_contract(output):
     if (held_count > 0.0).any():
         assert (
             held_sum[held_count > 0.0]
-            <= output["held_max_ms"][held_count > 0.0]
-            * held_count[held_count > 0.0]
+            <= output["held_max_ms"][held_count > 0.0] * held_count[held_count > 0.0]
         ).all()
     has_fills = ~no_fills
     if has_fills.any():
@@ -168,9 +179,7 @@ def _assert_fill_scalar_contract(output):
     assert (account_recovery >= 0.0).all()
     equity_span = output["last_eq_ts"] - output["first_eq_ts"]
     has_equity = torch.isfinite(equity_span) & (equity_span >= 0.0)
-    assert (
-        account_recovery[has_equity] <= equity_span[has_equity] + 1.0e-6
-    ).all()
+    assert (account_recovery[has_equity] <= equity_span[has_equity] + 1.0e-6).all()
     assert (account_recovery[~has_equity] == 0.0).all()
 
 
@@ -196,12 +205,18 @@ def test_tm_parameter_packing_preserves_positive_underflow_mode_per_side():
     assert packed[0, width + entry_column] == 0.0
 
 
-@pytest.mark.parametrize("side_width,strategy_start", [(37, 1), (54, 0)])
+@pytest.mark.parametrize(
+    "side_width,strategy_start",
+    [
+        (len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS), 1),
+        (len(TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS), 0),
+    ],
+)
 @pytest.mark.parametrize("missing_wel", [False, True])
 def test_legacy_single_coin_rows_gain_explicit_unstuck_spans(
     side_width, strategy_start, missing_wel
 ):
-    legacy_width = side_width - 2 - int(missing_wel)
+    legacy_width = side_width - 7 - 2 - int(missing_wel)
     params = np.arange(legacy_width * 2, dtype=np.float64).reshape(1, -1)
     upgraded = _upgrade_legacy_single_coin_wel_params(params, side_width=side_width)
     assert upgraded.shape == (1, side_width * 2)
@@ -210,22 +225,20 @@ def test_legacy_single_coin_rows_gain_explicit_unstuck_spans(
         actual = upgraded[0, side * side_width : (side + 1) * side_width]
         np.testing.assert_array_equal(actual[:legacy_width], original)
         if missing_wel:
-            assert actual[-3] == -1.0
+            assert actual[-10] == -1.0
         np.testing.assert_array_equal(
-            actual[-2:], original[strategy_start : strategy_start + 2]
+            actual[-9:-7], original[strategy_start : strategy_start + 2]
         )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize(
-    ("base_wel", "allowance_pct", "legacy_raw", "expected_allowed_wel"),
+    ("base_wel", "allowance_pct", "scale_budget", "expected_allowed_wel"),
     [
         (0.4, 0.25, False, 0.5),
         (0.4, 2.0, False, 0.9),
-        (0.4, 2.0, True, 1.2),
+        (0.4, 2.0, True, 0.9),
         (-1.0, 0.25, False, 0.9),
     ],
 )
@@ -233,7 +246,7 @@ def test_mps_single_coin_wallet_exposure_override_keeps_twel_separate(
     strategy_kind,
     base_wel,
     allowance_pct,
-    legacy_raw,
+    scale_budget,
     expected_allowed_wel,
 ):
     import passivbot_rust
@@ -252,7 +265,7 @@ def test_mps_single_coin_wallet_exposure_override_keeps_twel_separate(
             "total_wallet_exposure_limit": 0.9,
             "wallet_exposure_limit": base_wel,
             "we_excess_allowance_pct": allowance_pct,
-            "we_excess_allowance_legacy_raw": float(legacy_raw),
+            "hsl_scale_budget_with_excess_allowance": float(scale_budget),
         }
     )
     params = torch.tensor(
@@ -272,25 +285,19 @@ kernel void passivbot_single_coin_wel_probe(
 }}
 """
     library = compile_shader(source + probe_kernel)
-    library.passivbot_single_coin_wel_probe(
-        params, output, threads=(1, 1, 1)
-    )
+    library.passivbot_single_coin_wel_probe(params, output, threads=(1, 1, 1))
     synchronize()
 
     assert output[0].item() == pytest.approx(0.9)
     assert output[1].item() == pytest.approx(expected_allowed_wel)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("side", "expected_entry_ticks"),
     [("long", 97.0), ("short", 103.0)],
 )
-def test_mps_ema_inventory_ratio_uses_single_coin_base_wel(
-    side, expected_entry_ticks
-):
+def test_mps_ema_inventory_ratio_uses_single_coin_base_wel(side, expected_entry_ticks):
     import passivbot_rust
 
     values = {key: 0.0 for key in EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS}
@@ -311,9 +318,7 @@ def test_mps_ema_inventory_ratio_uses_single_coin_base_wel(
         device=gpu_device(),
     )
     output = torch.zeros(2, dtype=torch.float32, device=gpu_device())
-    generator = (
-        "generate_long_orders" if side == "long" else "generate_short_orders"
-    )
+    generator = "generate_long_orders" if side == "long" else "generate_short_orders"
     probe_kernel = f"""
 kernel void passivbot_ema_base_wel_inventory_probe(
     constant float* packed,
@@ -344,12 +349,8 @@ kernel void passivbot_ema_base_wel_inventory_probe(
     result[1] = state.base_wel;
 }}
 """
-    library = compile_shader(
-        passivbot_rust.mps_ema_anchor_source_py() + probe_kernel
-    )
-    library.passivbot_ema_base_wel_inventory_probe(
-        params, output, threads=(1, 1, 1)
-    )
+    library = compile_shader(passivbot_rust.mps_ema_anchor_source_py() + probe_kernel)
+    library.passivbot_ema_base_wel_inventory_probe(params, output, threads=(1, 1, 1))
     synchronize()
 
     # With current WE=0.1, exact Rust's base-WEL ratio is 0.1 / 0.4 = 0.25.
@@ -377,40 +378,28 @@ def test_decode_multicoin_fused_outputs_maps_directional_reductions():
     daily = torch.zeros((1, 1, 9), dtype=torch.float32)
     daily[:, :, 1].fill_(float("inf"))
     daily[:, :, 5].fill_(float("inf"))
-    scalars = torch.arange(74, dtype=torch.float32).reshape(1, 74)
+    scalars = torch.arange(72, dtype=torch.float32).reshape(1, 72)
     gaps = torch.zeros((1, 128), dtype=torch.int32)
 
     output = _decode_multicoin_fused_outputs(daily, scalars, gaps)
 
     assert "entry_initial_balance_pct" not in output
     assert torch.equal(output["entry_initial_balance_pct_long"], scalars[:, 21])
-    assert torch.equal(output["hsl_drawdown_ema_max_long"], scalars[:, 57])
-    assert torch.equal(output["hsl_drawdown_ema_max_short"], scalars[:, 58])
-    assert torch.equal(output["entry_initial_balance_pct_short"], scalars[:, 59])
-    assert torch.equal(output["profit_sum_long"], scalars[:, 60])
-    assert torch.equal(output["loss_sum_long"], scalars[:, 61])
-    assert torch.equal(output["profit_sum_short"], scalars[:, 62])
-    assert torch.equal(output["loss_sum_short"], scalars[:, 63])
-    assert torch.equal(
-        output["hsl_strategy_eq_recovery_max_ms_long"], scalars[:, 64]
-    )
-    assert torch.equal(
-        output["hsl_strategy_eq_recovery_max_ms_short"], scalars[:, 65]
-    )
-    assert torch.equal(
-        output["hsl_drawdown_ema_mean_worst_1pct_long"], scalars[:, 66]
-    )
-    assert torch.equal(
-        output["hsl_drawdown_ema_mean_worst_1pct_short"], scalars[:, 67]
-    )
-    assert torch.equal(output["hsl_drawdown_raw_max_long"], scalars[:, 68])
-    assert torch.equal(output["hsl_drawdown_raw_max_short"], scalars[:, 69])
-    assert torch.equal(
-        output["hsl_drawdown_raw_mean_worst_1pct_long"], scalars[:, 70]
-    )
-    assert torch.equal(
-        output["hsl_drawdown_raw_mean_worst_1pct_short"], scalars[:, 71]
-    )
+    assert torch.equal(output["hsl_drawdown_ema_max_long"], scalars[:, 55])
+    assert torch.equal(output["hsl_drawdown_ema_max_short"], scalars[:, 56])
+    assert torch.equal(output["entry_initial_balance_pct_short"], scalars[:, 57])
+    assert torch.equal(output["profit_sum_long"], scalars[:, 58])
+    assert torch.equal(output["loss_sum_long"], scalars[:, 59])
+    assert torch.equal(output["profit_sum_short"], scalars[:, 60])
+    assert torch.equal(output["loss_sum_short"], scalars[:, 61])
+    assert torch.equal(output["hsl_strategy_eq_recovery_max_ms_long"], scalars[:, 62])
+    assert torch.equal(output["hsl_strategy_eq_recovery_max_ms_short"], scalars[:, 63])
+    assert torch.equal(output["hsl_drawdown_ema_mean_worst_1pct_long"], scalars[:, 64])
+    assert torch.equal(output["hsl_drawdown_ema_mean_worst_1pct_short"], scalars[:, 65])
+    assert torch.equal(output["hsl_drawdown_raw_max_long"], scalars[:, 66])
+    assert torch.equal(output["hsl_drawdown_raw_max_short"], scalars[:, 67])
+    assert torch.equal(output["hsl_drawdown_raw_mean_worst_1pct_long"], scalars[:, 68])
+    assert torch.equal(output["hsl_drawdown_raw_mean_worst_1pct_short"], scalars[:, 69])
 
 
 def test_hsl_ema_tail_source_variant_is_opt_in_and_guarded():
@@ -427,12 +416,15 @@ def test_hsl_ema_tail_source_variant_is_opt_in_and_guarded():
 def test_hsl_raw_drawdown_source_variant_is_opt_in_and_guarded():
     source = "#ifndef PASSIVBOT_HSL_RAW_DRAWDOWN_ENABLED\nbody"
 
-    assert _with_hsl_features(
-        source,
-        ema_tail_enabled=False,
-        raw_drawdown_enabled=False,
-        raw_tail_enabled=False,
-    ) is source
+    assert (
+        _with_hsl_features(
+            source,
+            ema_tail_enabled=False,
+            raw_drawdown_enabled=False,
+            raw_tail_enabled=False,
+        )
+        is source
+    )
     assert _with_hsl_features(
         source,
         ema_tail_enabled=False,
@@ -468,8 +460,7 @@ def test_hsl_raw_tail_source_variant_is_separately_opt_in_and_guarded():
         raw_tail_enabled=True,
     ) == (
         "#define PASSIVBOT_HSL_RAW_TAIL_ENABLED 1\n"
-        "#define PASSIVBOT_HSL_RAW_DRAWDOWN_ENABLED 1\n"
-        + source
+        "#define PASSIVBOT_HSL_RAW_DRAWDOWN_ENABLED 1\n" + source
     )
     with pytest.raises(RuntimeError, match="raw-tail feature guard"):
         _with_hsl_features(
@@ -513,8 +504,7 @@ def test_recovery_distribution_source_variant_is_opt_in_and_guarded():
 
     assert _with_recovery_distribution(source, False) is source
     assert _with_recovery_distribution(source, True) == (
-        "#define PASSIVBOT_STRATEGY_EQ_RECOVERY_DISTRIBUTION_ENABLED 1\n"
-        + source
+        "#define PASSIVBOT_STRATEGY_EQ_RECOVERY_DISTRIBUTION_ENABLED 1\n" + source
     )
     with pytest.raises(RuntimeError, match="recovery-distribution feature guard"):
         _with_recovery_distribution("body", True)
@@ -576,9 +566,7 @@ def test_btc_risk_source_variant_is_opt_in_and_guarded():
         _with_btc_risk("body", True)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_strategy_eq_recovery_distribution_matches_strict_rust_contract():
     matrix = torch.tensor(
         [
@@ -589,9 +577,13 @@ def test_mps_strategy_eq_recovery_distribution_matches_strict_rust_contract():
         device=gpu_device(),
     )
 
-    actual = strategy_eq_recovery_distribution_from_samples(
-        matrix, sample_interval_days=1.0 / 24.0
-    ).cpu().numpy()
+    actual = (
+        strategy_eq_recovery_distribution_from_samples(
+            matrix, sample_interval_days=1.0 / 24.0
+        )
+        .cpu()
+        .numpy()
+    )
 
     assert actual[0].tolist() == pytest.approx(
         [value / 24.0 for value in [8.0 / 6.0, 1.0, 2.75, 2.95, 3.0, 3.0, 3.0]]
@@ -610,14 +602,12 @@ def test_trailing_martingale_no_hsl_specialization_keeps_base_scalar_abi(
     )
 
     def fake_base_init(self, *args, **kwargs):
-        self.hsl_engine = "legacy"
-        self.revised_capacity = 0
+
+        self.hsl_capacity = 0
         self.long_enabled = True
         self.short_enabled = False
         self.hsl_ema_tail_enabled = bool(kwargs["hsl_ema_tail_enabled"])
-        self.hsl_raw_drawdown_enabled = bool(
-            kwargs["hsl_raw_drawdown_enabled"]
-        )
+        self.hsl_raw_drawdown_enabled = bool(kwargs["hsl_raw_drawdown_enabled"])
         self.hsl_raw_tail_enabled = bool(kwargs["hsl_raw_tail_enabled"])
 
     monkeypatch.setattr(MpsEmaAnchorRunner, "__init__", fake_base_init)
@@ -630,16 +620,17 @@ def test_trailing_martingale_no_hsl_specialization_keeps_base_scalar_abi(
         None,
         None,
         None,
+        pnl_lookback_bars=1440,
         hsl_enabled=False,
         hsl_ema_tail_enabled=True,
         hsl_raw_drawdown_enabled=True,
         hsl_raw_tail_enabled=True,
     )
 
-    assert runner.shader_topology == "long_no_hsl"
-    assert runner.hsl_ema_tail_enabled is False
-    assert runner.hsl_raw_drawdown_enabled is False
-    assert runner.hsl_raw_tail_enabled is False
+    assert runner.shader_topology == "generic"
+    assert runner.hsl_ema_tail_enabled is True
+    assert runner.hsl_raw_drawdown_enabled is True
+    assert runner.hsl_raw_tail_enabled is True
 
 
 def test_trailing_martingale_hsl_specialization_keeps_requested_features(
@@ -651,14 +642,12 @@ def test_trailing_martingale_hsl_specialization_keeps_requested_features(
     )
 
     def fake_base_init(self, *args, **kwargs):
-        self.hsl_engine = "legacy"
-        self.revised_capacity = 0
+
+        self.hsl_capacity = 0
         self.long_enabled = False
         self.short_enabled = True
         self.hsl_ema_tail_enabled = bool(kwargs["hsl_ema_tail_enabled"])
-        self.hsl_raw_drawdown_enabled = bool(
-            kwargs["hsl_raw_drawdown_enabled"]
-        )
+        self.hsl_raw_drawdown_enabled = bool(kwargs["hsl_raw_drawdown_enabled"])
         self.hsl_raw_tail_enabled = bool(kwargs["hsl_raw_tail_enabled"])
 
     monkeypatch.setattr(MpsEmaAnchorRunner, "__init__", fake_base_init)
@@ -671,13 +660,14 @@ def test_trailing_martingale_hsl_specialization_keeps_requested_features(
         None,
         None,
         None,
+        pnl_lookback_bars=1440,
         hsl_enabled=True,
         hsl_ema_tail_enabled=True,
         hsl_raw_drawdown_enabled=True,
         hsl_raw_tail_enabled=True,
     )
 
-    assert runner.shader_topology == "short_hsl"
+    assert runner.shader_topology == "generic"
     assert runner.hsl_ema_tail_enabled is True
     assert runner.hsl_raw_drawdown_enabled is True
     assert runner.hsl_raw_tail_enabled is True
@@ -692,8 +682,8 @@ def test_trailing_martingale_hsl_specialization_disables_unrequested_diagnostics
     )
 
     def fake_base_init(self, *args, **kwargs):
-        self.hsl_engine = "legacy"
-        self.revised_capacity = 0
+
+        self.hsl_capacity = 0
         self.long_enabled = True
         self.short_enabled = False
         self.hsl_ema_tail_enabled = False
@@ -713,18 +703,17 @@ def test_trailing_martingale_hsl_specialization_disables_unrequested_diagnostics
         None,
         None,
         None,
+        pnl_lookback_bars=1440,
         hsl_enabled=True,
         hsl_diagnostics_enabled=False,
     )
 
-    assert runner.shader_topology == "long_hsl"
+    assert runner.shader_topology == "generic"
     assert runner.hsl_diagnostics_enabled is False
-    assert runner._shader_library_cache_call()[1][-1] is False
+    assert runner._shader_library_cache_call()[1][-3] is False
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_hsl_diagnostic_opt_out_preserves_strategy_outputs():
     count = 30
     close = np.full(count, 100.0)
@@ -755,11 +744,7 @@ def test_mps_tm_hsl_diagnostic_opt_out_preserves_strategy_outputs():
         "hsl_red_threshold": 0.01,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 2.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -770,6 +755,7 @@ def test_mps_tm_hsl_diagnostic_opt_out_preserves_strategy_outputs():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         hsl_enabled=True,
@@ -779,6 +765,7 @@ def test_mps_tm_hsl_diagnostic_opt_out_preserves_strategy_outputs():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         hsl_enabled=True,
@@ -800,9 +787,7 @@ def test_mps_tm_hsl_diagnostic_opt_out_preserves_strategy_outputs():
     assert lean["hsl_triggers_long"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("interval_ms", "history_start_step", "trade_start_step"),
     [
@@ -847,6 +832,7 @@ def test_mps_tm_history_window_preserves_full_run_and_selects_recent_suffix(
             market,
             run,
             data,
+            pnl_lookback_bars=1440,
             long_enabled=True,
             short_enabled=False,
             hsl_enabled=False,
@@ -890,6 +876,7 @@ def test_mps_tm_history_window_preserves_full_run_and_selects_recent_suffix(
         market,
         sliced_run,
         sliced_data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         hsl_enabled=False,
@@ -900,7 +887,10 @@ def test_mps_tm_history_window_preserves_full_run_and_selects_recent_suffix(
     for key in ordinary:
         if isinstance(ordinary[key], torch.Tensor):
             torch.testing.assert_close(
-                ordinary[key], explicit_full[key], rtol=0.0, atol=0.0,
+                ordinary[key],
+                explicit_full[key],
+                rtol=0.0,
+                atol=0.0,
                 equal_nan=True,
             )
     assert truncated["last_eq_ts"][0].item() < ordinary["last_eq_ts"][0].item()
@@ -952,10 +942,7 @@ def test_single_coin_size_buffer_packs_last_valid_before_recovery_fields(
     runner = object.__new__(runner_cls)
     runner.n = 17
     runner.n_days = 2
-    runner.run_config = ProxyRun(
-        1_000.0, 1, 1, 0, 0, 0, 60_000, 0.05, 3, 11
-    )
-    runner.rolling_capacity = 9
+    runner.run_config = ProxyRun(1_000.0, 1, 1, 0, 0, 0, 60_000, 0.05, 3, 11)
     runner.pnl_lookback_bars = 7
     runner.recovery_distribution_enabled = recovery_enabled
     runner.recovery_stride = 60
@@ -963,14 +950,10 @@ def test_single_coin_size_buffer_packs_last_valid_before_recovery_fields(
 
     actual = runner._single_coin_size_values(5, 13)
 
-    assert actual == [5, 17, 2, 13, 3, 9, 7, 11] + (
-        [60, 4] if recovery_enabled else []
-    )
+    assert actual == [5, 17, 2, 13, 3, 7, 11] + ([60, 4] if recovery_enabled else [])
 
     truncated = runner._single_coin_size_values(5, 13, end_step=12)
-    assert truncated == [5, 12, 2, 13, 3, 9, 7, 11] + (
-        [60, 4] if recovery_enabled else []
-    )
+    assert truncated == [5, 12, 2, 13, 3, 7, 11] + ([60, 4] if recovery_enabled else [])
 
     with pytest.raises(ValueError, match="end_step"):
         runner._single_coin_size_values(5, 13, end_step=18)
@@ -983,10 +966,7 @@ def test_tm_size_buffer_appends_recent_window_after_recovery_fields(
     runner = object.__new__(MpsTrailingMartingaleRunner)
     runner.n = 17
     runner.n_days = 2
-    runner.run_config = ProxyRun(
-        1_000.0, 1, 1, 0, 0, 0, 60_000, 0.05, 3, 11
-    )
-    runner.rolling_capacity = 9
+    runner.run_config = ProxyRun(1_000.0, 1, 1, 0, 0, 0, 60_000, 0.05, 3, 11)
     runner.pnl_lookback_bars = 7
     runner.recovery_distribution_enabled = recovery_enabled
     runner.recovery_stride = 2
@@ -1001,7 +981,7 @@ def test_tm_size_buffer_appends_recent_window_after_recovery_fields(
     )
 
     recovery = [2, 10] if recovery_enabled else [0, 0]
-    assert ordinary == [5, 17, 2, 13, 3, 9, 7, 11] + recovery + [
+    assert ordinary == [5, 17, 2, 13, 3, 7, 11] + recovery + [
         -1,
         -1,
         10 if recovery_enabled else 0,
@@ -1009,7 +989,7 @@ def test_tm_size_buffer_appends_recent_window_after_recovery_fields(
         0,
         -1,
     ]
-    assert recent == [5, 17, 2, 13, 3, 9, 7, 11] + recovery + [
+    assert recent == [5, 17, 2, 13, 3, 7, 11] + recovery + [
         5,
         10,
         5 if recovery_enabled else 0,
@@ -1018,9 +998,7 @@ def test_tm_size_buffer_appends_recent_window_after_recovery_fields(
         5,
     ]
     with pytest.raises(ValueError, match="requires both"):
-        runner._trailing_single_coin_size_values(
-            5, 13, history_start_step=5
-        )
+        runner._trailing_single_coin_size_values(5, 13, history_start_step=5)
 
 
 def test_trailing_martingale_runner_accepts_ordinary_market_execution(monkeypatch):
@@ -1028,8 +1006,8 @@ def test_trailing_martingale_runner_accepts_ordinary_market_execution(monkeypatc
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
     def fake_base_init(self, *args, **kwargs):
-        self.hsl_engine = "legacy"
-        self.revised_capacity = 0
+
+        self.hsl_capacity = 0
         self.long_enabled = True
         self.short_enabled = False
         self.hsl_ema_tail_enabled = False
@@ -1044,165 +1022,18 @@ def test_trailing_martingale_runner_accepts_ordinary_market_execution(monkeypatc
         lambda self: None,
     )
     runner = MpsTrailingMartingaleRunner(
-        None, None, None, market_orders_allowed=True, hsl_enabled=False
+        None,
+        None,
+        None,
+        pnl_lookback_bars=1440,
+        market_orders_allowed=True,
+        hsl_enabled=False,
     )
 
-    assert runner.shader_topology == "long_no_hsl"
+    assert runner.shader_topology == "generic"
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_coin_hsl_rolling_pnl_window_expires_and_resets_fill_events():
-    import passivbot_rust
-
-    dense_round_trip_count = 2_096
-    fills_per_round_trip = 4
-    assert MPS_DIRECTIONAL_HSL_ROLLING_CAPACITY >= dense_round_trip_count
-    probe_kernel = r"""
-kernel void passivbot_hsl_rolling_pnl_probe(
-    device float2* values,
-    device int2* indices,
-    device float* output,
-    uint b [[thread_position_in_grid]]
-) {
-    if (b > 0) return;
-    HslRollingPnlWindow window = init_hsl_rolling_pnl_window();
-    const int capacity = 4;
-    const int lookback_bars = 2;
-    record_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 0, lookback_bars, true, 50.0f
-    );
-    HslRollingPnlSignal first = effective_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 0, lookback_bars
-    );
-    record_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 1, lookback_bars, true, -80.0f
-    );
-    HslRollingPnlSignal second = effective_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 1, lookback_bars
-    );
-    HslRollingPnlSignal expired = effective_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 3, lookback_bars
-    );
-    record_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 4, lookback_bars, true, 55.0f
-    );
-    HslRollingPnlSignal final_signal = effective_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 4, lookback_bars
-    );
-    reset_hsl_rolling_pnl_window(window);
-    HslRollingPnlSignal reset_signal = effective_hsl_rolling_pnl(
-        window, values, indices, 0, capacity, 4, lookback_bars
-    );
-
-    output[0] = first.peak;
-    output[1] = first.current;
-    output[2] = second.peak;
-    output[3] = second.current;
-    output[4] = expired.peak;
-    output[5] = expired.current;
-    output[6] = final_signal.peak;
-    output[7] = final_signal.current;
-    output[8] = reset_signal.peak;
-    output[9] = reset_signal.current;
-
-    HslRollingPnlWindow inactive = init_hsl_rolling_pnl_window();
-    record_hsl_rolling_pnl(
-        inactive, values, indices, 4, 2, 0, 10, false, 1.0f
-    );
-    record_hsl_rolling_pnl(
-        inactive, values, indices, 4, 2, 1, 10, false, 1.0f
-    );
-    record_hsl_rolling_pnl(
-        inactive, values, indices, 4, 2, 2, 10, false, 1.0f
-    );
-    output[10] = inactive.overflowed ? 1.0f : 0.0f;
-
-    HslRollingPnlWindow overflow = init_hsl_rolling_pnl_window();
-    record_hsl_rolling_pnl(
-        overflow, values, indices, 4, 2, 0, 10, true, 1.0f
-    );
-    record_hsl_rolling_pnl(
-        overflow, values, indices, 4, 2, 1, 10, true, 1.0f
-    );
-    record_hsl_rolling_pnl(
-        overflow, values, indices, 4, 2, 2, 10, true, 1.0f
-    );
-    output[11] = overflow.overflowed ? 1.0f : 0.0f;
-
-    HslRollingPnlWindow dense = init_hsl_rolling_pnl_window();
-    for (int k = 0; k < __DENSE_ROUND_TRIP_COUNT__; ++k) {
-        for (int fill = 0; fill < __FILLS_PER_ROUND_TRIP__; ++fill) {
-            record_hsl_rolling_pnl(
-                dense, values, indices, 6, __DENSE_CAPACITY__, k,
-                __DENSE_ROUND_TRIP_COUNT__ + 1, true, -0.1f
-            );
-        }
-        record_hsl_rolling_pnl(
-            dense, values, indices, 6, __DENSE_CAPACITY__, k,
-            __DENSE_ROUND_TRIP_COUNT__ + 1, true, 1.0f
-        );
-    }
-    output[12] = dense.overflowed ? 1.0f : 0.0f;
-    output[13] = float(dense.event_count);
-
-    HslRollingPnlWindow coalesced = init_hsl_rolling_pnl_window();
-    record_hsl_rolling_pnl(
-        coalesced, values, indices, 6, __DENSE_CAPACITY__, 0, 2, true, 50.0f
-    );
-    record_hsl_rolling_pnl(
-        coalesced, values, indices, 6, __DENSE_CAPACITY__, 0, 2, true, -80.0f
-    );
-    HslRollingPnlSignal coalesced_signal = effective_hsl_rolling_pnl(
-        coalesced, values, indices, 6, __DENSE_CAPACITY__, 0, 2
-    );
-    output[14] = coalesced_signal.peak;
-    output[15] = coalesced_signal.current;
-    output[16] = float(coalesced.event_count);
-}
-""".replace(
-        "__DENSE_ROUND_TRIP_COUNT__", str(dense_round_trip_count)
-    ).replace("__FILLS_PER_ROUND_TRIP__", str(fills_per_round_trip)).replace(
-        "__DENSE_CAPACITY__", str(MPS_DIRECTIONAL_HSL_ROLLING_CAPACITY)
-    )
-    buffer_size = 6 + MPS_DIRECTIONAL_HSL_ROLLING_CAPACITY
-    values = torch.empty((buffer_size, 2), dtype=torch.float32, device=gpu_device())
-    indices = torch.empty((buffer_size, 2), dtype=torch.int32, device=gpu_device())
-    output = torch.zeros(17, dtype=torch.float32, device=gpu_device())
-    library = compile_shader(
-        passivbot_rust.mps_ema_anchor_source_py() + probe_kernel
-    )
-
-    library.passivbot_hsl_rolling_pnl_probe(
-        values, indices, output, threads=(1, 1, 1)
-    )
-    synchronize()
-
-    assert output.cpu().tolist() == [
-        50.0,
-        50.0,
-        50.0,
-        -30.0,
-        0.0,
-        -80.0,
-        55.0,
-        55.0,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-        0.0,
-        float(dense_round_trip_count),
-        50.0,
-        -30.0,
-        1.0,
-    ]
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_hsl_strategy_equity_recovery_matches_exact_rust_recurrence():
     import passivbot_rust
 
@@ -1232,9 +1063,7 @@ kernel void passivbot_hsl_strategy_equity_recovery_probe(
         device=gpu_device(),
     )
     output = torch.zeros(2, dtype=torch.float32, device=gpu_device())
-    library = compile_shader(
-        passivbot_rust.mps_ema_anchor_source_py() + probe_kernel
-    )
+    library = compile_shader(passivbot_rust.mps_ema_anchor_source_py() + probe_kernel)
 
     library.passivbot_hsl_strategy_equity_recovery_probe(
         samples, output, threads=(1, 1, 1)
@@ -1250,9 +1079,7 @@ kernel void passivbot_hsl_strategy_equity_recovery_probe(
     assert output[1].item() == 3.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_hsl_drawdown_ema_tail_reducer_matches_exact_unambiguous_bins():
     import passivbot_rust
 
@@ -1276,22 +1103,16 @@ kernel void passivbot_hsl_drawdown_ema_tail_probe(
         device=gpu_device(),
     )
     output = torch.zeros(1, dtype=torch.float32, device=gpu_device())
-    source = _with_hsl_ema_tail(
-        passivbot_rust.mps_ema_anchor_source_py(), True
-    )
+    source = _with_hsl_ema_tail(passivbot_rust.mps_ema_anchor_source_py(), True)
     library = compile_shader(source + probe_kernel)
-    library.passivbot_hsl_drawdown_ema_tail_probe(
-        samples, output, threads=(1, 1, 1)
-    )
+    library.passivbot_hsl_drawdown_ema_tail_probe(samples, output, threads=(1, 1, 1))
     synchronize()
 
     # floor(200 * 1%) is two, and the two worst values occupy the highest bin.
     assert output.item() == pytest.approx(0.4, abs=1.0e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_hsl_strategy_equity_raw_drawdown_matches_exact_peak_contract():
     import passivbot_rust
 
@@ -1335,177 +1156,7 @@ kernel void passivbot_hsl_strategy_equity_raw_drawdown_probe(
     assert output[1].item() == pytest.approx(0.2, abs=1.0e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_joint_pside_hsl_contract_routes_unified_and_directional_signals():
-    import passivbot_rust
-
-    probe_kernel = r"""
-kernel void passivbot_joint_pside_hsl_contract_probe(
-    constant float* hsl_params,
-    constant float* samples,
-    constant float* settings,
-    constant int* sizes,
-    device float* output,
-    uint b [[thread_position_in_grid]]
-) {
-    const int B = sizes[0];
-    const int T = sizes[1];
-    if (b >= uint(B)) return;
-    const int po = int(b) * 22;
-    HslState long_hsl = load_hsl(hsl_params, po, 0);
-    HslState short_hsl = load_hsl(hsl_params, po, 11);
-    const float starting_balance = settings[0];
-    const float interval_ms = settings[1];
-    JointPortfolioAccount account = init_joint_portfolio_account(starting_balance);
-    float unrealized_long = 0.0f;
-    float unrealized_short = 0.0f;
-    bool has_position_long = false;
-    bool has_position_short = false;
-    for (int k = 0; k < T; ++k) {
-        int so = (int(b) * T + k) * 8;
-        account.realized_pnl_long = samples[so + 0];
-        account.realized_pnl_short = samples[so + 1];
-        account.realized_pnl_total = account.realized_pnl_long
-            + account.realized_pnl_short;
-        account.realized_pnl_peak = fmax(
-            account.realized_pnl_peak, account.realized_pnl_total
-        );
-        account.balance = starting_balance + account.realized_pnl_total;
-        unrealized_long = samples[so + 2];
-        unrealized_short = samples[so + 3];
-        has_position_long = samples[so + 4] > 0.5f;
-        has_position_short = samples[so + 5] > 0.5f;
-        bool blocking_long = samples[so + 6] > 0.5f;
-        bool blocking_short = samples[so + 7] > 0.5f;
-        update_joint_pside_hsl(
-            long_hsl, short_hsl, account, starting_balance,
-            unrealized_long, unrealized_short,
-            has_position_long, has_position_short,
-            blocking_long, blocking_short, float(k), interval_ms
-        );
-        try_restart_joint_pside_hsl(
-            long_hsl, short_hsl, account, starting_balance,
-            unrealized_long, unrealized_short, float(k)
-        );
-    }
-    int oo = int(b) * 62;
-    output[oo + 0] = float(long_hsl.tier);
-    output[oo + 1] = float(short_hsl.tier);
-    output[oo + 2] = long_hsl.triggers;
-    output[oo + 3] = short_hsl.triggers;
-    output[oo + 4] = float(hsl_mode(long_hsl, has_position_long));
-    output[oo + 5] = float(hsl_mode(short_hsl, has_position_short));
-    output[oo + 6] = joint_portfolio_equity(
-        account, unrealized_long, unrealized_short
-    );
-    output[oo + 7] = float(joint_pside_hsl_global_tier(long_hsl, short_hsl));
-    long_hsl.halt_duration_sum_steps = 2.0f;
-    long_hsl.halt_duration_max_steps = 2.0f;
-    long_hsl.halt_duration_count = 1.0f;
-    short_hsl.halt_duration_sum_steps = 3.0f;
-    short_hsl.halt_duration_max_steps = 3.0f;
-    short_hsl.halt_duration_count = 1.0f;
-    long_hsl.panic_loss_drawdown_min = 0.2f;
-    long_hsl.panic_loss_drawdown_sum = 0.2f;
-    long_hsl.panic_loss_drawdown_max = 0.2f;
-    long_hsl.panic_loss_drawdown_count = 1.0f;
-    short_hsl.panic_loss_drawdown_min = 0.1f;
-    short_hsl.panic_loss_drawdown_sum = 0.1f;
-    short_hsl.panic_loss_drawdown_max = 0.1f;
-    short_hsl.panic_loss_drawdown_count = 1.0f;
-    write_dual_side_hsl_outputs(
-        long_hsl, short_hsl, 4.0f, 1.0f, 2.0f, 3.0f, -1.0f,
-        output, oo + 8
-    );
-    HslState long_coin_hsl[2];
-    HslState short_coin_hsl[2];
-    long_coin_hsl[0] = long_hsl;
-    long_coin_hsl[1] = long_hsl;
-    short_coin_hsl[0] = short_hsl;
-    short_coin_hsl[1] = short_hsl;
-    write_dual_side_coin_hsl_outputs(
-        long_coin_hsl, short_coin_hsl, 2,
-        4.0f, 1.0f, 2.0f, 3.0f, -1.0f,
-        output, oo + 35
-    );
-}
-"""
-
-    def controller(mode):
-        return [
-            1.0,
-            0.05,
-            1.0,
-            0.0,
-            1.0,
-            2.0,
-            0.5,
-            0.75,
-            0.0,
-            float(mode),
-            1.0,
-        ]
-
-    params = torch.tensor(
-        [
-            controller(0) + controller(0),
-            controller(1) + controller(1),
-            controller(2) + controller(2),
-            controller(0) + controller(1),
-            controller(0) + controller(0),
-        ],
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    samples = torch.zeros((5, 4, 8), dtype=torch.float32, device=gpu_device())
-    samples[:, :2, 4] = 1.0
-    samples[:, :2, 5] = 1.0
-    samples[:, 1:, 3] = -10.0
-    samples[4, :, 4] = 1.0
-    settings = torch.tensor([100.0, 60_000.0], device=gpu_device())
-    sizes = torch.tensor([5, 4], dtype=torch.int32, device=gpu_device())
-    output = torch.zeros((5, 62), dtype=torch.float32, device=gpu_device())
-
-    library = compile_shader(
-        passivbot_rust.mps_ema_anchor_multicoin_source_py() + probe_kernel
-    )
-    library.passivbot_joint_pside_hsl_contract_probe(
-        params,
-        samples,
-        settings,
-        sizes,
-        output,
-        threads=(5, 1, 1),
-    )
-    synchronize()
-    values = output.cpu().numpy()
-
-    assert values[0, :4].tolist() == [3.0, 3.0, 1.0, 1.0]
-    assert values[1, :4].tolist() == [0.0, 3.0, 0.0, 1.0]
-    assert values[2, :4].tolist() == [0.0, 0.0, 0.0, 0.0]
-    assert values[3, :4].tolist() == [0.0, 0.0, 0.0, 0.0]
-    assert values[4, :4].tolist() == [3.0, 3.0, 0.0, 0.0]
-    assert values[:, 6].tolist() == [90.0, 90.0, 90.0, 90.0, 90.0]
-    assert values[:, 7].tolist() == [3.0, 3.0, 0.0, 0.0, 3.0]
-    assert values[0, 8:14].tolist() == [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
-    assert values[1, 8:14].tolist() == [1.0, 1.0, 0.0, 1.0, 0.0, 0.0]
-    assert values[:, 14:18].tolist() == [[4.0, 1.0, 2.0, 3.0]] * 5
-    assert values[:, 18:21].tolist() == [[5.0, 3.0, 2.0]] * 5
-    np.testing.assert_allclose(values[:, 29:33], [[0.1, 0.3, 0.2, 2.0]] * 5)
-    assert (values[:, 33:35] >= 0.0).all()
-    assert values[0, 35:41].tolist() == [1.0, 1.0, 2.0, 2.0, 0.0, 0.0]
-    assert values[1, 35:41].tolist() == [1.0, 1.0, 0.0, 2.0, 0.0, 0.0]
-    assert values[:, 41:45].tolist() == [[4.0, 1.0, 2.0, 3.0]] * 5
-    assert values[:, 45:48].tolist() == [[10.0, 3.0, 4.0]] * 5
-    np.testing.assert_allclose(values[:, 56:60], [[0.1, 0.6, 0.2, 4.0]] * 5)
-    np.testing.assert_allclose(values[:, 60:62], values[:, 33:35])
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_side_states_are_isolated_for_fused_execution():
     import passivbot_rust
 
@@ -1557,9 +1208,7 @@ kernel void passivbot_ema_multicoin_side_state_isolation_probe(
     assert output.cpu().tolist() == [1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 11.0, 15.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_fused_reducers_share_loss_budget_and_fallback():
     import passivbot_rust
 
@@ -1693,9 +1342,7 @@ kernel void passivbot_ema_multicoin_fused_reducer_budget_probe(
     assert output.cpu().tolist() == [0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 1.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_side_states_are_isolated_for_fused_execution():
     import passivbot_rust
 
@@ -1719,14 +1366,14 @@ kernel void passivbot_tm_multicoin_side_state_isolation_probe(
     short_side.hsl.enabled = false;
     long_side.coin_hsl[0].triggers = 7.0f;
     short_side.coin_hsl[0].triggers = 8.0f;
-    long_side.coin_hsl_entry_blocked_mask = 9ul;
-    short_side.coin_hsl_entry_blocked_mask = 10ul;
-    long_side.selection_initialized = true;
-    short_side.selection_initialized = false;
+    long_side.entry_qty[0] = 9.0f;
+    short_side.entry_qty[0] = 10.0f;
+    long_side.incumbent[0] = true;
+    short_side.incumbent[0] = false;
     long_side.max_tradable_seen = 11;
     short_side.max_tradable_seen = 12;
-    long_side.previous_effective_n_positions = 13;
-    short_side.previous_effective_n_positions = 14;
+    long_side.score[0] = 13;
+    short_side.score[0] = 14;
     output[0] = long_side.psize[0];
     output[1] = short_side.psize[0];
     output[2] = float(long_side.entry_tick[0]);
@@ -1738,22 +1385,21 @@ kernel void passivbot_tm_multicoin_side_state_isolation_probe(
     output[7] = long_side.coin_hsl[0].triggers
         + short_side.coin_hsl[0].triggers;
     output[8] = float(
-        long_side.coin_hsl_entry_blocked_mask
-            + short_side.coin_hsl_entry_blocked_mask
+        long_side.entry_qty[0]
+            + short_side.entry_qty[0]
     );
-    output[9] = long_side.selection_initialized
-        && !short_side.selection_initialized ? 1.0f : 0.0f;
+    output[9] = long_side.incumbent[0]
+        && !short_side.incumbent[0] ? 1.0f : 0.0f;
     output[10] = float(long_side.max_tradable_seen);
     output[11] = float(short_side.max_tradable_seen);
-    output[12] = float(long_side.previous_effective_n_positions);
-    output[13] = float(short_side.previous_effective_n_positions);
+    output[12] = float(long_side.score[0]);
+    output[13] = float(short_side.score[0]);
 }
 """
 
     output = torch.zeros(14, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_side_state_isolation_probe(
         output,
@@ -1779,9 +1425,7 @@ kernel void passivbot_tm_multicoin_side_state_isolation_probe(
     ]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_fill_state_shares_directional_accounting():
     import passivbot_rust
 
@@ -1837,12 +1481,9 @@ kernel void passivbot_tm_multicoin_fill_state_probe(
 
     output = torch.zeros(18, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
-    library.passivbot_tm_multicoin_fill_state_probe(
-        output, threads=(1, 1, 1)
-    )
+    library.passivbot_tm_multicoin_fill_state_probe(output, threads=(1, 1, 1))
     synchronize()
 
     assert output.cpu().tolist() == [
@@ -1867,9 +1508,7 @@ kernel void passivbot_tm_multicoin_fill_state_probe(
     ]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_close_fill_centralizes_hsl_accounting():
     import passivbot_rust
 
@@ -1885,11 +1524,10 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
     TrailingMartingaleMulticoinSideState short_side;
     long_side.hsl = load_hsl(hsl_params, 0, 0);
     long_side.coin_hsl[0] = load_hsl(hsl_params, 0, 0);
-    short_side.hsl = load_hsl(hsl_params, 11, 0);
-    short_side.coin_hsl[0] = load_hsl(hsl_params, 11, 0);
+    short_side.hsl = load_hsl(hsl_params, 7, 0);
+    short_side.coin_hsl[0] = load_hsl(hsl_params, 7, 0);
     long_side.coin_realized_pnl[0] = 0.0f;
     short_side.coin_realized_pnl[0] = 0.0f;
-    long_side.coin_hsl[0].coin_realized_baseline = -20.0f;
     JointPortfolioAccount account = init_joint_portfolio_account(1000.0f);
     TrailingMartingaleMulticoinFillState fills =
         init_trailing_martingale_multicoin_fill_state();
@@ -1920,7 +1558,7 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
     output[11] = short_equity;
     output[12] = long_side.coin_realized_pnl[0];
     output[13] = short_side.coin_realized_pnl[0];
-    output[14] = long_side.coin_hsl[0].coin_realized_peak;
+    output[14] = long_side.coin_realized_pnl[0];
     output[15] = long_side.coin_hsl[0].panic_event_start_equity;
     output[16] = long_side.coin_hsl[0].panic_event_loss;
     output[17] = short_side.hsl.panic_event_start_equity;
@@ -1935,10 +1573,6 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
             0.2,
             60.0,
             0.0,
-            1.0,
-            1.0,
-            0.5,
-            0.75,
             0.0,
             2.0,
             1.0,
@@ -1946,10 +1580,6 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
             0.2,
             60.0,
             0.0,
-            1.0,
-            1.0,
-            0.5,
-            0.75,
             0.0,
             1.0,
             1.0,
@@ -1960,8 +1590,7 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
     coin_fill_counts = torch.zeros(1, dtype=torch.float32, device=gpu_device())
     output = torch.zeros(20, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_close_fill_probe(
         hsl_params, coin_fill_counts, output, threads=(1, 1, 1)
@@ -1983,7 +1612,7 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
         989.0,
         -11.0,
         -11.0,
-        9.0,
+        -11.0,
         1000.0,
         11.0,
         989.0,
@@ -1992,9 +1621,7 @@ kernel void passivbot_tm_multicoin_close_fill_probe(
     ]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_entry_fill_centralizes_hsl_accounting():
     import passivbot_rust
 
@@ -2010,11 +1637,10 @@ kernel void passivbot_tm_multicoin_entry_fill_probe(
     TrailingMartingaleMulticoinSideState short_side;
     long_side.hsl = load_hsl(hsl_params, 0, 0);
     long_side.coin_hsl[0] = load_hsl(hsl_params, 0, 0);
-    short_side.hsl = load_hsl(hsl_params, 11, 0);
-    short_side.coin_hsl[0] = load_hsl(hsl_params, 11, 0);
+    short_side.hsl = load_hsl(hsl_params, 7, 0);
+    short_side.coin_hsl[0] = load_hsl(hsl_params, 7, 0);
     long_side.coin_realized_pnl[0] = 0.0f;
     short_side.coin_realized_pnl[0] = 0.0f;
-    long_side.coin_hsl[0].coin_realized_baseline = -20.0f;
     JointPortfolioAccount account = init_joint_portfolio_account(1000.0f);
     TrailingMartingaleMulticoinFillState fills =
         init_trailing_martingale_multicoin_fill_state();
@@ -2043,7 +1669,7 @@ kernel void passivbot_tm_multicoin_entry_fill_probe(
     output[9] = short_equity;
     output[10] = long_side.coin_realized_pnl[0];
     output[11] = short_side.coin_realized_pnl[0];
-    output[12] = long_side.coin_hsl[0].coin_realized_peak;
+    output[12] = long_side.coin_realized_pnl[0];
     output[13] = fills.profit_sum;
     output[14] = fills.loss_sum;
     output[15] = coin_fill_counts[0];
@@ -2056,10 +1682,6 @@ kernel void passivbot_tm_multicoin_entry_fill_probe(
             0.2,
             60.0,
             0.0,
-            1.0,
-            1.0,
-            0.5,
-            0.75,
             0.0,
             2.0,
             1.0,
@@ -2067,10 +1689,6 @@ kernel void passivbot_tm_multicoin_entry_fill_probe(
             0.2,
             60.0,
             0.0,
-            1.0,
-            1.0,
-            0.5,
-            0.75,
             0.0,
             1.0,
             1.0,
@@ -2081,8 +1699,7 @@ kernel void passivbot_tm_multicoin_entry_fill_probe(
     coin_fill_counts = torch.zeros(1, dtype=torch.float32, device=gpu_device())
     output = torch.zeros(16, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_entry_fill_probe(
         hsl_params, coin_fill_counts, output, threads=(1, 1, 1)
@@ -2102,16 +1719,14 @@ kernel void passivbot_tm_multicoin_entry_fill_probe(
         990.0,
         -10.0,
         -10.0,
-        10.0,
+        -10.0,
         0.0,
         0.0,
         2.0,
     ]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_fill_position_helpers_preserve_chronology():
     import passivbot_rust
 
@@ -2185,12 +1800,9 @@ kernel void passivbot_tm_multicoin_fill_position_probe(
 
     output = torch.zeros(24, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
-    library.passivbot_tm_multicoin_fill_position_probe(
-        output, threads=(1, 1, 1)
-    )
+    library.passivbot_tm_multicoin_fill_position_probe(output, threads=(1, 1, 1))
     synchronize()
 
     np.testing.assert_allclose(
@@ -2226,9 +1838,7 @@ kernel void passivbot_tm_multicoin_fill_position_probe(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_side_fill_pass_shares_account_chronology():
     import passivbot_rust
 
@@ -2250,8 +1860,8 @@ kernel void passivbot_tm_multicoin_side_fill_pass_probe(
     if (b > 0) return;
     TrailingMartingaleMulticoinSideState long_side;
     TrailingMartingaleMulticoinSideState short_side;
-    TrailingMartingaleMulticoinSideConfig long_config;
-    TrailingMartingaleMulticoinSideConfig short_config;
+    TrailingMartingaleMulticoinSideConfig long_config = {};
+    TrailingMartingaleMulticoinSideConfig short_config = {};
     long_config.coin_hsl_mode = false;
     short_config.coin_hsl_mode = false;
     long_side.hsl = load_hsl(hsl_params, 0, 0);
@@ -2368,7 +1978,9 @@ kernel void passivbot_tm_multicoin_side_fill_pass_probe(
     touch_nearest_ticks = torch.zeros(3, dtype=torch.int32, device=gpu_device())
     touch_min_qty_bits = torch.zeros(3, dtype=torch.int32, device=gpu_device())
     touch_min_qty_relation = torch.zeros(
-        3, dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
+        3,
+        dtype=torch.int8 if gpu_device() == "cuda" else torch.int32,
+        device=gpu_device(),
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 1.0
@@ -2377,18 +1989,20 @@ kernel void passivbot_tm_multicoin_side_fill_pass_probe(
     coin_settings[0, 4] = 1.0
     coin_settings[0, 7] = 10.0
     coin_overrides = torch.full(
-        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
     hsl_params = torch.tensor(
-        [1.0, 0.2, 60.0, 0.0, 1.0, 1.0, 0.5, 0.75, 0.0, 1.0, 1.0],
+        [1.0, 0.2, 60.0, 0.0, 0.0, 1.0, 1.0],
         dtype=torch.float32,
         device=gpu_device(),
     )
     coin_fill_counts = torch.zeros(1, dtype=torch.float32, device=gpu_device())
     output = torch.zeros(16, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_side_fill_pass_probe(
         bars,
@@ -2408,16 +2022,30 @@ kernel void passivbot_tm_multicoin_side_fill_pass_probe(
 
     np.testing.assert_allclose(
         output.cpu().numpy(),
-        [1.0, 1000.0, 0.0, 4.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0,
-         1.0, 2.0, 2.0, 1.0, 0.4, 4.0],
+        [
+            1.0,
+            1000.0,
+            0.0,
+            4.0,
+            2.0,
+            2.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0,
+            2.0,
+            1.0,
+            0.4,
+            4.0,
+        ],
         rtol=1e-5,
         atol=1e-6,
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_selection_phase_keeps_side_local_hsl_rankings():
     import passivbot_rust
 
@@ -2430,10 +2058,10 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
     uint b [[thread_position_in_grid]]
 ) {
     if (b > 0) return;
-    TrailingMartingaleMulticoinSideState long_side;
-    TrailingMartingaleMulticoinSideState short_side;
-    TrailingMartingaleMulticoinSideConfig long_config;
-    TrailingMartingaleMulticoinSideConfig short_config;
+    TrailingMartingaleMulticoinSideState long_side = {};
+    TrailingMartingaleMulticoinSideState short_side = {};
+    TrailingMartingaleMulticoinSideConfig long_config = {};
+    TrailingMartingaleMulticoinSideConfig short_config = {};
     long_config.coin_hsl_mode = true;
     short_config.coin_hsl_mode = false;
     long_config.volume_drop = 0.0f;
@@ -2448,17 +2076,11 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
     short_config.initial_ema_dist = 0.0f;
     long_config.n_positions = 1;
     short_config.n_positions = 1;
-    long_side.selection_initialized = false;
-    short_side.selection_initialized = false;
-    long_side.previous_effective_n_positions = 0;
-    short_side.previous_effective_n_positions = 0;
-    long_side.coin_hsl_entry_blocked_mask = 0ul;
-    short_side.coin_hsl_entry_blocked_mask = 0ul;
-    long_side.one_way_initial_blocked_mask = 0ul;
-    short_side.one_way_initial_blocked_mask = 0ul;
     for (int c = 0; c < 3; ++c) {
         long_side.psize[c] = 0.0f;
         short_side.psize[c] = 0.0f;
+        long_side.entry_qty[c] = 0.0f;
+        short_side.entry_qty[c] = 0.0f;
         long_side.selected[c] = false;
         short_side.selected[c] = false;
         long_side.incumbent[c] = false;
@@ -2479,7 +2101,6 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
         long_side.coin_hsl[c].halted = false;
         long_side.coin_hsl[c].tier = 0;
         long_side.coin_hsl[c].red_active_now = false;
-        long_side.coin_hsl[c].orange_graceful_stop = false;
     }
     ulong long_selection_blocked_mask = 0ul;
     ulong short_selection_blocked_mask = 0ul;
@@ -2494,8 +2115,7 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
     );
     // Block the long side's highest-volume coin without affecting short.
     long_side.coin_hsl[0].enabled = true;
-    long_side.coin_hsl[0].tier = 2;
-    long_side.coin_hsl[0].orange_graceful_stop = true;
+    long_side.coin_hsl[0].hsl.action = 1; // Flat scope in cooldown.
     update_tm_multicoin_side_selection(
         long_side, long_config, bars, coin_settings, coin_overrides,
         1, 3, false, true, 1, 0.0f, 0ul, false, 0.0f
@@ -2508,12 +2128,6 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
         output[c] = long_side.selected[c] ? 1.0f : 0.0f;
         output[3 + c] = short_side.selected[c] ? 1.0f : 0.0f;
     }
-    output[6] = long_side.selection_initialized ? 1.0f : 0.0f;
-    output[7] = short_side.selection_initialized ? 1.0f : 0.0f;
-    output[8] = float(long_side.previous_effective_n_positions);
-    output[9] = float(short_side.previous_effective_n_positions);
-    output[10] = float(long_side.coin_hsl_entry_blocked_mask);
-    output[11] = float(short_side.coin_hsl_entry_blocked_mask);
     // Mimic a new opposite-held block on short's highest-ranked coin.
     // The changed mask must force reselection onto the next candidate.
     update_tm_multicoin_side_selection(
@@ -2521,13 +2135,12 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
         1, 3, true, false, 1, 0.0f, 4ul, false, 0.0f
     );
     for (int c = 0; c < 3; ++c) {
-        output[12 + c] = short_side.selected[c] ? 1.0f : 0.0f;
+        output[6 + c] = short_side.selected[c] ? 1.0f : 0.0f;
     }
-    output[15] = float(short_side.one_way_initial_blocked_mask);
-    output[16] = float(long_selection_blocked_mask);
-    output[17] = float(short_selection_blocked_mask);
-    output[18] = float(long_order_blocked_mask);
-    output[19] = float(short_order_blocked_mask);
+    output[9] = float(long_selection_blocked_mask);
+    output[10] = float(short_selection_blocked_mask);
+    output[11] = float(long_order_blocked_mask);
+    output[12] = float(short_order_blocked_mask);
     // Coin one is the current flat incumbent, but its validity window ended
     // at k=1. With no fill or mask change, k=2 must still evict it and select
     // the only surviving unblocked candidate.
@@ -2536,7 +2149,7 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
         2, 3, true, false, 1, 0.0f, 4ul, false, 0.0f
     );
     for (int c = 0; c < 3; ++c) {
-        output[20 + c] = short_side.selected[c] ? 1.0f : 0.0f;
+        output[13 + c] = short_side.selected[c] ? 1.0f : 0.0f;
     }
 }
 """
@@ -2554,12 +2167,17 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
     coin_settings[:, 7] = 10.0
     coin_settings[1, 7] = 1.0
     coin_overrides = torch.full(
-        (3, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (3, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
-    output = torch.zeros(23, dtype=torch.float32, device=gpu_device())
+    output = torch.zeros(16, dtype=torch.float32, device=gpu_device())
 
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py().replace(
+            "constant int MAX_COINS = 64;", "constant int MAX_COINS = 3;"
+        )
         + probe_kernel
     )
     library.passivbot_tm_multicoin_selection_phase_probe(
@@ -2570,33 +2188,24 @@ kernel void passivbot_tm_multicoin_selection_phase_probe(
     assert output.cpu().tolist() == [
         0.0,
         1.0,
+        0.0,  # Long excludes its HSL-blocked top-ranked coin.
         0.0,
         0.0,
-        0.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.0,
+        1.0,  # Short ranks independently.
         0.0,
         1.0,
-        0.0,
-        4.0,
-        0.0,
+        0.0,  # Opposite-held block changes short selection.
         0.0,
         0.0,
-        7.0,
+        0.0,
+        7.0,  # Selection and order one-way masks.
         1.0,
         0.0,
-        0.0,
+        0.0,  # Expired flat incumbent is evicted without a fill.
     ]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_order_phase_builds_both_sides_on_shared_account():
     import passivbot_rust
 
@@ -2670,14 +2279,12 @@ kernel void passivbot_tm_multicoin_order_phase_probe(
     _, row = _multicoin_exposure_fixture(
         "trailing_martingale", "long", count=3, closes=(100.0, 100.0)
     )
-    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-        "entry_initial_ema_dist"
-    )] = 0.01
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_ema_dist")] = 0.01
     row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("gate_initial")] = 1.0
     short_row = list(row)
-    short_row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-        "entry_initial_qty_pct"
-    )] = 0.5
+    short_row[
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_qty_pct")
+    ] = 0.5
     params = torch.tensor([row, short_row], dtype=torch.float32, device=gpu_device())
     bars = torch.tensor(
         [[[100.0, 100.0, 100.0, 1.0]], [[101.0, 99.0, 100.0, 1.0]]],
@@ -2694,7 +2301,9 @@ kernel void passivbot_tm_multicoin_order_phase_probe(
     )
     touch_min_qty_bits = torch.zeros((2, 1), dtype=torch.int32, device=gpu_device())
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
+        (2, 1),
+        dtype=torch.int8 if gpu_device() == "cuda" else torch.int32,
+        device=gpu_device(),
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.001
@@ -2705,13 +2314,15 @@ kernel void passivbot_tm_multicoin_order_phase_probe(
     coin_settings[0, 9] = 100.0
     coin_settings[0, 10] = 1.0
     coin_overrides = torch.full(
-        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
     output = torch.zeros(11, dtype=torch.float32, device=gpu_device())
 
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_order_phase_probe(
         bars,
@@ -2737,345 +2348,7 @@ kernel void passivbot_tm_multicoin_order_phase_probe(
     assert values[8:].tolist() == [0.0, 0.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_tm_multicoin_dual_hsl_phase_covers_all_signal_topologies():
-    import passivbot_rust
-
-    probe_kernel = r"""
-kernel void passivbot_tm_multicoin_dual_hsl_phase_probe(
-    constant float* params,
-    constant float* bars,
-    constant float* invalid_bars,
-    constant float* coin_settings,
-    device float* output,
-    uint b [[thread_position_in_grid]]
-) {
-    if (b >= 8) return;
-    int po = int(b) * 22;
-    TrailingMartingaleMulticoinSideState long_side;
-    TrailingMartingaleMulticoinSideState short_side;
-    TrailingMartingaleMulticoinSideConfig long_config;
-    TrailingMartingaleMulticoinSideConfig short_config;
-    long_side.hsl = load_hsl(params, po, 0);
-    short_side.hsl = load_hsl(params, po + 11, 0);
-    long_config.coin_hsl_mode =
-        long_side.hsl.signal_mode == HSL_SIGNAL_COIN;
-    short_config.coin_hsl_mode =
-        short_side.hsl.signal_mode == HSL_SIGNAL_COIN;
-    long_side.coin_hsl[0] = long_side.hsl;
-    short_side.coin_hsl[0] = short_side.hsl;
-    long_side.coin_realized_pnl[0] = 0.0f;
-    short_side.coin_realized_pnl[0] = 0.0f;
-    long_side.psize[0] = (b == 4 || b == 5) ? 1.0f : 0.0f;
-    short_side.psize[0] = 0.0f;
-    long_side.pprice[0] = 100.0f;
-    short_side.pprice[0] = 100.0f;
-    long_side.entry_qty[0] = 0.0f;
-    short_side.entry_qty[0] = 0.0f;
-    long_side.close_qty[0] = 0.0f;
-    short_side.close_qty[0] = 0.0f;
-    long_side.secondary_close_qty[0] = 0.0f;
-    short_side.secondary_close_qty[0] = 0.0f;
-
-    JointPortfolioAccount account = init_joint_portfolio_account(100.0f);
-    account.realized_pnl_total = 0.0f;
-    account.realized_pnl_long = 0.0f;
-    account.realized_pnl_short = 0.0f;
-    account.balance = 100.0f;
-    bool all_valid = true;
-    bool sample_enabled = false;
-    int sampled_tier = 0;
-    float triggers_while_long_open = -1.0f;
-    for (int k = 1; k <= 5; ++k) {
-        if (k == 2) {
-            account.realized_pnl_total = -10.0f;
-            account.realized_pnl_long = b == 7 ? 0.0f : -10.0f;
-            account.realized_pnl_short = b == 7 ? -10.0f : 0.0f;
-            account.balance = 90.0f;
-            long_side.coin_realized_pnl[0] = b == 7 ? 0.0f : -10.0f;
-            short_side.coin_realized_pnl[0] = b == 7 ? -10.0f : 0.0f;
-        }
-        if (b == 4 && k == 4) long_side.psize[0] = 0.0f;
-        constant float* selected_bars = b == 5 ? invalid_bars : bars;
-        int long_slots = b == 7 ? 0 : 1;
-        int short_slots = b == 6 ? 0 : 1;
-        bool valid = update_tm_multicoin_dual_side_hsl(
-            long_side, long_config, long_slots,
-            short_side, short_config, short_slots,
-                account, selected_bars, coin_settings, k, 0, 1,
-            100.0f, 60000.0f, sample_enabled, sampled_tier
-        );
-        all_valid = all_valid && valid;
-        if (b == 4 && k == 3) {
-            triggers_while_long_open = long_side.hsl.triggers;
-        }
-    }
-    int oo = int(b) * 12;
-    output[oo + 0] = all_valid ? 1.0f : 0.0f;
-    output[oo + 1] = sample_enabled ? 1.0f : 0.0f;
-    output[oo + 2] = float(sampled_tier);
-    output[oo + 3] = float(long_side.hsl.tier);
-    output[oo + 4] = float(short_side.hsl.tier);
-    output[oo + 5] = long_side.hsl.triggers;
-    output[oo + 6] = short_side.hsl.triggers;
-    output[oo + 7] = float(long_side.coin_hsl[0].tier);
-    output[oo + 8] = float(short_side.coin_hsl[0].tier);
-    output[oo + 9] = long_side.coin_hsl[0].triggers;
-    output[oo + 10] = short_side.coin_hsl[0].triggers;
-    output[oo + 11] = triggers_while_long_open;
-}
-"""
-
-    def controller(mode):
-        return [
-            1.0,
-            0.05,
-            1.0,
-            0.0,
-            1.0,
-            2.0,
-            0.5,
-            0.75,
-            0.0,
-            float(mode),
-            1.0,
-        ]
-
-    params = torch.tensor(
-        [
-            controller(0) + controller(0),
-            controller(1) + controller(1),
-            controller(2) + controller(2),
-            controller(0) + controller(1),
-            controller(0) + controller(0),
-            controller(0) + controller(0),
-            controller(2) + controller(2),
-            controller(2) + controller(2),
-        ],
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    bars = torch.tensor(
-        [[[100.0, 100.0, 100.0, 0.0]]] * 6,
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    invalid_bars = bars.clone()
-    invalid_bars[:, 0, 2] = float("nan")
-    coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
-    coin_settings[0, 4] = 1.0
-    coin_settings[0, 6] = 0.0
-    coin_settings[0, 7] = 5.0
-    output = torch.zeros((8, 12), dtype=torch.float32, device=gpu_device())
-
-    library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
-    )
-    library.passivbot_tm_multicoin_dual_hsl_phase_probe(
-        params, bars, invalid_bars, coin_settings, output, threads=(8, 1, 1)
-    )
-    synchronize()
-    values = output.cpu().numpy()
-
-    # Unified mode consumes the shared account signal and requires portfolio
-    # flatness before either controller may halt.
-    assert values[0, :7].tolist() == [1.0, 1.0, 3.0, 3.0, 3.0, 1.0, 1.0]
-    # Pside mode isolates directional strategy PnL.
-    assert values[1, :7].tolist() == [1.0, 1.0, 3.0, 3.0, 0.0, 1.0, 0.0]
-    # Coin mode advances the per-coin controllers, not the pside templates.
-    assert values[2, :7].tolist() == [1.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0]
-    assert values[2, 7:11].tolist() == [3.0, 0.0, 1.0, 0.0]
-    # Mixed topologies fail closed without advancing state.
-    assert values[3, :7].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    # One open long position blocks both unified controllers until the whole
-    # account is flat for two consecutive samples.
-    assert values[4, 5:7].tolist() == [1.0, 1.0]
-    assert values[4, 11] == 0.0
-    # A held coin without a valid mark rejects the sample before mutating any
-    # controller instead of fabricating neutral unrealized PnL.
-    assert values[5, :11].tolist() == [0.0] * 11
-    # Coin HSL skips a side without an effective slot budget while retaining
-    # the active side's controller, matching exact Rust asymmetric tradability.
-    assert values[6, :11].tolist() == [
-        1.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0
-    ]
-    assert values[7, :11].tolist() == [
-        1.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0
-    ]
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_ema_multicoin_dual_hsl_phase_covers_all_signal_topologies():
-    import passivbot_rust
-
-    probe_kernel = r"""
-kernel void passivbot_ema_multicoin_dual_hsl_phase_probe(
-    constant float* params,
-    constant float* bars,
-    constant float* invalid_bars,
-    constant float* coin_settings,
-    device float* output,
-    uint b [[thread_position_in_grid]]
-) {
-    if (b >= 8) return;
-    int po = int(b) * 22;
-    EmaMulticoinSideState long_side;
-    EmaMulticoinSideState short_side;
-    EmaMulticoinSideConfig long_config;
-    EmaMulticoinSideConfig short_config;
-    long_side.hsl = load_hsl(params, po, 0);
-    short_side.hsl = load_hsl(params, po + 11, 0);
-    long_config.coin_hsl_mode =
-        long_side.hsl.signal_mode == HSL_SIGNAL_COIN;
-    short_config.coin_hsl_mode =
-        short_side.hsl.signal_mode == HSL_SIGNAL_COIN;
-    long_side.coin_hsl[0] = long_side.hsl;
-    short_side.coin_hsl[0] = short_side.hsl;
-    long_side.coin_realized_pnl[0] = 0.0f;
-    short_side.coin_realized_pnl[0] = 0.0f;
-    long_side.psize[0] = (b == 4 || b == 5) ? 1.0f : 0.0f;
-    short_side.psize[0] = 0.0f;
-    long_side.pprice[0] = 100.0f;
-    short_side.pprice[0] = 100.0f;
-    long_side.entry_qty[0] = 0.0f;
-    short_side.entry_qty[0] = 0.0f;
-    long_side.close_qty[0] = 0.0f;
-    short_side.close_qty[0] = 0.0f;
-    long_side.secondary_close_qty[0] = 0.0f;
-    short_side.secondary_close_qty[0] = 0.0f;
-
-    JointPortfolioAccount account = init_joint_portfolio_account(100.0f);
-    account.realized_pnl_total = 0.0f;
-    account.realized_pnl_long = 0.0f;
-    account.realized_pnl_short = 0.0f;
-    account.balance = 100.0f;
-    bool all_valid = true;
-    bool sample_enabled = false;
-    int sampled_tier = 0;
-    float triggers_while_long_open = -1.0f;
-    for (int k = 1; k <= 5; ++k) {
-        if (k == 2) {
-            account.realized_pnl_total = -10.0f;
-            account.realized_pnl_long = b == 7 ? 0.0f : -10.0f;
-            account.realized_pnl_short = b == 7 ? -10.0f : 0.0f;
-            account.balance = 90.0f;
-            long_side.coin_realized_pnl[0] = b == 7 ? 0.0f : -10.0f;
-            short_side.coin_realized_pnl[0] = b == 7 ? -10.0f : 0.0f;
-        }
-        if (b == 4 && k == 4) long_side.psize[0] = 0.0f;
-        constant float* selected_bars = b == 5 ? invalid_bars : bars;
-        int long_slots = b == 7 ? 0 : 1;
-        int short_slots = b == 6 ? 0 : 1;
-        bool valid = update_ema_multicoin_dual_side_hsl(
-            long_side, long_config, long_slots,
-            short_side, short_config, short_slots,
-                account, selected_bars, coin_settings, k, 0, 1,
-            100.0f, 60000.0f, sample_enabled, sampled_tier
-        );
-        all_valid = all_valid && valid;
-        if (b == 4 && k == 3) {
-            triggers_while_long_open = long_side.hsl.triggers;
-        }
-    }
-    int oo = int(b) * 12;
-    output[oo + 0] = all_valid ? 1.0f : 0.0f;
-    output[oo + 1] = sample_enabled ? 1.0f : 0.0f;
-    output[oo + 2] = float(sampled_tier);
-    output[oo + 3] = float(long_side.hsl.tier);
-    output[oo + 4] = float(short_side.hsl.tier);
-    output[oo + 5] = long_side.hsl.triggers;
-    output[oo + 6] = short_side.hsl.triggers;
-    output[oo + 7] = float(long_side.coin_hsl[0].tier);
-    output[oo + 8] = float(short_side.coin_hsl[0].tier);
-    output[oo + 9] = long_side.coin_hsl[0].triggers;
-    output[oo + 10] = short_side.coin_hsl[0].triggers;
-    output[oo + 11] = triggers_while_long_open;
-}
-"""
-
-    def controller(mode):
-        return [
-            1.0,
-            0.05,
-            1.0,
-            0.0,
-            1.0,
-            2.0,
-            0.5,
-            0.75,
-            0.0,
-            float(mode),
-            1.0,
-        ]
-
-    params = torch.tensor(
-        [
-            controller(0) + controller(0),
-            controller(1) + controller(1),
-            controller(2) + controller(2),
-            controller(0) + controller(1),
-            controller(0) + controller(0),
-            controller(0) + controller(0),
-            controller(2) + controller(2),
-            controller(2) + controller(2),
-        ],
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    bars = torch.tensor(
-        [[[100.0, 100.0, 100.0, 0.0]]] * 6,
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    invalid_bars = bars.clone()
-    invalid_bars[:, 0, 2] = float("nan")
-    coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
-    coin_settings[0, 4] = 1.0
-    coin_settings[0, 6] = 0.0
-    coin_settings[0, 7] = 5.0
-    output = torch.zeros((8, 12), dtype=torch.float32, device=gpu_device())
-
-    library = compile_shader(
-        passivbot_rust.mps_ema_anchor_multicoin_source_py() + probe_kernel
-    )
-    library.passivbot_ema_multicoin_dual_hsl_phase_probe(
-        params, bars, invalid_bars, coin_settings, output, threads=(8, 1, 1)
-    )
-    synchronize()
-    values = output.cpu().numpy()
-
-    # Unified mode consumes the shared account signal and requires portfolio
-    # flatness before either controller may halt.
-    assert values[0, :7].tolist() == [1.0, 1.0, 3.0, 3.0, 3.0, 1.0, 1.0]
-    # Pside mode isolates directional strategy PnL.
-    assert values[1, :7].tolist() == [1.0, 1.0, 3.0, 3.0, 0.0, 1.0, 0.0]
-    # Coin mode advances the per-coin controllers, not the pside templates.
-    assert values[2, :7].tolist() == [1.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0]
-    assert values[2, 7:11].tolist() == [3.0, 0.0, 1.0, 0.0]
-    # Mixed topologies fail closed without advancing state.
-    assert values[3, :7].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    # One open long position blocks both unified controllers until the whole
-    # account is flat for two consecutive samples.
-    assert values[4, 5:7].tolist() == [1.0, 1.0]
-    assert values[4, 11] == 0.0
-    # A held coin without a valid mark rejects the sample before mutating any
-    # controller instead of fabricating neutral unrealized PnL.
-    assert values[5, :11].tolist() == [0.0] * 11
-    # Coin HSL skips a side without an effective slot budget while retaining
-    # the active side's controller, matching exact Rust asymmetric tradability.
-    assert values[6, :11].tolist() == [
-        1.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0
-    ]
-    assert values[7, :11].tolist() == [
-        1.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0
-    ]
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_candle_helpers_advance_independent_sides():
     import passivbot_rust
 
@@ -3091,8 +2364,8 @@ kernel void passivbot_ema_multicoin_candle_helpers_probe(
     if (b > 0) return;
     EmaMulticoinSideState long_side;
     EmaMulticoinSideState short_side;
-    EmaMulticoinSideConfig long_config;
-    EmaMulticoinSideConfig short_config;
+    EmaMulticoinSideConfig long_config = {};
+    EmaMulticoinSideConfig short_config = {};
     long_config.alpha_forager_volume = 1.0f;
     long_config.alpha_forager_volatility = 1.0f;
     short_config.alpha_forager_volume = 0.5f;
@@ -3218,9 +2491,7 @@ kernel void passivbot_ema_multicoin_candle_helpers_probe(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_candle_helpers_advance_independent_sides():
     import passivbot_rust
 
@@ -3236,8 +2507,8 @@ kernel void passivbot_tm_multicoin_candle_helpers_probe(
     if (b > 0) return;
     TrailingMartingaleMulticoinSideState long_side;
     TrailingMartingaleMulticoinSideState short_side;
-    TrailingMartingaleMulticoinSideConfig long_config;
-    TrailingMartingaleMulticoinSideConfig short_config;
+    TrailingMartingaleMulticoinSideConfig long_config = {};
+    TrailingMartingaleMulticoinSideConfig short_config = {};
     long_config.alpha_forager_volume = 1.0f;
     long_config.alpha_forager_volatility = 1.0f;
     short_config.alpha_forager_volume = 0.5f;
@@ -3330,18 +2601,18 @@ kernel void passivbot_tm_multicoin_candle_helpers_probe(
     coin_settings[:, 4] = 1.0
     coin_settings[:, 7] = 10.0
     coin_overrides = torch.full(
-        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
     coin_overrides[1, 24] = 0.0
-    hour_log_ranges = torch.full(
-        (2, 2), -1.0, dtype=torch.float32, device=gpu_device()
-    )
+    hour_log_ranges = torch.full((2, 2), -1.0, dtype=torch.float32, device=gpu_device())
     hour_log_ranges[1, 0] = np.log(105.0 / 95.0)
     output = torch.zeros(20, dtype=torch.float32, device=gpu_device())
 
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_candle_helpers_probe(
         bars,
@@ -3385,9 +2656,7 @@ kernel void passivbot_tm_multicoin_candle_helpers_probe(
     assert np.isinf(values[19])
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_fill_phase_shares_account_across_sides():
     import passivbot_rust
 
@@ -3524,9 +2793,7 @@ kernel void passivbot_ema_multicoin_shared_fill_phase_probe(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_selection_phase_keeps_side_local_rankings():
     import passivbot_rust
 
@@ -3541,8 +2808,8 @@ kernel void passivbot_ema_multicoin_selection_phase_probe(
     if (b > 0) return;
     EmaMulticoinSideState long_side;
     EmaMulticoinSideState short_side;
-    EmaMulticoinSideConfig long_config;
-    EmaMulticoinSideConfig short_config;
+    EmaMulticoinSideConfig long_config = {};
+    EmaMulticoinSideConfig short_config = {};
     long_config.coin_hsl_mode = false;
     short_config.coin_hsl_mode = false;
     long_config.volume_drop = 0.0f;
@@ -3640,7 +2907,7 @@ kernel void passivbot_ema_multicoin_selection_phase_probe(
     // out of the Forager selection even when its exchange minimum is small.
     long_config.twel = 1.0f;
     long_config.allowance_pct = 0.0f;
-    long_config.legacy_raw_allowance = false;
+    long_config.scale_budget_allowance = false;
     long_config.base_qty_pct = 1.0f;
     long_side.selection_initialized = false;
     long_side.previous_effective_n_positions = 0;
@@ -3713,9 +2980,7 @@ kernel void passivbot_ema_multicoin_selection_phase_probe(
     ]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_order_phase_builds_both_sides_on_shared_account():
     import passivbot_rust
 
@@ -3835,11 +3100,11 @@ kernel void passivbot_ema_multicoin_order_phase_probe(
 
 
 def _single_coin_exposure_fields(
-    *, allowance_pct=0.0, legacy_raw=False, entry_gate=True, threshold=1.0
+    *, allowance_pct=0.0, scale_budget=False, entry_gate=True, threshold=1.0
 ):
     return [
         allowance_pct,
-        float(legacy_raw),
+        float(scale_budget),
         float(entry_gate),
         threshold,
     ]
@@ -3870,6 +3135,21 @@ def _tm_twel_enforcer_fields(
     ] + list(_HSL_DISABLED_VALUES.values())
 
 
+_ADAPTIVE_DISABLED_VALUES = dict(
+    zip(
+        (
+            "entry_cooldown_min_duration_minutes",
+            "entry_cooldown_max_duration_minutes",
+            "entry_cooldown_exposure_weight",
+            "entry_cooldown_adverse_weight",
+            "unilateralness_ema_span_1m",
+            "forager_score_weights_unilateralness",
+            "unilateralness_window",
+        ),
+        (0.0, -1.0, 0.0, 0.0, 60.0, 0.0, 1200.0),
+    )
+)
+
 _UNSTUCK_DISABLED_VALUES = {
     "unstuck_enabled": 0.0,
     "unstuck_ema_gating_enabled": 1.0,
@@ -3884,11 +3164,7 @@ _HSL_DISABLED_VALUES = {
     "hsl_red_threshold": 0.2,
     "hsl_ema_span_minutes": 60.0,
     "hsl_cooldown_minutes_after_red": 0.0,
-    "hsl_no_restart_drawdown_threshold": 1.0,
-    "hsl_restart_policy": 1.0,
-    "hsl_tier_ratio_yellow": 0.5,
-    "hsl_tier_ratio_orange": 0.75,
-    "hsl_orange_graceful_stop": 0.0,
+    "hsl_restart_policy": 2.0,
     "hsl_signal_mode": 0.0,
     "hsl_slot_count": 1.0,
 }
@@ -3897,6 +3173,7 @@ _HSL_DISABLED_VALUES = {
 def _single_coin_param_row(values, keys):
     merged = {
         **_UNSTUCK_DISABLED_VALUES,
+        **_ADAPTIVE_DISABLED_VALUES,
         "unstuck_ema_span_0": 2.0,
         "unstuck_ema_span_1": 3.0,
         **_HSL_DISABLED_VALUES,
@@ -3936,6 +3213,7 @@ def test_single_coin_interval_packing_scales_only_elapsed_minute_inputs(
             "hsl_cooldown_minutes_after_red": 7.5,
         }
     )
+    side.update(_ADAPTIVE_DISABLED_VALUES)
     original = np.asarray(
         [[side[key] for key in keys] * 2], dtype=np.float64
     )
@@ -3974,6 +3252,7 @@ def test_single_coin_interval_packing_compounds_hsl_elapsed_minute_decay(span):
         key: float(index + 1)
         for index, key in enumerate(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS)
     }
+    side.update(_ADAPTIVE_DISABLED_VALUES)
     side["hsl_ema_span_minutes"] = span
     original = np.asarray(
         [[side[key] for key in EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS] * 2],
@@ -3992,9 +3271,7 @@ def test_single_coin_interval_packing_compounds_hsl_elapsed_minute_decay(span):
         offset = side_index * len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS)
         effective_span = scaled[
             0,
-            offset + EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS.index(
-                "hsl_ema_span_minutes"
-            ),
+            offset + EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS.index("hsl_ema_span_minutes"),
         ]
         alpha_5m = 2.0 / (effective_span + 1.0)
         assert alpha_5m == pytest.approx(1.0 - (1.0 - alpha_1m) ** 5)
@@ -4007,6 +3284,12 @@ def test_single_coin_interval_packing_preserves_one_minute_hsl_span_exactly():
         dtype=np.float64,
     ).reshape(1, -1)
     for side_index in range(2):
+        for key, value in _ADAPTIVE_DISABLED_VALUES.items():
+            values[
+                0,
+                side_index * len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS)
+                + EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS.index(key),
+            ] = value
         values[
             0,
             side_index * len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS)
@@ -4023,74 +3306,8 @@ def test_single_coin_interval_packing_preserves_one_minute_hsl_span_exactly():
     assert np.array_equal(scaled, values)
 
 
-def test_single_coin_interval_packing_matches_exact_rust_hsl_elapsed_decay():
-    import passivbot_rust
-
-    side = {
-        key: float(index + 1)
-        for index, key in enumerate(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS)
-    }
-    side["hsl_ema_span_minutes"] = 60.0
-    original = np.asarray(
-        [[side[key] for key in EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS] * 2],
-        dtype=np.float64,
-    )
-    scaled = _scale_single_coin_minute_parameters(
-        original,
-        EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS,
-        sides=2,
-        interval_minutes=5.0,
-    )
-    effective_span = scaled[
-        0,
-        EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS.index("hsl_ema_span_minutes"),
-    ]
-    exact = passivbot_rust.EquityHardStopRuntime()
-    packed = passivbot_rust.EquityHardStopRuntime()
-    common = {
-        "red_threshold": 0.25,
-        "tier_ratio_yellow": 0.5,
-        "tier_ratio_orange": 0.75,
-    }
-    exact.apply_sample(
-        timestamp_ms=0,
-        equity=100.0,
-        peak_strategy_equity=100.0,
-        ema_span_minutes=60.0,
-        **common,
-    )
-    packed.apply_sample(
-        timestamp_ms=0,
-        equity=100.0,
-        peak_strategy_equity=100.0,
-        ema_span_minutes=effective_span,
-        **common,
-    )
-
-    exact_step = exact.apply_sample(
-        timestamp_ms=5 * 60_000,
-        equity=90.0,
-        peak_strategy_equity=100.0,
-        ema_span_minutes=60.0,
-        **common,
-    )
-    packed_step = packed.apply_sample(
-        timestamp_ms=60_000,
-        equity=90.0,
-        peak_strategy_equity=100.0,
-        ema_span_minutes=effective_span,
-        **common,
-    )
-
-    assert exact_step["drawdown_ema"] == pytest.approx(
-        packed_step["drawdown_ema"]
-    )
-
-
 def test_single_coin_interval_packing_rejects_invalid_interval():
-    values = np.zeros(
-        (1, len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS) * 2), dtype=np.float64
-    )
+    values = np.zeros((1, len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS) * 2), dtype=np.float64)
 
     with pytest.raises(ValueError, match="at least one minute"):
         _scale_single_coin_minute_parameters(
@@ -4119,6 +3336,7 @@ def test_multicoin_ema_interval_packing_scales_forager_and_directional_spans():
             "hsl_cooldown_minutes_after_red": 35.0,
         }
     )
+    values.update(_ADAPTIVE_DISABLED_VALUES)
     original = np.asarray(
         [[values[key] for key in EMA_ANCHOR_MULTICOIN_PARAM_KEYS] * 2],
         dtype=np.float64,
@@ -4142,20 +3360,24 @@ def test_multicoin_ema_interval_packing_scales_forager_and_directional_spans():
             ("entry_cooldown_minutes", 3.0),
             ("hsl_cooldown_minutes_after_red", 7.0),
         ):
-            assert scaled[0, offset + EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(key)] == expected
-        assert scaled[
-            0,
-            offset
-            + EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(
-                "offset_volatility_ema_span_1h"
-            ),
-        ] == 24.0
+            assert (
+                scaled[0, offset + EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(key)]
+                == expected
+            )
+        assert (
+            scaled[
+                0,
+                offset
+                + EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(
+                    "offset_volatility_ema_span_1h"
+                ),
+            ]
+            == 24.0
+        )
 
 
 def test_multicoin_ema_interval_packing_scales_only_finite_coin_overrides():
-    overrides = np.full(
-        (2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float64
-    )
+    overrides = np.full((2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float64)
     ema0_column = EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS.index("ema_span_0")
     ema1_column = EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS.index("ema_span_1")
     volatility_1m_column = EMA_ANCHOR_COIN_OVERRIDE_STRATEGY_KEYS.index(
@@ -4200,14 +3422,9 @@ def test_multicoin_tm_interval_packing_scales_forager_and_directional_spans():
             "hsl_cooldown_minutes_after_red": 35.0,
         }
     )
+    values.update(_ADAPTIVE_DISABLED_VALUES)
     original = np.asarray(
-        [
-            [
-                values[key]
-                for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-            ]
-            * 2
-        ],
+        [[values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS] * 2],
         dtype=np.float64,
     )
 
@@ -4229,26 +3446,30 @@ def test_multicoin_tm_interval_packing_scales_forager_and_directional_spans():
             ("entry_cooldown_minutes", 3.0),
             ("hsl_cooldown_minutes_after_red", 7.0),
         ):
-            assert scaled[
+            assert (
+                scaled[
+                    0,
+                    offset + TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key),
+                ]
+                == expected
+            )
+        assert (
+            scaled[
                 0,
-                offset + TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key),
-            ] == expected
-        assert scaled[
-            0,
-            offset
-            + TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "volatility_ema_span_1h"
-            ),
-        ] == 24.0
+                offset
+                + TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
+                    "volatility_ema_span_1h"
+                ),
+            ]
+            == 24.0
+        )
 
 
 def test_multicoin_tm_interval_packing_scales_only_finite_coin_overrides():
     overrides = np.full(
         (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float64
     )
-    override_keys = tuple(
-        key for key, _path in TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS
-    )
+    override_keys = tuple(key for key, _path in TRAILING_MARTINGALE_COIN_OVERRIDE_PATHS)
     ema0_column = override_keys.index("ema_span_0")
     ema1_column = override_keys.index("ema_span_1")
     volatility_1m_column = override_keys.index("volatility_ema_span_1m")
@@ -4269,19 +3490,14 @@ def test_multicoin_tm_interval_packing_scales_only_finite_coin_overrides():
     assert scaled[0, ema1_column] == 10.0
     assert scaled[0, volatility_1m_column] == 20.0
     assert scaled[0, volatility_1h_column] == 24.0
-    assert (
-        scaled[0, TRAILING_MARTINGALE_COIN_OVERRIDE_COOLDOWN_COLUMN]
-        == 3.0
-    )
+    assert scaled[0, TRAILING_MARTINGALE_COIN_OVERRIDE_COOLDOWN_COLUMN] == 3.0
     assert scaled[0, hsl_cooldown_column] == 4.0
     alpha_7m = 2.0 / (float(scaled[0, hsl_span_column]) + 1.0)
     assert alpha_7m == pytest.approx(1.0 - (1.0 - 2.0 / 61.0) ** 7)
     assert np.isnan(scaled[1]).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_single_coin_five_minute_shader_smoke(strategy_kind):
     from optimization.gpu.mps_kernel import (
@@ -4295,10 +3511,7 @@ def test_mps_single_coin_five_minute_shader_smoke(strategy_kind):
     close = 100.0 + np.sin(phase)
     high = close * 1.01
     low = close * 0.99
-    timestamps = (
-        1_700_000_000_000
-        + np.arange(count, dtype=np.int64) * interval_ms
-    )
+    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * interval_ms
     market = ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
     run = ProxyRun(
         1_000.0,
@@ -4329,7 +3542,7 @@ def test_mps_single_coin_five_minute_shader_smoke(strategy_kind):
                 "entry_cooldown_minutes": 2.0,
                 "total_wallet_exposure_limit": 1.0,
                 "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
+                "hsl_scale_budget_with_excess_allowance": 0.0,
                 "twel_entry_gate_enabled": 1.0,
                 "twel_enforcer_threshold": 1.0,
                 "twel_enforcer_enabled": 0.0,
@@ -4343,16 +3556,20 @@ def test_mps_single_coin_five_minute_shader_smoke(strategy_kind):
         row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("ema_span_0")] = 10.0
         row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("ema_span_1")] = 30.0
         row[
-            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-                "entry_cooldown_minutes"
-            )
+            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_cooldown_minutes")
         ] = 2.0
         runner_cls = MpsTrailingMartingaleRunner
         keys = TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS
     params = np.asarray([row + row], dtype=np.float64)
 
     runner = runner_cls(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=0,
+        hsl_enabled=False,
+        long_enabled=True,
+        short_enabled=False,
     )
     packed = runner._pack_params(params)
     output = runner.run(params)
@@ -4360,20 +3577,14 @@ def test_mps_single_coin_five_minute_shader_smoke(strategy_kind):
 
     assert runner.interval_minutes == 5.0
     assert packed[0, keys.index("ema_span_0")] == pytest.approx(2.0)
-    assert packed[0, keys.index("entry_cooldown_minutes")] == pytest.approx(
-        0.4
-    )
+    assert packed[0, keys.index("entry_cooldown_minutes")] == pytest.approx(0.4)
     packed_hsl_span = packed[0, keys.index("hsl_ema_span_minutes")]
-    assert 2.0 / (packed_hsl_span + 1.0) == pytest.approx(
-        1.0 - (1.0 - 2.0 / 61.0) ** 5
-    )
+    assert 2.0 / (packed_hsl_span + 1.0) == pytest.approx(1.0 - (1.0 - 2.0 / 61.0) ** 5)
     assert output["balance"].device.type == gpu_device()
     assert torch.isfinite(output["balance"]).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("hsl_enabled", [False, True])
@@ -4435,7 +3646,7 @@ def test_mps_single_coin_invalid_tail_matches_forced_delist_boundary(
                 "entry_cooldown_minutes": 100.0,
                 "total_wallet_exposure_limit": 1.0,
                 "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
+                "hsl_scale_budget_with_excess_allowance": 0.0,
                 "twel_entry_gate_enabled": 1.0,
                 "twel_enforcer_threshold": 1.0,
                 "twel_enforcer_enabled": 0.0,
@@ -4447,9 +3658,7 @@ def test_mps_single_coin_invalid_tail_matches_forced_delist_boundary(
     else:
         row = _tm_single_row(initial_ema_dist=0.01)
         row[
-            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-                "entry_cooldown_minutes"
-            )
+            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_cooldown_minutes")
         ] = 100.0
         runner_cls = MpsTrailingMartingaleRunner
         keys = TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS
@@ -4460,11 +3669,7 @@ def test_mps_single_coin_invalid_tail_matches_forced_delist_boundary(
             "hsl_red_threshold": 0.005,
             "hsl_ema_span_minutes": 1.0,
             "hsl_cooldown_minutes_after_red": 0.0,
-            "hsl_no_restart_drawdown_threshold": 1.0,
             "hsl_restart_policy": 2.0,
-            "hsl_tier_ratio_yellow": 0.5,
-            "hsl_tier_ratio_orange": 0.75,
-            "hsl_orange_graceful_stop": 0.0,
             "hsl_signal_mode": 0.0,
             "hsl_slot_count": 1.0,
         }.items():
@@ -4478,6 +3683,7 @@ def test_mps_single_coin_invalid_tail_matches_forced_delist_boundary(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         **runner_kwargs,
@@ -4496,28 +3702,21 @@ def test_mps_single_coin_invalid_tail_matches_forced_delist_boundary(
         assert output["hsl_panic_close_loss_sum"].item() > 0.0
     else:
         assert output[size_key].item() > 0.0
-    assert output["day_end_eq"][0, 0].item() == pytest.approx(
-        output["balance"].item()
-    )
+    assert output["day_end_eq"][0, 0].item() == pytest.approx(output["balance"].item())
     if hsl_enabled:
         expected_hsl_samples = (
-            (output["last_eq_ts"] - output["first_eq_ts"]) / 60_000.0 + 1.0
-        )
+            output["last_eq_ts"] - output["first_eq_ts"]
+        ) / 60_000.0 + 1.0
         assert output["hsl_tier_samples_total"].item() == pytest.approx(
             expected_hsl_samples.item()
         )
-        assert output["hsl_tier_samples_red"].item() > 0.0
-        assert (
-            output["hsl_tier_samples_red"].item()
-            < output["hsl_tier_samples_total"].item()
-        )
-        if not forced_delist:
-            assert output[f"hsl_triggers_{side}"].item() == 0.0
+        # The delisting close itself is the RED terminal sample; once flat,
+        # subsequent bars are cooldown, not retained panic.
+        assert output[f"hsl_triggers_{side}"].item() == 1.0
+        assert output["hsl_tier_samples_red"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_single_coin_forced_delist_closes_both_hedged_sides(strategy_kind):
     from optimization.gpu.mps_kernel import (
@@ -4569,7 +3768,7 @@ def test_mps_single_coin_forced_delist_closes_both_hedged_sides(strategy_kind):
                 "entry_cooldown_minutes": 100.0,
                 "total_wallet_exposure_limit": 1.0,
                 "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
+                "hsl_scale_budget_with_excess_allowance": 0.0,
                 "twel_entry_gate_enabled": 1.0,
                 "twel_enforcer_threshold": 1.0,
                 "twel_enforcer_enabled": 0.0,
@@ -4581,9 +3780,7 @@ def test_mps_single_coin_forced_delist_closes_both_hedged_sides(strategy_kind):
     else:
         row = _tm_single_row(initial_ema_dist=0.01)
         row[
-            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-                "entry_cooldown_minutes"
-            )
+            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_cooldown_minutes")
         ] = 100.0
         runner_cls = MpsTrailingMartingaleRunner
         runner_kwargs = {"hsl_enabled": False}
@@ -4592,6 +3789,7 @@ def test_mps_single_coin_forced_delist_closes_both_hedged_sides(strategy_kind):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=True,
@@ -4609,9 +3807,7 @@ def test_mps_single_coin_forced_delist_closes_both_hedged_sides(strategy_kind):
     assert output["hsl_panic_close_loss_sum"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("inactive_hsl_enabled", [False, True])
 def test_mps_single_coin_service_dispatches_forced_delist_tail(
@@ -4628,10 +3824,7 @@ def test_mps_single_coin_service_dispatches_forced_delist_tail(
     hlcvs[: last_valid + 1, 0] = [100.0, 100.0, 100.0, 1.0]
     hlcvs[entry_k, 0, 1] = 98.0
     hlcvs[last_valid, 0] = [80.0, 80.0, 80.0, 1.0]
-    timestamps = (
-        1_700_000_000_000
-        + np.arange(count, dtype=np.int64) * 60_000
-    )
+    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     market_settings = {
         "BTC": {
             "qty_step": 0.001,
@@ -4717,7 +3910,7 @@ def test_mps_single_coin_service_dispatches_forced_delist_tail(
             "strategy_eq_recovery_days_p99",
         },
     )
-    assert proxy.runner.shader_topology == "long_no_hsl"
+    assert proxy.runner.shader_topology == "generic"
     result = proxy.evaluate([{}])[0]
     exact_fills, _, exact_analysis = run_backtest(
         hlcvs,
@@ -4734,9 +3927,7 @@ def test_mps_single_coin_service_dispatches_forced_delist_tail(
     )
     assert np.isfinite(result["entry_interval_hours_max"])
     assert np.isfinite(result["strategy_eq_recovery_days_p99"])
-    assert result["adg_btc"] == pytest.approx(
-        exact_analysis["adg_btc"], rel=2.0e-3
-    )
+    assert result["adg_btc"] == pytest.approx(exact_analysis["adg_btc"], rel=2.0e-3)
     assert result["drawdown_worst_btc"] == pytest.approx(
         exact_analysis["drawdown_worst_btc"], rel=2.0e-3
     )
@@ -4778,9 +3969,7 @@ def test_mps_single_coin_service_dispatches_forced_delist_tail(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize(
     ("topology", "hedge_mode"),
@@ -4822,15 +4011,12 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
             "warmup_minutes_requested": 1,
         },
     }
-    enabled_sides = (
-        ("long", "short") if topology == "fused" else (topology,)
-    )
+    enabled_sides = ("long", "short") if topology == "fused" else (topology,)
     config = get_template_config()
     config["live"]["strategy_kind"] = strategy_kind
     config["live"]["max_warmup_minutes"] = 1
     config["live"]["approved_coins"] = {
-        side: ["ETH"] if side in enabled_sides else []
-        for side in ("long", "short")
+        side: ["ETH"] if side in enabled_sides else [] for side in ("long", "short")
     }
     config["live"]["hedge_mode"] = hedge_mode
     config["backtest"]["coins"] = {"bybit": ["ETH"]}
@@ -4840,7 +4026,7 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
         risk = config["bot"][side]["risk"]
         risk["total_wallet_exposure_limit"] = 0.9 if enabled else 0.0
         risk["n_positions"] = 1 if enabled else 0
-        risk["entry_cooldown_minutes"] = 0.0
+        config["bot"][side]["entry_cooldown"]["base_duration_minutes"] = 0.0
         risk["we_excess_allowance_pct"] = 0.0
         risk["total_exposure_entry_gate_enabled"] = False
         risk["position_exposure_enforcer_enabled"] = False
@@ -4868,9 +4054,7 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
             locked_key = "offset"
             locked_value = 0.01
         else:
-            strategy = config["bot"][side]["strategy"][
-                "trailing_martingale"
-            ]
+            strategy = config["bot"][side]["strategy"]["trailing_martingale"]
             strategy["entry"]["ema_span_0"] = 2.0
             strategy["entry"]["ema_span_1"] = 3.0
             strategy["entry"]["initial_qty_pct"] = 0.1
@@ -4889,7 +4073,6 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
         candidate[f"{side}_unstuck_close_pct"] = 0.9
         candidate[f"{side}_hsl_red_threshold"] = 0.8
         risk_patch = {
-            "entry_cooldown_minutes": 1_000.0,
             "we_excess_allowance_pct": 0.25,
         }
         if strategy_kind == "trailing_martingale":
@@ -4904,6 +4087,7 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
         side_overrides[side] = {
             "strategy": {strategy_kind: strategy_patch},
             "risk": risk_patch,
+            "entry_cooldown": {"base_duration_minutes": 1000.0},
             "wallet_exposure_limit": 0.4,
             "unstuck": {"close_pct": 0.2},
             "hsl": {"red_threshold": 0.2},
@@ -4932,13 +4116,11 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
         ] == pytest.approx(1_000.0)
         assert parameter_matrix[
             0,
-            side_offset
-            + proxy.param_keys.index("total_wallet_exposure_limit"),
+            side_offset + proxy.param_keys.index("total_wallet_exposure_limit"),
         ] == pytest.approx(0.9)
         assert parameter_matrix[
             0,
-            side_offset
-            + proxy.param_keys.index("wallet_exposure_limit"),
+            side_offset + proxy.param_keys.index("wallet_exposure_limit"),
         ] == pytest.approx(0.4)
         assert parameter_matrix[
             0, side_offset + proxy.param_keys.index("we_excess_allowance_pct")
@@ -4968,9 +4150,7 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
     )
 
     assert result["fills_per_day"] > 0.0
-    fill_rate_drift = abs(
-        result["fills_per_day"] - exact_analysis["fills_per_day"]
-    )
+    fill_rate_drift = abs(result["fills_per_day"] - exact_analysis["fills_per_day"])
     # TM's float32 screening path may cross one recursive fill boundary that
     # exact Rust's float64 path does not. The exact optimizer validation remains
     # authoritative; this matrix is proving override dispatch and bounded drift.
@@ -4981,14 +4161,10 @@ def test_mps_single_coin_overrides_shadow_candidates_and_track_exact(
     assert fill_count_equivalent_drift <= allowed_fill_drift + 1.0e-9
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
-def test_mps_multicoin_service_dispatches_forced_delist_tail(
-    strategy_kind, topology
-):
+def test_mps_multicoin_service_dispatches_forced_delist_tail(strategy_kind, topology):
     from backtest import run_backtest
     from config.schema import get_template_config
     from optimization.gpu.service import MpsMulticoinProxy
@@ -5014,10 +4190,7 @@ def test_mps_multicoin_service_dispatches_forced_delist_tail(
         delist_close,
         1.0,
     ]
-    timestamps = (
-        1_700_000_000_000
-        + np.arange(count, dtype=np.int64) * 60_000
-    )
+    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     market_settings = {
         coin: {
             "qty_step": 0.001,
@@ -5042,12 +4215,9 @@ def test_mps_multicoin_service_dispatches_forced_delist_tail(
     config = get_template_config()
     config["live"]["strategy_kind"] = strategy_kind
     config["live"]["max_warmup_minutes"] = 1
-    enabled_sides = (
-        ("long", "short") if topology == "fused" else (topology,)
-    )
+    enabled_sides = ("long", "short") if topology == "fused" else (topology,)
     config["live"]["approved_coins"] = {
-        side: ["BTC"] if side in enabled_sides else []
-        for side in ("long", "short")
+        side: ["BTC"] if side in enabled_sides else [] for side in ("long", "short")
     }
     config["live"]["hedge_mode"] = topology == "fused"
     config["backtest"]["coins"] = {"bybit": ["BTC", "ETH"]}
@@ -5057,7 +4227,7 @@ def test_mps_multicoin_service_dispatches_forced_delist_tail(
         risk = config["bot"][side]["risk"]
         risk["total_wallet_exposure_limit"] = 0.1 if enabled else 0.0
         risk["n_positions"] = 1 if enabled else 0
-        risk["entry_cooldown_minutes"] = 100.0
+        config["bot"][side]["entry_cooldown"]["base_duration_minutes"] = 100.0
         risk["we_excess_allowance_pct"] = 0.0
         risk["position_exposure_enforcer_enabled"] = False
         risk["total_exposure_enforcer_enabled"] = False
@@ -5075,9 +4245,7 @@ def test_mps_multicoin_service_dispatches_forced_delist_tail(
                 }
             )
         else:
-            strategy = config["bot"][side]["strategy"][
-                "trailing_martingale"
-            ]
+            strategy = config["bot"][side]["strategy"]["trailing_martingale"]
             strategy["entry"]["ema_span_0"] = 2.0
             strategy["entry"]["ema_span_1"] = 3.0
             strategy["entry"]["initial_qty_pct"] = 1.0
@@ -5132,13 +4300,9 @@ def test_mps_multicoin_service_dispatches_forced_delist_tail(
     assert np.isfinite(result["entry_interval_hours_max"])
     assert np.isfinite(result["strategy_eq_recovery_days_p99"])
     exact_order_types = {row[13] for row in exact_fills}
-    expected_panic_types = {
-        f"close_panic_{side}" for side in enabled_sides
-    }
+    expected_panic_types = {f"close_panic_{side}" for side in enabled_sides}
     assert expected_panic_types <= exact_order_types
-    assert result["adg_btc"] == pytest.approx(
-        exact_analysis["adg_btc"], rel=2.0e-3
-    )
+    assert result["adg_btc"] == pytest.approx(exact_analysis["adg_btc"], rel=2.0e-3)
     assert result["drawdown_worst_btc"] == pytest.approx(
         exact_analysis["drawdown_worst_btc"], rel=2.0e-3
     )
@@ -5183,13 +4347,9 @@ def test_mps_multicoin_service_dispatches_forced_delist_tail(
         )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
-@pytest.mark.parametrize(
-    "topology", ["long", "short", "fused-hedge", "fused-one-way"]
-)
+@pytest.mark.parametrize("topology", ["long", "short", "fused-hedge", "fused-one-way"])
 @pytest.mark.parametrize(
     ("count", "first_valid_indices", "last_valid_indices"),
     [
@@ -5216,10 +4376,7 @@ def test_mps_multicoin_service_matches_exact_declared_all_invalid_time(
         hlcvs[3, 0, 1] = 80.0
     if topology in {"short", "fused-hedge", "fused-one-way"}:
         hlcvs[3, 0, 0] = 120.0
-    timestamps = (
-        1_700_000_000_000
-        + np.arange(count, dtype=np.int64) * 60_000
-    )
+    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     market_settings = {
         coin: {
             "qty_step": 0.001,
@@ -5246,12 +4403,9 @@ def test_mps_multicoin_service_matches_exact_declared_all_invalid_time(
     config = get_template_config()
     config["live"]["strategy_kind"] = strategy_kind
     config["live"]["max_warmup_minutes"] = 1
-    enabled_sides = (
-        ("long", "short") if topology.startswith("fused-") else (topology,)
-    )
+    enabled_sides = ("long", "short") if topology.startswith("fused-") else (topology,)
     config["live"]["approved_coins"] = {
-        side: ["BTC"] if side in enabled_sides else []
-        for side in ("long", "short")
+        side: ["BTC"] if side in enabled_sides else [] for side in ("long", "short")
     }
     config["live"]["hedge_mode"] = topology == "fused-hedge"
     config["backtest"]["coins"] = {"bybit": ["BTC", "ETH"]}
@@ -5262,7 +4416,7 @@ def test_mps_multicoin_service_matches_exact_declared_all_invalid_time(
         risk = config["bot"][side]["risk"]
         risk["total_wallet_exposure_limit"] = 0.1 if enabled else 0.0
         risk["n_positions"] = 2 if enabled else 0
-        risk["entry_cooldown_minutes"] = 100.0
+        config["bot"][side]["entry_cooldown"]["base_duration_minutes"] = 100.0
         risk["we_excess_allowance_pct"] = 0.0
         risk["position_exposure_enforcer_enabled"] = False
         risk["total_exposure_enforcer_enabled"] = False
@@ -5282,9 +4436,7 @@ def test_mps_multicoin_service_matches_exact_declared_all_invalid_time(
                 }
             )
         else:
-            strategy = config["bot"][side]["strategy"][
-                "trailing_martingale"
-            ]
+            strategy = config["bot"][side]["strategy"]["trailing_martingale"]
             strategy["entry"]["ema_span_0"] = 2.0
             strategy["entry"]["ema_span_1"] = 3.0
             strategy["entry"]["initial_qty_pct"] = 1.0
@@ -5313,7 +4465,14 @@ def test_mps_multicoin_service_matches_exact_declared_all_invalid_time(
         with pytest.raises(ValueError, match="held-position valuation"):
             proxy.evaluate([{}])
         with pytest.raises(ValueError, match="held-position valuation"):
-            run_backtest(hlcvs, market_settings, config, "bybit", np.full(count, 50_000.0), timestamps)
+            run_backtest(
+                hlcvs,
+                market_settings,
+                config,
+                "bybit",
+                np.full(count, 50_000.0),
+                timestamps,
+            )
         return
     result = proxy.evaluate([{}])[0]
     exact_fills, _, exact_analysis = run_backtest(
@@ -5344,14 +4503,10 @@ def test_mps_multicoin_service_matches_exact_declared_all_invalid_time(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_single_coin_hsl_can_restart_during_invalid_tail(
-    strategy_kind, side
-):
+def test_mps_single_coin_hsl_can_restart_during_invalid_tail(strategy_kind, side):
     from optimization.gpu.mps_kernel import (
         MpsEmaAnchorRunner,
         MpsTrailingMartingaleRunner,
@@ -5402,7 +4557,7 @@ def test_mps_single_coin_hsl_can_restart_during_invalid_tail(
                 "entry_cooldown_minutes": 0.0,
                 "total_wallet_exposure_limit": 1.0,
                 "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
+                "hsl_scale_budget_with_excess_allowance": 0.0,
                 "twel_entry_gate_enabled": 1.0,
                 "twel_enforcer_threshold": 1.0,
                 "twel_enforcer_enabled": 0.0,
@@ -5416,11 +4571,7 @@ def test_mps_single_coin_hsl_can_restart_during_invalid_tail(
         "hsl_red_threshold": 0.01,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 2.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 0.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 0.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -5433,6 +4584,7 @@ def test_mps_single_coin_hsl_can_restart_during_invalid_tail(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         **runner_kwargs,
@@ -5446,9 +4598,7 @@ def test_mps_single_coin_hsl_can_restart_during_invalid_tail(
     assert output["last_eq_ts"].item() > last_valid * run.interval_ms
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_single_coin_active_fill_day_bucket_uses_elapsed_time(
     strategy_kind,
@@ -5529,10 +4679,7 @@ def _multicoin_exposure_fixture(
     if last_valid_indices is None:
         last_valid_indices = (count - 1,) * coin_count
     interval_ms = int(interval_minutes) * 60_000
-    timestamps = (
-        1_700_000_000_000
-        + np.arange(count, dtype=np.int64) * interval_ms
-    )
+    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * interval_ms
     hlcvs = np.empty((count, coin_count, 4), dtype=np.float64)
     close_matrix = np.asarray(closes, dtype=np.float64)
     for coin in range(coin_count):
@@ -5544,15 +4691,12 @@ def _multicoin_exposure_fixture(
         hlcvs[:, coin, 0] = (
             close * 1.01 if highs is None else np.asarray(highs)[:, coin]
         )
-        hlcvs[:, coin, 1] = (
-            close * 0.99 if lows is None else np.asarray(lows)[:, coin]
-        )
+        hlcvs[:, coin, 1] = close * 0.99 if lows is None else np.asarray(lows)[:, coin]
         hlcvs[:, coin, 2] = close
         hlcvs[:, coin, 3] = 100.0 * (coin + 1)
     if markets is None:
         markets = [
-            ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0)
-            for _ in range(coin_count)
+            ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0) for _ in range(coin_count)
         ]
     runs = [
         ProxyRun(
@@ -5598,12 +4742,13 @@ def _multicoin_exposure_fixture(
             "forager_score_weights_volatility": 0.0,
             "n_positions": 2.0,
             "we_excess_allowance_pct": 0.0,
-            "we_excess_allowance_legacy_raw": 0.0,
+            "hsl_scale_budget_with_excess_allowance": 0.0,
             "twel_entry_gate_enabled": 1.0,
             "twel_enforcer_threshold": 1.0,
             "twel_enforcer_enabled": 0.0,
             "twel_enforcer_reduce_portfolio": 0.0,
             **_UNSTUCK_DISABLED_VALUES,
+            **_ADAPTIVE_DISABLED_VALUES,
             "unstuck_ema_span_0": 2.0,
             "unstuck_ema_span_1": 3.0,
             **_HSL_DISABLED_VALUES,
@@ -5612,6 +4757,7 @@ def _multicoin_exposure_fixture(
         runner = MpsEmaAnchorMulticoinRunner(
             runs[0],
             data,
+            pnl_lookback_bars=1440 if interval_minutes == 1 else 0,
             side=side,
             coin_overrides=coin_overrides,
             max_realized_loss_pct=max_realized_loss_pct,
@@ -5661,7 +4807,7 @@ def _multicoin_exposure_fixture(
             "forager_score_weights_volatility": 0.0,
             "n_positions": 2.0,
             "we_excess_allowance_pct": 0.0,
-            "we_excess_allowance_legacy_raw": 0.0,
+            "hsl_scale_budget_with_excess_allowance": 0.0,
             "twel_entry_gate_enabled": 1.0,
             "twel_enforcer_threshold": 1.0,
             "wel_enforcer_enabled": 0.0,
@@ -5669,6 +4815,7 @@ def _multicoin_exposure_fixture(
             "twel_enforcer_enabled": 0.0,
             "twel_enforcer_reduce_portfolio": 0.0,
             **_UNSTUCK_DISABLED_VALUES,
+            **_ADAPTIVE_DISABLED_VALUES,
             "unstuck_ema_span_0": 2.0,
             "unstuck_ema_span_1": 3.0,
             **_HSL_DISABLED_VALUES,
@@ -5677,6 +4824,7 @@ def _multicoin_exposure_fixture(
         runner = MpsTrailingMartingaleMulticoinRunner(
             runs[0],
             data,
+            pnl_lookback_bars=1440 if interval_minutes == 1 else 0,
             side=side,
             coin_overrides=coin_overrides,
             max_realized_loss_pct=max_realized_loss_pct,
@@ -5706,12 +4854,17 @@ def test_ema_disabled_hsl_preserves_optional_fill_counts(
 
     count = 1509 if forced_delist else 313
     steps = np.arange(count)
-    closes = np.column_stack([
-        base * (1.0 + 0.09 * np.sin(steps / 17.0 + coin))
-        for coin, base in enumerate((100.0, 120.0))
-    ])
+    closes = np.column_stack(
+        [
+            base * (1.0 + 0.09 * np.sin(steps / 17.0 + coin))
+            for coin, base in enumerate((100.0, 120.0))
+        ]
+    )
     runner, row, run, _ = _multicoin_exposure_fixture(
-        "ema_anchor", side, count=count, closes=closes,
+        "ema_anchor",
+        side,
+        count=count,
+        closes=closes,
         last_valid_indices=(89, 97) if forced_delist else None,
         markets=[ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001, 0.02)] * 2,
         collect_coin_fill_counts=collect_counts,
@@ -5720,21 +4873,9 @@ def test_ema_disabled_hsl_preserves_optional_fill_counts(
     params = np.asarray([row] * 3, dtype=np.float64)
     params[:, EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("hsl_signal_mode")] = [0, 1, 2]
 
-    def evaluate(compact):
-        runner.hsl_disabled_specialization = compact
-        output = runner.run(params)
-        synchronize()
-        assert runner.dispatch_hsl_disabled is compact
-        # The runner reuses buffers; keep the baseline independent of the next run.
-        return {key: value.cpu().clone() for key, value in output.items()}
-
-    full = evaluate(False)
-    compact = evaluate(True)
-    assert full.keys() == compact.keys()
-    for key in full:
-        np.testing.assert_array_equal(
-            full[key].numpy(), compact[key].numpy(), err_msg=key
-        )
+    output = runner.run(params)
+    synchronize()
+    compact = {key: value.cpu() for key, value in output.items()}
     assert torch.all(compact["fill_count_entry"] > 0)
     assert torch.all(compact["fill_count"] > compact["fill_count_entry"])
     if forced_delist:
@@ -5742,33 +4883,40 @@ def test_ema_disabled_hsl_preserves_optional_fill_counts(
     assert ("coin_fill_counts" in compact) is collect_counts
     if collect_counts:
         torch.testing.assert_close(
-            compact["coin_fill_counts"].sum(dim=1), compact["fill_count"],
-            rtol=0, atol=0,
+            compact["coin_fill_counts"].sum(dim=1),
+            compact["fill_count"],
+            rtol=0,
+            atol=0,
         )
         requested = {"fills_top_symbol_share", "fills_active_symbols_count"}
-        expected_metrics = _fill_activity_metrics(full, run, requested)
-        actual_metrics = _fill_activity_metrics(compact, run, requested)
-        for name in requested:
-            torch.testing.assert_close(
-                actual_metrics[name], expected_metrics[name], rtol=0, atol=0
-            )
+        metrics = _fill_activity_metrics(compact, run, requested)
+        assert torch.all(metrics["fills_active_symbols_count"] == 2)
+        assert torch.all(metrics["fills_top_symbol_share"] >= 0.5)
+        assert torch.all(metrics["fills_top_symbol_share"] <= 1.0)
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("features", [False, True])
 @pytest.mark.parametrize("batch_size", [3, 35])
-def test_tm_multicoin_temporal_replay_preserves_every_output(side, features, batch_size):
+def test_tm_multicoin_temporal_replay_preserves_every_output(
+    side, features, batch_size
+):
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleMulticoinRunner
 
     count = 1513
     steps = np.arange(count)
-    closes = np.column_stack([
-        base * (1 + 0.12 * np.sin(steps / 37.0 + coin))
-        for coin, base in enumerate((100.0, 120.0))
-    ])
+    closes = np.column_stack(
+        [
+            base * (1 + 0.12 * np.sin(steps / 37.0 + coin))
+            for coin, base in enumerate((100.0, 120.0))
+        ]
+    )
     _, row, run, data = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=count, closes=closes,
+        "trailing_martingale",
+        side,
+        count=count,
+        closes=closes,
         requested_start_index=31,
         return_context=True,
     )
@@ -5786,30 +4934,44 @@ def test_tm_multicoin_temporal_replay_preserves_every_output(side, features, bat
         ):
             row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key)] = value
     kwargs = dict(
-        side=side, collect_coin_fill_counts=True,
-        recovery_distribution_enabled=features, entry_interval_enabled=features,
-        hsl_ema_tail_enabled=features, hsl_raw_drawdown_enabled=features,
-        hsl_raw_tail_enabled=features, btc_risk_enabled=features,
+        side=side,
+        collect_coin_fill_counts=True,
+        recovery_distribution_enabled=features,
+        entry_interval_enabled=features,
+        hsl_ema_tail_enabled=features,
+        hsl_raw_drawdown_enabled=features,
+        hsl_raw_tail_enabled=features,
+        btc_risk_enabled=features,
         equity_balance_diff_enabled=features,
         btc_prices=30_000.0 + steps if features else None,
     )
-    generic = MpsTrailingMartingaleMulticoinRunner(run, data, **kwargs)
+    generic = MpsTrailingMartingaleMulticoinRunner(
+        run, data, pnl_lookback_bars=1440, **kwargs
+    )
     # Include empty and early-finished candidates alongside a full replay. The
     # boundary crosses activation, hours, UTC days, and HSL episodes.
     params = np.asarray([row] * batch_size, dtype=np.float64)
     ends = np.resize(np.asarray([1, 123, count - 1], dtype=np.int32), batch_size)
     expected = generic.run(params, end_steps=ends)
-    expected = {key: value.cpu().clone() if isinstance(value, torch.Tensor) else value
-                for key, value in expected.items()}
+    expected = {
+        key: value.cpu().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in expected.items()
+    }
     chunked = MpsTrailingMartingaleMulticoinRunner(
-        run, data, max_dispatch_candidate_bars=batch_size * 2 * 47, **kwargs
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        max_dispatch_candidate_bars=batch_size * 2 * 47,
+        **kwargs,
     )
     for _ in range(2):
         actual = chunked.run(params, profile=True, end_steps=ends)
         assert actual.keys() == expected.keys()
         for key, value in actual.items():
             if isinstance(value, torch.Tensor):
-                torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+                torch.testing.assert_close(
+                    value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+                )
             else:
                 assert value == expected[key]
         assert chunked.last_profile["dispatch_count"] == 33
@@ -5836,7 +4998,11 @@ def test_tm_multicoin_temporal_replay_interrupt_does_not_leak_partial_state():
             raise InterruptedError("test interruption")
 
     chunked = MpsTrailingMartingaleMulticoinRunner(
-        run, data, side="long", max_dispatch_candidate_bars=2 * 7,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        side="long",
+        max_dispatch_candidate_bars=2 * 7,
         interrupt_check=interrupt,
     )
     with pytest.raises(InterruptedError, match="test interruption"):
@@ -5844,7 +5010,9 @@ def test_tm_multicoin_temporal_replay_interrupt_does_not_leak_partial_state():
     chunked.interrupt_check = lambda: None
     actual = chunked.run(matrix)
     for key, value in actual.items():
-        torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+        torch.testing.assert_close(
+            value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+        )
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
@@ -5852,31 +5020,85 @@ def test_tm_multicoin_temporal_replay_preserves_unavailable_valuation():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleMulticoinRunner
 
     generic, row, run, data = _multicoin_exposure_fixture(
-        "trailing_martingale", "long", count=64, last_valid_indices=(24, 63),
+        "trailing_martingale",
+        "long",
+        count=64,
+        last_valid_indices=(24, 63),
         return_context=True,
     )
     chunked = MpsTrailingMartingaleMulticoinRunner(
-        run, data, side="long", max_dispatch_candidate_bars=2 * 7,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        side="long",
+        max_dispatch_candidate_bars=2 * 7,
     )
     for runner in (generic, chunked):
         with pytest.raises(ValueError, match="unavailable held-position valuation"):
             runner.run(np.asarray([row], dtype=np.float64))
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize(
+    "marker,error,message",
+    [
+        (-2, ValueError, "held-position valuation"),
+        (-3, RuntimeError, "PnL history overflow"),
+        (-4, ValueError, "HSL controller inputs"),
+    ],
 )
+def test_tm_multicoin_temporal_continuation_preserves_fatal_marker(
+    side, marker, error, message
+):
+    from optimization.gpu.mps_kernel import MpsTrailingMartingaleMulticoinRunner
+
+    _, row, run, data = _multicoin_exposure_fixture(
+        "trailing_martingale", side, return_context=True
+    )
+    calls = 0
+
+    def inject_failure():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # A completed early dispatch reported fatal input/history failure.
+            # Later real GPU dispatches must not restore state or overwrite it.
+            runner._buffers[1][1][0, 9] = marker
+
+    runner = MpsTrailingMartingaleMulticoinRunner(
+        run,
+        data,
+        side=side,
+        pnl_lookback_bars=1440,
+        max_dispatch_candidate_bars=2 * 7,
+        interrupt_check=inject_failure,
+    )
+    matrix = np.asarray([row], dtype=np.float64)
+    with pytest.raises(error, match=message):
+        runner.run(matrix)
+    assert calls > 2 and runner._buffers[1][1][0, 9].item() == marker
+    runner.interrupt_check = lambda: None
+    assert runner.run(matrix)["alive"].item()  # A new replay resets fatal state.
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_equity_recovery_includes_unrecovered_final_tail(strategy_kind, side):
     count = 32
     final_multiplier = 0.7 if side == "long" else 1.3
-    closes = np.column_stack([
-        np.linspace(initial, initial * final_multiplier, count)
-        for initial in (100.0, 120.0)
-    ])
+    closes = np.column_stack(
+        [
+            np.linspace(initial, initial * final_multiplier, count)
+            for initial in (100.0, 120.0)
+        ]
+    )
     runner, row = _multicoin_exposure_fixture(
-        strategy_kind, side, count=count, closes=closes,
+        strategy_kind,
+        side,
+        count=count,
+        closes=closes,
         highs=closes if side == "long" else closes * 1.01,
         lows=closes * 0.99 if side == "long" else closes,
     )
@@ -5891,9 +5113,7 @@ def test_mps_equity_recovery_includes_unrecovered_final_tail(strategy_kind, side
     assert output["account_recovery_max_ms"].item() == duration.item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_runner_profile_distinguishes_cold_warm_and_disabled(strategy_kind):
     runner, row = _multicoin_exposure_fixture(strategy_kind, "long")
@@ -5925,9 +5145,7 @@ def test_mps_runner_profile_distinguishes_cold_warm_and_disabled(strategy_kind):
     assert second_runner.last_profile == {}
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
 def test_mps_tm_multicoin_entry_intervals_remain_coin_and_side_local(topology):
     count = 45
@@ -5974,6 +5192,7 @@ def test_mps_tm_multicoin_entry_intervals_remain_coin_and_side_local(topology):
         runner = MpsTrailingMartingaleMulticoinFusedRunner(
             run,
             data,
+            pnl_lookback_bars=1440,
             entry_interval_enabled=True,
         )
         candidates = np.asarray([row + row], dtype=np.float64)
@@ -5992,14 +5211,10 @@ def test_mps_tm_multicoin_entry_intervals_remain_coin_and_side_local(topology):
     assert metrics["entry_interval_hours_max"].item() == pytest.approx(1.0 / 3.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("topology", ["single_side", "fused"])
-def test_mps_multicoin_retains_synchronized_btc_risk_surface(
-    strategy_kind, topology
-):
+def test_mps_multicoin_retains_synchronized_btc_risk_surface(strategy_kind, topology):
     _, row, run, data = _multicoin_exposure_fixture(
         strategy_kind, "long", count=5, return_context=True
     )
@@ -6012,21 +5227,21 @@ def test_mps_multicoin_retains_synchronized_btc_risk_surface(
             else MpsEmaAnchorMulticoinRunner
         )
     else:
-        row[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "entry_initial_qty_pct"
-            )
-        ] = 0.0
+        row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_qty_pct")] = (
+            0.0
+        )
         runner_cls = (
             MpsTrailingMartingaleMulticoinFusedRunner
             if topology == "fused"
             else MpsTrailingMartingaleMulticoinRunner
         )
     if topology == "fused":
-        runner = runner_cls(run, data, btc_prices=btc_prices)
+        runner = runner_cls(run, data, pnl_lookback_bars=1440, btc_prices=btc_prices)
         candidates = np.asarray([row + row], dtype=np.float64)
     else:
-        runner = runner_cls(run, data, side="long", btc_prices=btc_prices)
+        runner = runner_cls(
+            run, data, pnl_lookback_bars=1440, side="long", btc_prices=btc_prices
+        )
         candidates = np.asarray([row], dtype=np.float64)
 
     output = runner.run(candidates)
@@ -6037,14 +5252,10 @@ def test_mps_multicoin_retains_synchronized_btc_risk_surface(
     assert output["btc_day_max_dd"][0, 0].item() == pytest.approx(0.75)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
-def test_mps_multicoin_forced_normal_reserves_active_slots(
-    strategy_kind, topology
-):
+def test_mps_multicoin_forced_normal_reserves_active_slots(strategy_kind, topology):
     if strategy_kind == "ema_anchor":
         override_cols = EMA_ANCHOR_COIN_OVERRIDE_COLS
         forced_column = EMA_ANCHOR_COIN_OVERRIDE_FORCED_ACTIVE_COLUMN
@@ -6075,12 +5286,14 @@ def test_mps_multicoin_forced_normal_reserves_active_slots(
         baseline_runner = fused_runner_cls(
             run,
             data,
+            pnl_lookback_bars=1440,
             collect_coin_fill_counts=True,
             hedge_mode=True,
         )
         forced_runner = fused_runner_cls(
             run,
             data,
+            pnl_lookback_bars=1440,
             long_coin_overrides=forced,
             short_coin_overrides=forced,
             collect_coin_fill_counts=True,
@@ -6104,9 +5317,7 @@ def test_mps_multicoin_forced_normal_reserves_active_slots(
     assert (expanded["coin_fill_counts"][0] > 0.0).sum().item() == 2
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
 def test_mps_multicoin_forced_normal_service_matches_exact_active_symbols(
@@ -6148,9 +5359,7 @@ def test_mps_multicoin_forced_normal_service_matches_exact_active_symbols(
     config = get_template_config()
     config["live"]["strategy_kind"] = strategy_kind
     config["live"]["max_warmup_minutes"] = 1
-    enabled_sides = (
-        ("long", "short") if topology == "fused" else (topology,)
-    )
+    enabled_sides = ("long", "short") if topology == "fused" else (topology,)
     config["live"]["approved_coins"] = {
         side: ["BTC", "ETH"] if side in enabled_sides else []
         for side in ("long", "short")
@@ -6164,7 +5373,7 @@ def test_mps_multicoin_forced_normal_service_matches_exact_active_symbols(
         risk = config["bot"][side]["risk"]
         risk["total_wallet_exposure_limit"] = 0.2 if enabled else 0.0
         risk["n_positions"] = 1 if enabled else 0
-        risk["entry_cooldown_minutes"] = 100.0
+        config["bot"][side]["entry_cooldown"]["base_duration_minutes"] = 100.0
         risk["we_excess_allowance_pct"] = 0.0
         risk["total_exposure_entry_gate_enabled"] = False
         risk["position_exposure_enforcer_enabled"] = False
@@ -6184,9 +5393,7 @@ def test_mps_multicoin_forced_normal_service_matches_exact_active_symbols(
                 }
             )
         else:
-            strategy = config["bot"][side]["strategy"][
-                "trailing_martingale"
-            ]
+            strategy = config["bot"][side]["strategy"]["trailing_martingale"]
             strategy["entry"]["ema_span_0"] = 2.0
             strategy["entry"]["ema_span_1"] = 3.0
             strategy["entry"]["initial_qty_pct"] = 1.0
@@ -6194,11 +5401,7 @@ def test_mps_multicoin_forced_normal_service_matches_exact_active_symbols(
             strategy["entry"]["double_down_factor"] = 0.0
             strategy["close"]["threshold_base_pct"] = 0.5
     config["coin_overrides"] = {
-        coin: {
-            "live": {
-                f"forced_mode_{side}": "normal" for side in enabled_sides
-            }
-        }
+        coin: {"live": {f"forced_mode_{side}": "normal" for side in enabled_sides}}
         for coin in ("BTC", "ETH")
     }
 
@@ -6225,14 +5428,13 @@ def test_mps_multicoin_forced_normal_service_matches_exact_active_symbols(
     )
 
     assert result["fills_active_symbols_count"] == 2.0
-    assert result["fills_active_symbols_count"] == exact_analysis[
-        "fills_active_symbols_count"
-    ]
+    assert (
+        result["fills_active_symbols_count"]
+        == exact_analysis["fills_active_symbols_count"]
+    )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("interval_minutes", [5, 7])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_aggregated_interval_directional_smoke(
@@ -6253,9 +5455,7 @@ def test_mps_ema_multicoin_aggregated_interval_directional_smoke(
     assert torch.isfinite(output["last_eq_ts"]).all().item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("interval_minutes", [5, 7])
 def test_mps_ema_multicoin_aggregated_interval_fused_smoke(interval_minutes):
     _, row, run, data = _multicoin_exposure_fixture(
@@ -6265,7 +5465,7 @@ def test_mps_ema_multicoin_aggregated_interval_fused_smoke(interval_minutes):
         interval_minutes=interval_minutes,
         return_context=True,
     )
-    runner = MpsEmaAnchorMulticoinFusedRunner(run, data)
+    runner = MpsEmaAnchorMulticoinFusedRunner(run, data, pnl_lookback_bars=0)
 
     output = runner.run(np.asarray([row + row], dtype=np.float64))
     synchronize()
@@ -6275,14 +5475,10 @@ def test_mps_ema_multicoin_aggregated_interval_fused_smoke(interval_minutes):
     assert torch.isfinite(output["last_eq_ts"]).all().item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("interval_minutes", [5, 7])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_tm_multicoin_aggregated_interval_directional_smoke(
-    interval_minutes, side
-):
+def test_mps_tm_multicoin_aggregated_interval_directional_smoke(interval_minutes, side):
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
         side,
@@ -6298,9 +5494,7 @@ def test_mps_tm_multicoin_aggregated_interval_directional_smoke(
     assert torch.isfinite(output["last_eq_ts"]).all().item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("interval_minutes", [5, 7])
 def test_mps_tm_multicoin_aggregated_interval_fused_smoke(interval_minutes):
     _, row, run, data = _multicoin_exposure_fixture(
@@ -6310,7 +5504,7 @@ def test_mps_tm_multicoin_aggregated_interval_fused_smoke(interval_minutes):
         interval_minutes=interval_minutes,
         return_context=True,
     )
-    runner = MpsTrailingMartingaleMulticoinFusedRunner(run, data)
+    runner = MpsTrailingMartingaleMulticoinFusedRunner(run, data, pnl_lookback_bars=0)
 
     output = runner.run(np.asarray([row + row], dtype=np.float64))
     synchronize()
@@ -6320,9 +5514,7 @@ def test_mps_tm_multicoin_aggregated_interval_fused_smoke(interval_minutes):
     assert torch.isfinite(output["last_eq_ts"]).all().item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
 @pytest.mark.parametrize("forced_delist", [False, True])
@@ -6351,10 +5543,7 @@ def test_mps_multicoin_staggered_tail_keeps_balance_only_equity_and_hsl(
         fused_runner_cls = MpsTrailingMartingaleMulticoinFusedRunner
     overrides = np.full((2, override_cols), np.nan, dtype=np.float32)
     overrides[1, wallet_exposure_column] = 0.0
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0, 0.02)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0, 0.02) for _ in range(2)]
     fixture_side = topology if topology != "fused" else "long"
     runner, row, run, data = _multicoin_exposure_fixture(
         strategy_kind,
@@ -6373,11 +5562,7 @@ def test_mps_multicoin_staggered_tail_keeps_balance_only_equity_and_hsl(
         "hsl_red_threshold": 0.9,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
-        "hsl_restart_policy": 1.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
+        "hsl_restart_policy": 2.0,
         "hsl_signal_mode": 0.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -6387,14 +5572,13 @@ def test_mps_multicoin_staggered_tail_keeps_balance_only_equity_and_hsl(
         runner = fused_runner_cls(
             run,
             data,
+            pnl_lookback_bars=1440,
             long_coin_overrides=overrides,
             short_coin_overrides=overrides,
         )
         short_row = list(row)
         qty_key = (
-            "base_qty_pct"
-            if strategy_kind == "ema_anchor"
-            else "entry_initial_qty_pct"
+            "base_qty_pct" if strategy_kind == "ema_anchor" else "entry_initial_qty_pct"
         )
         short_row[keys.index(qty_key)] *= 0.5
         params = np.asarray([row + short_row], dtype=np.float64)
@@ -6418,16 +5602,12 @@ def test_mps_multicoin_staggered_tail_keeps_balance_only_equity_and_hsl(
         assert output["hsl_panic_close_loss_sum"].item() > 0.0
     else:
         assert output["hsl_panic_close_loss_sum"].item() == 0.0
-    assert output["day_end_eq"][0, 0].item() == pytest.approx(
-        output["balance"].item()
-    )
+    assert output["day_end_eq"][0, 0].item() == pytest.approx(output["balance"].item())
     assert output["last_eq_ts"].item() > last_valid * run.interval_ms
     assert output["hsl_tier_samples_total"].item() > last_valid
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
 @pytest.mark.parametrize(
@@ -6497,18 +5677,14 @@ def test_mps_multicoin_all_invalid_time_keeps_equity_and_hsl_clock(
         "hsl_red_threshold": 0.9,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
-        "hsl_restart_policy": 1.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
+        "hsl_restart_policy": 2.0,
         "hsl_signal_mode": 0.0,
         "hsl_slot_count": 1.0,
     }.items():
         row[keys.index(key)] = value
 
     if topology == "fused":
-        runner = fused_runner_cls(run, data)
+        runner = fused_runner_cls(run, data, pnl_lookback_bars=1440)
         params = np.asarray([row + row], dtype=np.float64)
     else:
         params = np.asarray([row], dtype=np.float64)
@@ -6534,9 +5710,7 @@ def test_mps_multicoin_all_invalid_time_keeps_equity_and_hsl_clock(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("adverse_side", ["long", "short"])
 def test_mps_multicoin_fused_hsl_restarts_during_all_coins_ended_tail(
@@ -6577,11 +5751,7 @@ def test_mps_multicoin_fused_hsl_restarts_during_all_coins_ended_tail(
         "hsl_red_threshold": 0.01,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 2.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 0.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 1.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -6595,6 +5765,7 @@ def test_mps_multicoin_fused_hsl_restarts_during_all_coins_ended_tail(
     output = fused_runner_cls(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
     ).run(np.asarray([long_row + short_row], dtype=np.float64))
@@ -6605,14 +5776,17 @@ def test_mps_multicoin_fused_hsl_restarts_during_all_coins_ended_tail(
     assert output["last_eq_ts"].item() > last_valid * run.interval_ms
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize(
+    "strategy_kind, change",
+    [
+        ("ema_anchor", "candle"),
+        ("trailing_martingale", "candle"),
+        ("trailing_martingale", "ranking"),
+    ],
 )
-@pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_multicoin_reselects_recovered_flat_candidate(
-    strategy_kind, side
-):
+def test_mps_multicoin_reselects_flat_candidate(strategy_kind, change, side):
     import passivbot_rust
 
     closes = np.full((4, 2), 100.0)
@@ -6628,7 +5802,8 @@ def test_mps_multicoin_reselects_recovered_flat_candidate(
         return_context=True,
     )
     # Inject only into the isolated selection probe; public builders reject internal gaps.
-    data["bars"][2, 0, :3] = 0.0
+    if change == "candle":
+        data["bars"][2, 0, :3] = 0.0
     if strategy_kind == "ema_anchor":
         state_type = "EmaMulticoinSideState"
         config_type = "EmaMulticoinSideConfig"
@@ -6672,12 +5847,14 @@ kernel void passivbot_multicoin_candidate_recovery_probe(
     );
     output[0] = candidate_side.selected[0] ? 1.0f : 0.0f;
     output[1] = candidate_side.selected[1] ? 1.0f : 0.0f;
+    {"candidate_side.forager_volume[1] = 300.0f;" if change == "ranking" else ""}
     {update_selection}(
         candidate_side, config, bars, coin_settings, coin_overrides,
         2, C, short_side, false, 1, 0.0f, 0ul, false, 0.0f
     );
     output[2] = candidate_side.selected[0] ? 1.0f : 0.0f;
     output[3] = candidate_side.selected[1] ? 1.0f : 0.0f;
+    {"candidate_side.forager_volume[1] = 100.0f;" if change == "ranking" else ""}
     {update_selection}(
         candidate_side, config, bars, coin_settings, coin_overrides,
         3, C, short_side, false, 1, 0.0f, 0ul, false, 0.0f
@@ -6703,9 +5880,88 @@ kernel void passivbot_multicoin_candidate_recovery_probe(
     assert output.cpu().tolist() == [1.0, 0.0, 0.0, 1.0, 1.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("prior_entry", [False, True])
+def test_mps_tm_hysteresis_requires_prior_entry_order(side, prior_entry):
+    import passivbot_rust
+
+    runner, row, _, data = _multicoin_exposure_fixture(
+        "trailing_martingale",
+        side,
+        count=4,
+        return_context=True,
+    )
+    keys = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
+    row[keys.index("n_positions")] = 1.0
+    probe = r"""
+kernel void passivbot_tm_incumbent_probe(
+    constant float* bars,
+    constant float* coin_settings,
+    constant float* coin_overrides,
+    constant float* params,
+    device float* output,
+    constant int& short_side_raw,
+    constant int& prior_entry,
+    uint b [[thread_position_in_grid]]
+) {
+    if (b > 0) return;
+    TrailingMartingaleMulticoinSideConfig config =
+        load_trailing_martingale_multicoin_side_config(params, 0);
+    config.w_volume = 0.01f;
+    config.w_ready = 0.0f;
+    config.w_volatility = 0.99f;
+    config.volume_drop = 0.0f;
+    TrailingMartingaleMulticoinSideState state;
+    init_trailing_martingale_multicoin_side_state(
+        state, config, coin_settings, coin_overrides, 2
+    );
+    state.forager_volume[0] = 100.0f;
+    state.forager_volume[1] = 200.0f;
+    // A held coin stays selected regardless of its score.
+    state.psize[0] = 1.0f;
+    update_tm_multicoin_side_selection(
+        state, config, bars, coin_settings, coin_overrides,
+        1, 2, short_side_raw != 0, false, 1, 0.02f, 0ul, false, 0.0f
+    );
+    output[0] = state.selected[0];
+    output[1] = state.selected[1];
+    // Closing the position grants no incumbent priority on its own. An
+    // outstanding entry does grant priority within the score hysteresis.
+    state.psize[0] = 0.0f;
+    state.entry_qty[0] = prior_entry ? 1.0f : 0.0f;
+    update_tm_multicoin_side_selection(
+        state, config, bars, coin_settings, coin_overrides,
+        2, 2, short_side_raw != 0, true, 1, 0.02f, 0ul, false, 0.0f
+    );
+    output[2] = state.selected[0];
+    output[3] = state.selected[1];
+}
+"""
+    output = torch.zeros(4, dtype=torch.float32, device=gpu_device())
+    library = compile_shader(
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe
+    )
+    library.passivbot_tm_incumbent_probe(
+        data["bars"],
+        data["coin_settings"],
+        runner.coin_overrides,
+        torch.tensor(row, dtype=torch.float32, device=gpu_device()),
+        output,
+        int(side == "short"),
+        int(prior_entry),
+        threads=(1, 1, 1),
+    )
+    synchronize()
+    assert output.cpu().tolist() == [
+        1.0,
+        0.0,
+        float(prior_entry),
+        float(not prior_entry),
+    ]
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("invalid_mode", ["tail", "internal"])
 def test_mps_tm_recursive_entry_twel_gate_does_not_expand_invalid_coin(
@@ -6788,7 +6044,7 @@ kernel void passivbot_tm_multicoin_tail_recursive_gate_probe(
     side.entry_gen_market_price[0] = 100.0f;
     side.entry_gen_psize[0] = 1.0f;
     side.entry_gen_pprice[0] = 100.0f;
-    side.entry_gen_initial_tick[0] = int(rint(100.0f / price_step));
+    side.entry_gen_initial_price[0] = 100.0f;
     side.entry_gen_touch_tick[0] = short_side ? 0 : 100000000;
     side.entry_recursive_market_mode[0] = true;
     apply_tm_multicoin_recursive_entry_twel_gate(
@@ -6819,9 +6075,7 @@ kernel void passivbot_tm_multicoin_tail_recursive_gate_probe(
     assert output[1].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("mark_case", ["tail", "in_range_zero"])
@@ -6942,7 +6196,6 @@ kernel void passivbot_tm_multicoin_tail_twel_probe(
     output[5] = accumulate_tm_multicoin_side_unrealized_pnl(
         side, bars, coin_settings, 1, 2, short_side, 0.0f
     );
-    side.selection_initialized = false;
     side.psize[1] = 0.0f;
     side.selected[0] = false;
     side.selected[1] = false;
@@ -7039,17 +6292,14 @@ kernel void passivbot_tm_multicoin_tail_twel_probe(
     assert output[7].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_min_cost_rejection_blocks_concurrent_flat_coins(
     strategy_kind, side
 ):
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0)
-        for min_cost in (30.0, 5.0)
+        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0) for min_cost in (30.0, 5.0)
     ]
     unfiltered, row = _multicoin_exposure_fixture(
         strategy_kind,
@@ -7080,17 +6330,14 @@ def test_mps_multicoin_min_cost_rejection_blocks_concurrent_flat_coins(
     assert filtered_counts[1] == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_min_cost_rejection_never_reuses_flat_cash_floor(
     strategy_kind, side
 ):
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0)
-        for min_cost in (60.0, 5.0)
+        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0) for min_cost in (60.0, 5.0)
     ]
     filtered, row = _multicoin_exposure_fixture(
         strategy_kind,
@@ -7111,9 +6358,7 @@ def test_mps_multicoin_min_cost_rejection_never_reuses_flat_cash_floor(
     assert output["coin_fill_counts"].cpu().tolist()[0] == [0.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_min_cost_floor_expires_after_first_selection(
@@ -7127,10 +6372,7 @@ def test_mps_multicoin_min_cost_floor_expires_after_first_selection(
         lows[6:, 1] = 108.0
     else:
         highs[6:, 1] = 132.0
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 1.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 1.0, 1.0, 0.0) for _ in range(2)]
     unfiltered, row = _multicoin_exposure_fixture(
         strategy_kind,
         side,
@@ -7164,17 +6406,14 @@ def test_mps_multicoin_min_cost_floor_expires_after_first_selection(
     assert filtered_output["coin_fill_counts"].cpu().tolist()[0] == [0.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("hedge_mode", [False, True])
 def test_mps_fused_min_cost_rejection_never_reuses_flat_cash_floor(
     strategy_kind, hedge_mode
 ):
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0)
-        for min_cost in (60.0, 5.0)
+        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0) for min_cost in (60.0, 5.0)
     ]
     _, row, run, data = _multicoin_exposure_fixture(
         strategy_kind,
@@ -7192,6 +6431,7 @@ def test_mps_fused_min_cost_rejection_never_reuses_flat_cash_floor(
     runner = runner_cls(
         run,
         data,
+        pnl_lookback_bars=1440,
         hedge_mode=hedge_mode,
         filter_by_min_effective_cost=True,
     )
@@ -7202,9 +6442,7 @@ def test_mps_fused_min_cost_rejection_never_reuses_flat_cash_floor(
     assert output["fill_count"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("override_kind", ["initial_qty", "wel_allowance"])
 def test_mps_multicoin_min_effective_cost_uses_per_coin_overrides(
@@ -7238,10 +6476,7 @@ def test_mps_multicoin_min_effective_cost_uses_per_coin_overrides(
         passing_overrides = overrides.copy()
         passing_overrides[0, allowance_column] = 1.0
         min_cost = 7.0
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, min_cost, 1.0, 0.0) for _ in range(2)]
     runner, row = _multicoin_exposure_fixture(
         strategy_kind,
         "long",
@@ -7272,17 +6507,12 @@ def test_mps_multicoin_min_effective_cost_uses_per_coin_overrides(
     assert passing_counts[1] > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_min_cost_blocks_new_flat_slot_while_portfolio_is_open():
     strategy_kind = "trailing_martingale"
     highs = np.tile(np.asarray([100.0, 120.0]), (10, 1))
     lows = highs * 0.99
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 1.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 1.0, 1.0, 0.0) for _ in range(2)]
     unfiltered, row = _multicoin_exposure_fixture(
         strategy_kind,
         "long",
@@ -7305,9 +6535,7 @@ def test_mps_tm_multicoin_min_cost_blocks_new_flat_slot_while_portfolio_is_open(
         filter_by_min_effective_cost=True,
     )
 
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_qty_pct")
-    ] = 0.5
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_qty_pct")] = 0.5
     parameters = np.asarray([row], dtype=np.float64)
     unfiltered_output = unfiltered.run(parameters)
     filtered_output = filtered.run(parameters)
@@ -7321,15 +6549,10 @@ def test_mps_tm_multicoin_min_cost_blocks_new_flat_slot_while_portfolio_is_open(
     assert filtered_counts[1] == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_fused_one_way_min_cost_rejection_blocks_side_arbitration(strategy_kind):
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0) for _ in range(2)]
     _, row, run, data = _multicoin_exposure_fixture(
         strategy_kind,
         "long",
@@ -7343,9 +6566,7 @@ def test_mps_fused_one_way_min_cost_rejection_blocks_side_arbitration(strategy_k
         else TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
     )
     qty_key = (
-        "base_qty_pct"
-        if strategy_kind == "ema_anchor"
-        else "entry_initial_qty_pct"
+        "base_qty_pct" if strategy_kind == "ema_anchor" else "entry_initial_qty_pct"
     )
     long_row = list(row)
     short_row = list(row)
@@ -7359,6 +6580,7 @@ def test_mps_fused_one_way_min_cost_rejection_blocks_side_arbitration(strategy_k
     runner = runner_cls(
         run,
         data,
+        pnl_lookback_bars=1440,
         hedge_mode=False,
         filter_by_min_effective_cost=True,
     )
@@ -7370,9 +6592,7 @@ def test_mps_fused_one_way_min_cost_rejection_blocks_side_arbitration(strategy_k
     assert output["fill_count"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("signal_mode", ["unified", "pside"])
@@ -7400,11 +6620,7 @@ def test_mps_one_sided_multicoin_hsl_panics_the_portfolio(
         "hsl_red_threshold": 0.05,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 0.0 if signal_mode == "unified" else 1.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -7426,9 +6642,7 @@ def test_mps_one_sided_multicoin_hsl_panics_the_portfolio(
     assert output["open_positions"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_dual_multicoin_pside_hsl_runs_both_directional_controllers(
     strategy_kind,
@@ -7458,11 +6672,7 @@ def test_mps_dual_multicoin_pside_hsl_runs_both_directional_controllers(
             "hsl_red_threshold": 0.05,
             "hsl_ema_span_minutes": 1.0,
             "hsl_cooldown_minutes_after_red": 0.0,
-            "hsl_no_restart_drawdown_threshold": 1.0,
             "hsl_restart_policy": 2.0,
-            "hsl_tier_ratio_yellow": 0.5,
-            "hsl_tier_ratio_orange": 0.75,
-            "hsl_orange_graceful_stop": 0.0,
             "hsl_signal_mode": 1.0,
             "hsl_slot_count": 1.0,
         }.items():
@@ -7482,9 +6692,7 @@ def test_mps_dual_multicoin_pside_hsl_runs_both_directional_controllers(
         assert output["hsl_trigger_drawdown_count"].item() == 1.0
         assert output["hsl_panic_loss_drawdown_count"].item() == 1.0
         assert output[f"hsl_strategy_eq_recovery_max_ms_{side}"].item() > 0.0
-        assert output[
-            f"hsl_strategy_eq_recovery_max_ms_{other_side}"
-        ].item() == 0.0
+        assert output[f"hsl_strategy_eq_recovery_max_ms_{other_side}"].item() == 0.0
         assert output["open_positions"].item() == 0.0
 
     from optimization.gpu.metrics import (
@@ -7534,9 +6742,7 @@ def test_mps_dual_multicoin_pside_hsl_runs_both_directional_controllers(
     assert truncated["short"]["hsl_triggers_short"].item() == 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("shock_coin", [0, 1, "both"])
@@ -7583,11 +6789,7 @@ def test_mps_one_sided_multicoin_coin_hsl_isolates_each_coin_episode(
         "hsl_red_threshold": 0.05,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 2.0,
         # The kernel must derive the effective value of two; this packed
         # single-coin default is deliberately not pre-adjusted by Python.
@@ -7597,30 +6799,28 @@ def test_mps_one_sided_multicoin_coin_hsl_isolates_each_coin_episode(
 
     packed_slot_variant = list(row)
     packed_slot_variant[keys.index("hsl_slot_count")] = 64.0
-    output = runner.run(
-        np.asarray([row, packed_slot_variant], dtype=np.float64)
-    )
+    output = runner.run(np.asarray([row, packed_slot_variant], dtype=np.float64))
     synchronize()
 
     assert output[f"hsl_{side}_enabled"].all().item()
     expected_episode_count = 2.0 if shock_coin == "both" else 1.0
+    assert (output[f"hsl_triggers_{side}"] == expected_episode_count).all().item()
+    assert (output["hsl_trigger_drawdown_count"] == expected_episode_count).all().item()
     assert (
-        output[f"hsl_triggers_{side}"] == expected_episode_count
-    ).all().item()
-    assert (
-        output["hsl_trigger_drawdown_count"] == expected_episode_count
-    ).all().item()
-    assert (
-        output["hsl_panic_loss_drawdown_count"] == expected_episode_count
-    ).all().item()
+        (output["hsl_panic_loss_drawdown_count"] == expected_episode_count).all().item()
+    )
     assert (output["hsl_panic_close_loss_sum"] > 0.0).all().item()
     assert (output[f"hsl_strategy_eq_recovery_max_ms_{side}"] > 0.0).all().item()
     if shock_coin == "both":
         assert (output["coin_fill_counts"] >= 2.0).all().item()
         assert (
-            output["hsl_panic_loss_drawdown_max"]
-            > output["hsl_panic_loss_drawdown_min"]
-        ).all().item()
+            (
+                output["hsl_panic_loss_drawdown_max"]
+                > output["hsl_panic_loss_drawdown_min"]
+            )
+            .all()
+            .item()
+        )
         assert output["hsl_panic_loss_drawdown_sum"][0].item() == pytest.approx(
             output["hsl_panic_loss_drawdown_min"][0].item()
             + output["hsl_panic_loss_drawdown_max"][0].item()
@@ -7628,18 +6828,14 @@ def test_mps_one_sided_multicoin_coin_hsl_isolates_each_coin_episode(
         expected_open_positions = 0.0
     else:
         assert (output["coin_fill_counts"][:, shock_coin] >= 2.0).all().item()
-        expected_open_positions = (
-            1.0 if strategy_kind == "trailing_martingale" else 0.0
-        )
+        expected_open_positions = 1.0 if strategy_kind == "trailing_martingale" else 0.0
     assert (output["open_positions"] == expected_open_positions).all().item()
     assert output["hsl_trigger_drawdown_sum"][0].item() == pytest.approx(
         output["hsl_trigger_drawdown_sum"][1].item()
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize(
@@ -7660,16 +6856,12 @@ def test_mps_multicoin_coin_hsl_override_controls_enablement(
     hsl_start = 19 if strategy_kind == "ema_anchor" else 34
     overrides = np.full((2, override_cols), np.nan, dtype=np.float32)
     if coin_enabled:
-        overrides[1, hsl_start : hsl_start + 10] = [
+        overrides[1, hsl_start : hsl_start + 6] = [
             1.0,
             0.05,
             1.0,
             0.0,
-            1.0,
             2.0,
-            0.5,
-            0.75,
-            0.0,
             0.0,
         ]
     else:
@@ -7692,11 +6884,7 @@ def test_mps_multicoin_coin_hsl_override_controls_enablement(
         "hsl_red_threshold": 0.05,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 2.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -7712,9 +6900,7 @@ def test_mps_multicoin_coin_hsl_override_controls_enablement(
         assert output["coin_fill_counts"][0, 1].item() >= 2.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_coin_hsl_recovery_uses_total_exposure_contract(
@@ -7755,11 +6941,7 @@ def test_mps_multicoin_coin_hsl_recovery_uses_total_exposure_contract(
         "hsl_red_threshold": 0.05,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 2.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -7772,9 +6954,7 @@ def test_mps_multicoin_coin_hsl_recovery_uses_total_exposure_contract(
     assert output[f"hsl_strategy_eq_recovery_max_ms_{side}"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_coin_hsl_overrides_can_disable_every_controller(
@@ -7806,9 +6986,7 @@ def test_mps_multicoin_coin_hsl_overrides_can_disable_every_controller(
     assert output["hsl_tier_samples_total"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_coin_hsl_override_selects_market_panic(strategy_kind, side):
@@ -7836,16 +7014,12 @@ def test_mps_multicoin_coin_hsl_override_selects_market_panic(strategy_kind, sid
     outputs = []
     for market_panic in (0.0, 1.0):
         overrides = np.full((2, override_cols), np.nan, dtype=np.float32)
-        overrides[1, hsl_start : hsl_start + 10] = [
+        overrides[1, hsl_start : hsl_start + 6] = [
             1.0,
             0.05,
             1.0,
             0.0,
-            1.0,
             2.0,
-            0.5,
-            0.75,
-            0.0,
             market_panic,
         ]
         runner, row = _multicoin_exposure_fixture(
@@ -7876,9 +7050,7 @@ def test_mps_multicoin_coin_hsl_override_selects_market_panic(strategy_kind, sid
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_coin_hsl_reselects_around_blocked_forager_coin(
@@ -7905,11 +7077,7 @@ def test_mps_multicoin_coin_hsl_reselects_around_blocked_forager_coin(
         "hsl_red_threshold": 0.05,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 2.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -7923,9 +7091,7 @@ def test_mps_multicoin_coin_hsl_reselects_around_blocked_forager_coin(
     assert output["coin_fill_counts"][0, 0].item() >= 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_one_sided_multicoin_hsl_market_panic_applies_taker_costs(
@@ -7968,11 +7134,7 @@ def test_mps_one_sided_multicoin_hsl_market_panic_applies_taker_costs(
         "hsl_red_threshold": 0.05,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
         "hsl_signal_mode": 1.0,
         "hsl_slot_count": 1.0,
     }.items():
@@ -7999,9 +7161,7 @@ def test_mps_one_sided_multicoin_hsl_market_panic_applies_taker_costs(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_tracks_position_unchanged_max(strategy_kind, side):
@@ -8024,9 +7184,7 @@ def test_mps_multicoin_tracks_position_unchanged_max(strategy_kind, side):
     assert torch.isfinite(output["day_net_pnl"][fill_days]).all()
     assert (output["day_last_fill_balance"][fill_days] > 0.0).all()
     assert (output["day_fill_count"][fill_days] >= 1.0).all()
-    assert torch.equal(
-        output["day_fill_count"], output["day_fill_count"].round()
-    )
+    assert torch.equal(output["day_fill_count"], output["day_fill_count"].round())
     _assert_fill_scalar_contract(output)
     if side == "long":
         assert torch.equal(output["fill_count_long"], output["fill_count"])
@@ -8034,9 +7192,7 @@ def test_mps_multicoin_tracks_position_unchanged_max(strategy_kind, side):
         assert (output["fill_count_long"] == 0.0).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_fixed_wel_uses_configured_position_denominator(
@@ -8075,9 +7231,7 @@ def test_mps_multicoin_fixed_wel_uses_configured_position_denominator(
     assert dynamic["entry_initial_balance_pct"].item() == pytest.approx(1.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("hedge_mode", [True, False], ids=["hedge", "one-way"])
 def test_mps_fused_multicoin_fixed_wel_uses_each_configured_denominator(
@@ -8104,6 +7258,7 @@ def test_mps_fused_multicoin_fixed_wel_uses_each_configured_denominator(
     runner = runner_cls(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         hedge_mode=hedge_mode,
@@ -8117,42 +7272,28 @@ def test_mps_fused_multicoin_fixed_wel_uses_each_configured_denominator(
     assert output["entry_initial_balance_pct_short"].item() == pytest.approx(0.5)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_multicoin_active_fill_days_use_equity_start_buckets(
-    strategy_kind, side
-):
-    runner, row = _multicoin_exposure_fixture(
-        strategy_kind, side, count=3 * 1440 + 32
-    )
+def test_mps_multicoin_active_fill_days_use_equity_start_buckets(strategy_kind, side):
+    runner, row = _multicoin_exposure_fixture(strategy_kind, side, count=3 * 1440 + 32)
     if strategy_kind == "trailing_martingale":
         row[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "entry_threshold_base_pct"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_threshold_base_pct")
         ] = 0.0
         row[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "close_threshold_base_pct"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_threshold_base_pct")
         ] = 0.0
 
     output = runner.run(np.asarray([row], dtype=np.float64))
     synchronize()
 
-    duration_days = (
-        output["last_eq_ts"] - output["first_eq_ts"]
-    ).item() / 86_400_000.0
+    duration_days = (output["last_eq_ts"] - output["first_eq_ts"]).item() / 86_400_000.0
     assert output["fills_active_days_count"].item() == int(np.ceil(duration_days))
     assert output["fills_active_days_count"].item() >= 3.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_tracks_fill_counts_by_symbol(strategy_kind, side):
@@ -8170,14 +7311,10 @@ def test_mps_multicoin_tracks_fill_counts_by_symbol(strategy_kind, side):
     assert coin_counts.sum().item() == output["fill_count"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_multicoin_initial_entry_pct_uses_first_coin_override(
-    strategy_kind, side
-):
+def test_mps_multicoin_initial_entry_pct_uses_first_coin_override(strategy_kind, side):
     override_cols = (
         EMA_ANCHOR_COIN_OVERRIDE_COLS
         if strategy_kind == "ema_anchor"
@@ -8199,9 +7336,7 @@ def test_mps_multicoin_initial_entry_pct_uses_first_coin_override(
     assert output["entry_initial_balance_pct"].item() == pytest.approx(0.1875)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_initial_entry_pct_freezes_denominator_at_liquidation(
@@ -8224,9 +7359,7 @@ def test_mps_multicoin_initial_entry_pct_freezes_denominator_at_liquidation(
     assert output["entry_initial_balance_pct"].item() == pytest.approx(1.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_multicoin_initial_entry_pct_freezes_before_post_fill_balance_depletion(
@@ -8267,9 +7400,7 @@ def test_directional_touch_ticks_preserve_alignment_and_round_non_aligned_prices
 def test_minimum_entry_qty_encoding_uses_original_float64_touch_price():
     market = ProxyMarket(0.001, 0.01, 0.001, 10.0004, 1.0, 0.0)
 
-    bits, relation = _minimum_entry_qty_encoding(
-        np.array([100.004, 100.0]), market
-    )
+    bits, relation = _minimum_entry_qty_encoding(np.array([100.004, 100.0]), market)
     rounded = np.ascontiguousarray(bits).view(np.float32)
     assert rounded.tolist() == pytest.approx([0.1, 0.101])
     assert relation.tolist() == [-1, -1]
@@ -8287,9 +7418,7 @@ def test_minimum_entry_qty_encoding_preserves_just_above_aligned_minimum():
 def test_maximum_effective_min_cost_preserves_float64_executable_threshold():
     market = ProxyMarket(0.001, 0.01, 0.001, 10.0004, 1.0, 0.0)
 
-    threshold = _maximum_effective_min_cost(
-        np.array([100.004, 100.0]), market
-    )
+    threshold = _maximum_effective_min_cost(np.array([100.004, 100.0]), market)
 
     assert threshold == pytest.approx(0.101 * 100.0)
 
@@ -8357,9 +7486,7 @@ def test_initial_single_candle_hour_bucket_matches_rust_skip_contract():
         last_valid_idx=len(timestamps) - 1,
     )
 
-    hour_log_range, hour_valid = _build_hourly_log_range(
-        high, low, timestamps, run
-    )
+    hour_log_range, hour_valid = _build_hourly_log_range(high, low, timestamps, run)
 
     assert not hour_valid[1]
     assert hour_valid[61]
@@ -8389,9 +7516,7 @@ def test_nondivisor_interval_hour_bucket_matches_rust_boundary_overlap():
         last_valid_idx=len(timestamps) - 1,
     )
 
-    hour_log_range, hour_valid = _build_hourly_log_range(
-        high, low, timestamps, run
-    )
+    hour_log_range, hour_valid = _build_hourly_log_range(high, low, timestamps, run)
 
     assert hour_valid[9]
     assert hour_valid[18]
@@ -8399,490 +7524,28 @@ def test_nondivisor_interval_hour_bucket_matches_rust_boundary_overlap():
     assert hour_log_range[18] == pytest.approx(np.log(200.0 / 50.0))
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_coin_hsl_preserves_intraminute_realized_peak():
-    import passivbot_rust
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+def test_mps_coin_hsl_realized_loss_uses_reconstructed_equity_peak():
+    from test_gpu_hsl_window import run_controller
 
-    trace_kernel = r"""
-kernel void passivbot_hsl_coin_fill_peak(
-    constant float* params [[buffer(0)]],
-    device float* output [[buffer(1)]],
-    uint b [[thread_position_in_grid]]
-) {
-    if (b > 0) return;
-    HslState h = load_hsl(params, 0, 0);
-    record_coin_hsl_realized_fill(h, 100.0f);
-    record_coin_hsl_realized_fill(h, 90.0f);
-    HslSignal signal;
-    bool valid = derive_hsl_signal(
-        h, 1000.0f, 1000.0f, 90.0f, 0.0f, signal
-    );
-    output[0] = valid ? h.coin_realized_peak : -1.0f;
-    output[1] = valid ? signal.drawdown_raw : -1.0f;
-}
-"""
-    source = passivbot_rust.mps_ema_anchor_source_py() + trace_kernel
-    library = compile_shader(source)
-    params = torch.tensor(
-        [1.0, 0.1, 1.0, 0.0, 1.0, 2.0, 0.5, 0.75, 0.0, 2.0, 2.0],
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    output = torch.zeros(2, dtype=torch.float32, device=gpu_device())
-
-    library.passivbot_hsl_coin_fill_peak(params, output, threads=(1, 1, 1))
-    actual = output.cpu().numpy()
-
-    assert actual[0] == pytest.approx(100.0)
-    assert actual[1] == pytest.approx(0.02)
+    # A 500 budget earns 100, then realizes a 10 loss while exposure remains.
+    # Current equity is 590 and the historical equity peak is 600.
+    events = [
+        (0, 500, 0, 0, False, False),
+        (1, 600, 100, 0, True, False),
+        (2, 590, 90, 0, True, False),
+    ]
+    result = run_controller(events, span=1.0, never=False)
+    np.testing.assert_allclose(result[-1], [0, 10 / 600, 10 / 600], atol=1e-7)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_joint_multicoin_account_feeds_exact_pside_hsl_scopes():
-    import passivbot_rust
-
-    trace_kernel = r"""
-kernel void passivbot_joint_multicoin_account_trace(
-    device const float* samples [[buffer(0)]],
-    constant float* params [[buffer(1)]],
-    constant float* settings [[buffer(2)]],
-    constant int* sizes [[buffer(3)]],
-    device float* output [[buffer(4)]],
-    uint b [[thread_position_in_grid]]
-) {
-    const int N = sizes[0];
-    const int SAMPLE_COLS = 8;
-    const int HSL_PARAM_COLS = 11;
-    const int OUTPUT_COLS = 13;
-    if (b > 0) return;
-    JointPortfolioAccount account = init_joint_portfolio_account(settings[0]);
-    HslState long_hsl = load_hsl(params, 0, 0);
-    HslState short_hsl = load_hsl(params, HSL_PARAM_COLS, 0);
-    for (int k = 0; k < N; ++k) {
-        const int si = k * SAMPLE_COLS;
-        // Exact Rust check_for_fills() completes the long-side pass before
-        // the short-side pass for every candle.
-        record_joint_portfolio_fill(account, samples[si + 0], true);
-        record_joint_portfolio_fill(account, samples[si + 1], false);
-        float long_unreal = samples[si + 2];
-        float short_unreal = samples[si + 3];
-        float equity = joint_portfolio_equity(
-            account, long_unreal, short_unreal
-        );
-        bool can_generate = joint_portfolio_can_generate(
-            account, equity, settings[1]
-        );
-        bool long_unified = long_hsl.signal_mode == HSL_SIGNAL_UNIFIED;
-        bool short_unified = short_hsl.signal_mode == HSL_SIGNAL_UNIFIED;
-        HslSignal long_signal;
-        HslSignal short_signal;
-        bool long_valid = can_generate && derive_hsl_signal(
-            long_hsl,
-            account.balance,
-            settings[0],
-            joint_hsl_realized_pnl(account, long_unified, true),
-            joint_hsl_unrealized_pnl(
-                long_unreal, short_unreal, long_unified, true
-            ),
-            long_signal
-        );
-        bool short_valid = can_generate && derive_hsl_signal(
-            short_hsl,
-            account.balance,
-            settings[0],
-            joint_hsl_realized_pnl(account, short_unified, false),
-            joint_hsl_unrealized_pnl(
-                long_unreal, short_unreal, short_unified, false
-            ),
-            short_signal
-        );
-        if (long_valid) {
-            update_hsl_from_signal(
-                long_hsl,
-                long_signal,
-                account.realized_pnl_long,
-                samples[si + 4] > 0.5f,
-                samples[si + 6] > 0.5f,
-                float(k),
-                settings[2]
-            );
-        }
-        if (short_valid) {
-            update_hsl_from_signal(
-                short_hsl,
-                short_signal,
-                account.realized_pnl_short,
-                samples[si + 5] > 0.5f,
-                samples[si + 7] > 0.5f,
-                float(k),
-                settings[2]
-            );
-        }
-        const int oi = k * OUTPUT_COLS;
-        output[oi + 0] = account.balance;
-        output[oi + 1] = account.realized_pnl_total;
-        output[oi + 2] = account.realized_pnl_peak;
-        output[oi + 3] = account.realized_pnl_long;
-        output[oi + 4] = account.realized_pnl_short;
-        output[oi + 5] = equity;
-        output[oi + 6] = can_generate ? 1.0f : 0.0f;
-        output[oi + 7] = long_valid ? long_signal.drawdown_raw : -1.0f;
-        output[oi + 8] = long_hsl.drawdown_ema;
-        output[oi + 9] = float(long_hsl.tier);
-        output[oi + 10] = short_valid ? short_signal.drawdown_raw : -1.0f;
-        output[oi + 11] = short_hsl.drawdown_ema;
-        output[oi + 12] = float(short_hsl.tier);
-    }
-}
-"""
-    source = passivbot_rust.mps_ema_anchor_multicoin_source_py() + trace_kernel
-    library = compile_shader(source)
-
-    starting_balance = 1_000.0
-    samples = np.array(
-        [
-            [-2.0, -3.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
-            [12.0, -5.0, -20.0, -10.0, 1.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, -80.0, -40.0, 1.0, 1.0, 0.0, 0.0],
-            [-30.0, 20.0, -120.0, -5.0, 1.0, 1.0, 0.0, 0.0],
-            [5.0, 5.0, -10.0, -80.0, 1.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, -950.0, 0.0, 1.0, 1.0, 0.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    hsl_params = np.array(
-        [1.0, 0.1, 2.0, 0.0, 1.0, 0.0, 0.5, 0.75, 0.0, 1.0, 1.0],
-        dtype=np.float32,
-    )
-    output = torch.zeros(
-        (len(samples), 13), dtype=torch.float32, device=gpu_device()
-    )
-    library.passivbot_joint_multicoin_account_trace(
-        torch.as_tensor(samples, dtype=torch.float32, device=gpu_device()).contiguous(),
-        torch.as_tensor(
-            np.concatenate([hsl_params, hsl_params]),
-            dtype=torch.float32,
-            device=gpu_device(),
-        ).contiguous(),
-        torch.tensor(
-            [starting_balance, 100.0, 60_000.0],
-            dtype=torch.float32,
-            device=gpu_device(),
-        ),
-        torch.tensor([len(samples)], dtype=torch.int32, device=gpu_device()),
-        output,
-        threads=(1, 1, 1),
-    )
-    actual = output.cpu().numpy()
-
-    realized_long = np.cumsum(samples[:, 0], dtype=np.float64)
-    realized_short = np.cumsum(samples[:, 1], dtype=np.float64)
-    realized_total = realized_long + realized_short
-    balance = starting_balance + realized_total
-    equity = balance + samples[:, 2] + samples[:, 3]
-    np.testing.assert_allclose(actual[:, 0], balance, atol=2.0e-5)
-    np.testing.assert_allclose(actual[:, 1], realized_total, atol=2.0e-5)
-    intraminute_realized_peak = []
-    running_realized = 0.0
-    running_peak = 0.0
-    for long_fill, short_fill in samples[:, :2]:
-        # Rust completes all long fills before starting the short pass. The
-        # loss budget retains a peak reached between those two side passes.
-        running_realized += float(long_fill)
-        running_peak = max(running_peak, running_realized)
-        running_realized += float(short_fill)
-        running_peak = max(running_peak, running_realized)
-        intraminute_realized_peak.append(running_peak)
-    np.testing.assert_allclose(
-        actual[:, 2], intraminute_realized_peak,
-        atol=2.0e-5,
-    )
-    np.testing.assert_allclose(actual[:, 3], realized_long, atol=2.0e-5)
-    np.testing.assert_allclose(actual[:, 4], realized_short, atol=2.0e-5)
-    np.testing.assert_allclose(actual[:, 5], equity, atol=2.0e-5)
-    assert actual[:, 6].tolist() == [1.0] * (len(samples) - 1) + [0.0]
-
-    tier_ids = {"green": 0.0, "yellow": 1.0, "orange": 2.0, "red": 3.0}
-    for side_index, (realized, unrealized) in enumerate(
-        (
-            (realized_long, samples[:, 2]),
-            (realized_short, samples[:, 3]),
-        )
-    ):
-        runtime = passivbot_rust.EquityHardStopRuntime()
-        peak_strategy_pnl = float("-inf")
-        base_column = 7 if side_index == 0 else 10
-        for k, (realized_pnl, unrealized_pnl) in enumerate(
-            zip(realized, unrealized)
-        ):
-            if not bool(actual[k, 6]):
-                assert actual[k, base_column] == -1.0
-                continue
-            strategy_pnl = float(realized_pnl + unrealized_pnl)
-            peak_strategy_pnl = max(peak_strategy_pnl, strategy_pnl)
-            strategy_equity = starting_balance + strategy_pnl
-            peak_strategy_equity = max(
-                starting_balance + peak_strategy_pnl, strategy_equity
-            )
-            exact = runtime.apply_sample(
-                timestamp_ms=k * 60_000,
-                equity=strategy_equity,
-                peak_strategy_equity=peak_strategy_equity,
-                red_threshold=0.1,
-                ema_span_minutes=2.0,
-                tier_ratio_yellow=0.5,
-                tier_ratio_orange=0.75,
-            )
-            assert actual[k, base_column] == pytest.approx(
-                exact["drawdown_raw"], abs=2.0e-6
-            )
-            assert actual[k, base_column + 1] == pytest.approx(
-                exact["drawdown_ema"], abs=2.0e-6
-            )
-            assert actual[k, base_column + 2] == tier_ids[exact["tier"]]
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-def test_mps_shared_hsl_trace_matches_exact_rust():
-    import passivbot_rust
-
-    trace_kernel = r"""
-kernel void passivbot_hsl_trace(
-    device const float* samples [[buffer(0)]],
-    constant float* params [[buffer(1)]],
-    constant float* settings [[buffer(2)]],
-    constant int* sizes [[buffer(3)]],
-    device float* output [[buffer(4)]],
-    uint b [[thread_position_in_grid]]
-) {
-    const int B = sizes[0];
-    const int N = sizes[1];
-    const int PARAM_COLS = 11;
-    const int SAMPLE_COLS = 5;
-    const int OUTPUT_COLS = 11;
-    if (b >= uint(B)) return;
-    HslState h = load_hsl(params, int(b) * PARAM_COLS, 0);
-    for (int k = 0; k < N; k++) {
-        const int si = k * SAMPLE_COLS;
-        HslSignal signal;
-        bool valid = derive_hsl_signal(
-            h,
-            samples[si + 0],
-            settings[0],
-            samples[si + 1],
-            samples[si + 2],
-            signal
-        );
-        if (valid) {
-            update_hsl_from_signal(
-                h,
-                signal,
-                samples[si + 1],
-                samples[si + 3] > 0.5f,
-                samples[si + 4] > 0.5f,
-                float(k),
-                settings[1]
-            );
-        }
-        const int oi = (int(b) * N + k) * OUTPUT_COLS;
-        output[oi + 0] = valid ? signal.drawdown_raw : -1.0f;
-        output[oi + 1] = h.drawdown_ema;
-        output[oi + 2] = float(h.tier);
-        output[oi + 3] = h.red_active_now ? 1.0f : 0.0f;
-        output[oi + 4] = h.red_latched ? 1.0f : 0.0f;
-        output[oi + 5] = h.halted ? 1.0f : 0.0f;
-        output[oi + 6] = h.no_restart_latched ? 1.0f : 0.0f;
-        output[oi + 7] = h.cooldown_until_k;
-        output[oi + 8] = h.triggers;
-        output[oi + 9] = h.pending_stop_k;
-        output[oi + 10] = h.drawdown_ema_max;
-    }
-}
-"""
-    source = passivbot_rust.mps_ema_anchor_source_py() + trace_kernel
-    library = compile_shader(source)
-
-    starting_balance = 1_000.0
-    realized = np.zeros(7, dtype=np.float32)
-    unrealized = np.array(
-        [0.0, -20.0, -60.0, -120.0, -160.0, -40.0, 0.0],
-        dtype=np.float32,
-    )
-    samples = np.column_stack(
-        [
-            np.full(len(realized), starting_balance, dtype=np.float32),
-            realized,
-            unrealized,
-            np.ones(len(realized), dtype=np.float32),
-            np.zeros(len(realized), dtype=np.float32),
-        ]
-    )
-    signal_modes = ("unified", "pside", "coin")
-    params = np.array(
-        [
-            [1.0, 0.1, 2.0, 0.0, 0.3, 1.0, 0.5, 0.75, 0.0, mode, 2.0]
-            for mode in range(len(signal_modes))
-        ],
-        dtype=np.float32,
-    )
-    output = torch.zeros(
-        (len(signal_modes), len(realized), 11),
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    library.passivbot_hsl_trace(
-        torch.as_tensor(samples, dtype=torch.float32, device=gpu_device()).contiguous(),
-        torch.as_tensor(params, dtype=torch.float32, device=gpu_device()).contiguous(),
-        torch.tensor(
-            [starting_balance, 60_000.0], dtype=torch.float32, device=gpu_device()
-        ),
-        torch.tensor(
-            [len(signal_modes), len(realized)], dtype=torch.int32, device=gpu_device()
-        ),
-        output,
-        threads=(len(signal_modes), 1, 1),
-    )
-    actual = output.cpu().numpy()
-
-    tier_ids = {"green": 0.0, "yellow": 1.0, "orange": 2.0, "red": 3.0}
-    for mode_index, signal_mode in enumerate(signal_modes):
-        runtime = passivbot_rust.EquityHardStopRuntime()
-        peak_strategy_pnl = float("-inf")
-        peak_coin_realized = 0.0
-        exact_drawdown_ema_max = 0.0
-        for k, (realized_pnl, unrealized_pnl) in enumerate(
-            zip(realized, unrealized)
-        ):
-            if signal_mode == "coin":
-                peak_coin_realized = max(peak_coin_realized, float(realized_pnl))
-                coin_signal = passivbot_rust.hsl_coin_drawdown_signal(
-                    balance=starting_balance,
-                    n_positions=2,
-                    peak_realized=peak_coin_realized,
-                    last_realized=float(realized_pnl),
-                    current_upnl=float(unrealized_pnl),
-                )
-                drawdown_raw = coin_signal["drawdown_raw"]
-                equity = max(1.0 - drawdown_raw, 1.0e-12)
-                peak_equity = 1.0
-            else:
-                strategy_pnl = float(realized_pnl + unrealized_pnl)
-                peak_strategy_pnl = max(peak_strategy_pnl, strategy_pnl)
-                equity = starting_balance + strategy_pnl
-                peak_equity = max(starting_balance + peak_strategy_pnl, equity)
-            exact = runtime.apply_sample(
-                timestamp_ms=k * 60_000,
-                equity=equity,
-                peak_strategy_equity=peak_equity,
-                red_threshold=0.1,
-                ema_span_minutes=2.0,
-                tier_ratio_yellow=0.5,
-                tier_ratio_orange=0.75,
-            )
-            assert actual[mode_index, k, 0] == pytest.approx(
-                exact["drawdown_raw"], abs=2.0e-6
-            )
-            assert actual[mode_index, k, 1] == pytest.approx(
-                exact["drawdown_ema"], abs=2.0e-6
-            )
-            exact_drawdown_ema_max = max(
-                exact_drawdown_ema_max, abs(exact["drawdown_ema"])
-            )
-            assert actual[mode_index, k, 10] == pytest.approx(
-                exact_drawdown_ema_max, abs=2.0e-6
-            )
-            assert actual[mode_index, k, 2] == tier_ids[exact["tier"]]
-            assert bool(actual[mode_index, k, 3]) == exact["red_active_now"]
-            assert bool(actual[mode_index, k, 4]) == exact["red_latched"]
-            assert not bool(actual[mode_index, k, 5])
-
-    restart_policies = ("always", "threshold", "never")
-    lifecycle_unrealized = np.array(
-        [0.0, -200.0, -200.0, -200.0, -200.0], dtype=np.float32
-    )
-    lifecycle_samples = np.column_stack(
-        [
-            np.full(
-                len(lifecycle_unrealized), starting_balance, dtype=np.float32
-            ),
-            np.zeros(len(lifecycle_unrealized), dtype=np.float32),
-            lifecycle_unrealized,
-            np.array([1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            np.zeros(len(lifecycle_unrealized), dtype=np.float32),
-        ]
-    )
-    lifecycle_params = np.array(
-        [
-            [1.0, 0.1, 1.0, 5.0, 0.3, policy, 0.5, 0.75, 0.0, 0.0, 1.0]
-            for policy in range(len(restart_policies))
-        ],
-        dtype=np.float32,
-    )
-    lifecycle_output = torch.zeros(
-        (len(restart_policies), len(lifecycle_unrealized), 11),
-        dtype=torch.float32,
-        device=gpu_device(),
-    )
-    library.passivbot_hsl_trace(
-        torch.as_tensor(
-            lifecycle_samples, dtype=torch.float32, device=gpu_device()
-        ).contiguous(),
-        torch.as_tensor(
-            lifecycle_params, dtype=torch.float32, device=gpu_device()
-        ).contiguous(),
-        torch.tensor(
-            [starting_balance, 60_000.0], dtype=torch.float32, device=gpu_device()
-        ),
-        torch.tensor(
-            [len(restart_policies), len(lifecycle_unrealized)],
-            dtype=torch.int32,
-            device=gpu_device(),
-        ),
-        lifecycle_output,
-        threads=(len(restart_policies), 1, 1),
-    )
-    lifecycle_actual = lifecycle_output.cpu().numpy()
-    for policy_index, restart_policy in enumerate(restart_policies):
-        exact = passivbot_rust.hsl_red_episode_finalization(
-            restart_after_red_policy=restart_policy,
-            stop_timestamp_ms=2 * 60_000,
-            stop_equity=800.0,
-            stop_peak_strategy_equity=1_000.0,
-            previous_no_restart_peak_strategy_equity=0.0,
-            drawdown_ema=0.2,
-            red_threshold=0.1,
-            no_restart_drawdown_threshold=0.3,
-            cooldown_minutes_after_red=5.0,
-        )
-        final = lifecycle_actual[policy_index, -1]
-        assert bool(final[5])
-        assert bool(final[6]) == exact["no_restart_latched"]
-        expected_cooldown_step = (
-            -1.0
-            if exact["cooldown_until_ms"] is None
-            else exact["cooldown_until_ms"] / 60_000.0
-        )
-        assert final[7] == pytest.approx(expected_cooldown_step)
-        assert final[8] == 1.0
-        assert final[9] == 2.0
-        assert final[10] == pytest.approx(0.2, abs=2.0e-6)
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_anchor_shader_smoke():
     import passivbot_rust
 
     source = passivbot_rust.mps_ema_anchor_source_py()
     assert "kernel void passivbot_ema_anchor" in source
-    assert "constant int SIDE_PARAMS = 37" in source
+    assert f"constant int SIDE_PARAMS = {len(EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS)}" in source
     assert "total_exposure_reducer_qty" in source
     assert "secondary_close_qty" in source
     assert "realized_loss_gate_allows" in source
@@ -8894,27 +7557,30 @@ def test_mps_ema_anchor_shader_smoke():
     assert "const bool long_hsl_panic_market = settings[17] > 0.5f" in source
     assert "const bool short_hsl_panic_market = settings[18] > 0.5f" in source
     assert "const bool market_orders_allowed = settings[19] > 0.5f" in source
-    assert "const float market_order_near_touch_threshold = fmax(settings[20], 0.0f)" in source
+    assert (
+        "const float market_order_near_touch_threshold = fmax(settings[20], 0.0f)"
+        in source
+    )
     assert "market_execution ? taker_fee : maker_fee" in source
     assert "if (variant.is_panic) return true" in source
     ordering_start = source.index("restore_ordinary_close(long_side)")
-    assert source.index("prepare_ordinary_market_close(", ordering_start) < source.index(
-        "gate_reducer_variant(", ordering_start
-    )
-    assert "constant int SCALAR_COLS = 70" in source
-    assert "scalars[so + 50] = fill_count" in source
-    assert "scalars[so + 51] = fill_count_entry" in source
-    assert "scalars[so + 52] = fill_count_long" in source
-    assert "scalars[so + 53] = fills_active_days_count" in source
-    assert "scalars[so + 54] = pnl_recovery_max_min * interval_ms" in source
-    assert "scalars[so + 55] = held_sum_min * interval_ms" in source
-    assert "scalars[so + 56] = held_count" in source
-    assert "scalars[so + 57] = account_recovery_max_min * interval_ms" in source
-    assert "scalars[so + 58] = profit_sum_long" in source
-    assert "scalars[so + 61] = loss_sum_short" in source
-    assert "scalars[so + 62] = long_hsl.enabled" in source
+    assert source.index(
+        "prepare_ordinary_market_close(", ordering_start
+    ) < source.index("gate_reducer_variant(", ordering_start)
+    assert "constant int SCALAR_COLS = 66" in source
+    assert "scalars[so + 48] = fill_count" in source
+    assert "scalars[so + 49] = fill_count_entry" in source
+    assert "scalars[so + 50] = fill_count_long" in source
+    assert "scalars[so + 51] = fills_active_days_count" in source
+    assert "scalars[so + 52] = pnl_recovery_max_min * interval_ms" in source
+    assert "scalars[so + 53] = held_sum_min * interval_ms" in source
+    assert "scalars[so + 54] = held_count" in source
+    assert "scalars[so + 55] = account_recovery_max_min * interval_ms" in source
+    assert "scalars[so + 56] = profit_sum_long" in source
+    assert "scalars[so + 59] = loss_sum_short" in source
+    assert "scalars[so + 60] = long_hsl.enabled" in source
     assert "long_hsl.drawdown_ema_max" in source
-    assert "scalars[so + 63] = short_hsl.enabled" in source
+    assert "scalars[so + 61] = short_hsl.enabled" in source
     assert "record_gross_pnl" in source
     assert "hsl_tier_samples_total" in source
     assert "h.restart_retrigger_count" in source
@@ -8989,11 +7655,11 @@ def test_mps_ema_anchor_shader_smoke():
     row += _single_coin_exposure_fields() + _tm_twel_enforcer_fields()
     parameters = np.array([row + row, row + row], dtype=np.float64)
 
-    runner = MpsEmaAnchorRunner(market, run, data)
+    runner = MpsEmaAnchorRunner(market, run, data, pnl_lookback_bars=1440)
     output = runner.run(parameters)
     synchronize()
 
-    assert runner._buffers[2][1].shape == (2, 68)
+    assert runner._buffers[2][1].shape == (2, 66)
     assert (output["hsl_drawdown_ema_mean_worst_1pct_long"] == 0.0).all()
     assert (output["hsl_drawdown_ema_mean_worst_1pct_short"] == 0.0).all()
     assert output["balance"].device.type == gpu_device()
@@ -9004,20 +7670,15 @@ def test_mps_ema_anchor_shader_smoke():
     assert torch.isfinite(output["day_net_pnl"][fill_days]).all()
     assert (output["day_last_fill_balance"][fill_days] > 0.0).all()
     assert (output["day_fill_count"][fill_days] >= 1.0).all()
-    assert torch.equal(
-        output["day_fill_count"], output["day_fill_count"].round()
-    )
+    assert torch.equal(output["day_fill_count"], output["day_fill_count"].round())
     _assert_fill_scalar_contract(output)
     assert (output["total_wallet_exposure_max"] > 0.0).all()
     assert (
-        output["total_wallet_exposure_max"]
-        >= output["total_wallet_exposure_mean"]
+        output["total_wallet_exposure_max"] >= output["total_wallet_exposure_mean"]
     ).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_anchor_near_touch_market_entry_uses_next_close_and_taker_fee(side):
     count = 5
@@ -9070,11 +7731,14 @@ def test_mps_ema_anchor_near_touch_market_entry_uses_next_close_and_taker_fee(si
         "hsl_enabled": False,
     }
 
-    resting = MpsEmaAnchorRunner(market, run, data, **common).run(parameters)
+    resting = MpsEmaAnchorRunner(
+        market, run, data, pnl_lookback_bars=1440, **common
+    ).run(parameters)
     promoted_runner = MpsEmaAnchorRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         market_orders_allowed=True,
         market_order_near_touch_threshold=0.001,
         market_order_slippage_pct=0.01,
@@ -9086,6 +7750,7 @@ def test_mps_ema_anchor_near_touch_market_entry_uses_next_close_and_taker_fee(si
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         market_orders_allowed=True,
         market_order_near_touch_threshold=0.001,
         market_order_slippage_pct=0.01,
@@ -9096,7 +7761,7 @@ def test_mps_ema_anchor_near_touch_market_entry_uses_next_close_and_taker_fee(si
 
     assert promoted_runner.settings[19].item() == 1.0
     assert promoted_runner.settings[20].item() == pytest.approx(0.001)
-    assert promoted_runner.shader_topology == f"{side}_no_hsl"
+    assert promoted_runner.shader_topology == "generic"
     assert resting["fill_count"].item() == 0.0
     assert promoted["fill_count"].item() == 1.0
     assert promoted.keys() == generic.keys()
@@ -9122,9 +7787,7 @@ def test_mps_ema_anchor_near_touch_market_entry_uses_next_close_and_taker_fee(si
     assert promoted["balance"].item() == pytest.approx(expected_balance, abs=2.0e-4)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize(
     ("taker_fee", "market_order_slippage_pct"),
@@ -9174,7 +7837,7 @@ def test_mps_ema_market_close_loss_gate_projects_execution_cost(
             "entry_cooldown_minutes": 100.0,
             "total_wallet_exposure_limit": 1.0,
             "we_excess_allowance_pct": 0.0,
-            "we_excess_allowance_legacy_raw": 0.0,
+            "hsl_scale_budget_with_excess_allowance": 0.0,
             "twel_entry_gate_enabled": 1.0,
             "twel_enforcer_threshold": 1.0,
             "twel_enforcer_enabled": 0.0,
@@ -9192,10 +7855,10 @@ def test_mps_ema_market_close_loss_gate_projects_execution_cost(
     }
 
     ungated = MpsEmaAnchorRunner(
-        market, run, data, max_realized_loss_pct=1.0, **common
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=1.0, **common
     ).run(parameters)
     gated = MpsEmaAnchorRunner(
-        market, run, data, max_realized_loss_pct=0.0, **common
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=0.0, **common
     ).run(parameters)
     synchronize()
 
@@ -9206,9 +7869,7 @@ def test_mps_ema_market_close_loss_gate_projects_execution_cost(
     assert gated[size_key].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
     import passivbot_rust
@@ -9221,7 +7882,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
     )
     assert "kernel void passivbot_ema_anchor_multicoin" in source
     assert "kernel void passivbot_ema_anchor_multicoin_long" in source
-    assert "constant int PARAM_COLS = 44" in source
+    assert f"constant int PARAM_COLS = {len(EMA_ANCHOR_MULTICOIN_PARAM_KEYS)}" in source
     assert f"constant int OVERRIDE_COLS = {EMA_ANCHOR_COIN_OVERRIDE_COLS}" in source
     assert "allowed_wallet_exposure_limit" in source
     assert "twel_entry_gate_enabled" in source
@@ -9252,8 +7913,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
         hlcvs[:, coin, 3] = 100.0 * (coin + 1)
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
-        for _ in range(coin_count)
+        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002) for _ in range(coin_count)
     ]
     runs = [
         ProxyRun(
@@ -9295,10 +7955,12 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
     row += _single_coin_exposure_fields() + [0.0, 0.0]
     row += list(_UNSTUCK_DISABLED_VALUES.values())
     row += list(_HSL_DISABLED_VALUES.values()) + [2.0, 3.0]
+    row += list(_ADAPTIVE_DISABLED_VALUES.values())
 
     runner = MpsEmaAnchorMulticoinRunner(
         runs[0],
         data,
+        pnl_lookback_bars=1440,
         side=side,
         forager_score_hysteresis_pct=0.02,
         max_realized_loss_pct=0.1,
@@ -9314,7 +7976,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
     output = runner.run(np.array([row, row], dtype=np.float64))
     synchronize()
 
-    assert runner._buffers[2][1].shape == (2, 67)
+    assert runner._buffers[2][1].shape == (2, 65)
     assert (output["hsl_drawdown_ema_mean_worst_1pct_long"] == 0.0).all()
     assert (output["hsl_drawdown_ema_mean_worst_1pct_short"] == 0.0).all()
     assert (output["hsl_drawdown_raw_max_long"] == 0.0).all()
@@ -9335,9 +7997,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
         assert (output["fill_count_long"] == 0.0).all()
     recovery = strategy_eq_recovery_distribution_from_samples(
         output["strategy_eq_recovery_samples"],
-        sample_interval_days=output[
-            "strategy_eq_recovery_sample_interval_days"
-        ],
+        sample_interval_days=output["strategy_eq_recovery_sample_interval_days"],
     )
     assert torch.isfinite(recovery).all().item()
     assert (recovery[:, 3] > 0.0).all().item()
@@ -9346,17 +8006,23 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
         MpsEmaAnchorMulticoinRunner(
             runs[0],
             data,
+            pnl_lookback_bars=1440,
             side=side,
             forager_score_hysteresis_pct=-0.01,
         )
     with pytest.raises(ValueError, match="max_realized_loss_pct"):
         MpsEmaAnchorMulticoinRunner(
-            runs[0], data, side=side, max_realized_loss_pct=float("nan")
+            runs[0],
+            data,
+            pnl_lookback_bars=1440,
+            side=side,
+            max_realized_loss_pct=float("nan"),
         )
     with pytest.raises(ValueError, match="market_order_near_touch_threshold"):
         MpsEmaAnchorMulticoinRunner(
             runs[0],
             data,
+            pnl_lookback_bars=1440,
             side=side,
             market_order_near_touch_threshold=float("nan"),
         )
@@ -9369,7 +8035,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
     )
     disabled[:, 11] = 0.0
     disabled_output = MpsEmaAnchorMulticoinRunner(
-        runs[0], data, side=side, coin_overrides=disabled
+        runs[0], data, pnl_lookback_bars=1440, side=side, coin_overrides=disabled
     ).run(np.array([row], dtype=np.float64))
     synchronize()
     assert disabled_output["day_has_fill"].sum().item() == 0
@@ -9394,7 +8060,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
         30.0,
     ]
     exact_last_output = MpsEmaAnchorMulticoinRunner(
-        runs[0], data, side=side, coin_overrides=exact_last
+        runs[0], data, pnl_lookback_bars=1440, side=side, coin_overrides=exact_last
     ).run(np.array([row, changed_candidate], dtype=np.float64))
     synchronize()
     assert torch.equal(
@@ -9405,9 +8071,7 @@ def test_mps_ema_anchor_multicoin_directional_shader_smoke(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_market_entry_uses_stored_next_close_intent(side):
     count = 5
@@ -9450,9 +8114,7 @@ def test_mps_ema_multicoin_market_entry_uses_stored_next_close_intent(side):
         market_order_slippage_pct=0.01,
     )
     row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("offset")] = 0.0005
-    row[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")
-    ] = 100.0
+    row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = 100.0
     params = np.asarray([row], dtype=np.float64)
 
     resting = resting_runner.run(params)
@@ -9468,9 +8130,7 @@ def test_mps_ema_multicoin_market_entry_uses_stored_next_close_intent(side):
     assert promoted["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_trailing_market_entry_uses_stored_next_close_intent(side):
     count = 5
@@ -9513,25 +8173,17 @@ def test_mps_tm_multicoin_trailing_market_entry_uses_stored_next_close_intent(si
         market_order_slippage_pct=0.01,
     )
     row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_retracement_base_pct"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_retracement_base_pct")
     ] = 0.01
     row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "close_retracement_base_pct"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_retracement_base_pct")
     ] = 0.01
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_initial_ema_dist"
-        )
-    ] = 0.0005
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_cooldown_minutes"
-        )
-    ] = 100.0
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_ema_dist")] = (
+        0.0005
+    )
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = (
+        100.0
+    )
     params = np.asarray([row], dtype=np.float64)
 
     resting = resting_runner.run(params)
@@ -9547,9 +8199,7 @@ def test_mps_tm_multicoin_trailing_market_entry_uses_stored_next_close_intent(si
     assert promoted["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_recursive_market_entry_does_not_expose_suffix(side):
     count = 5
@@ -9584,9 +8234,7 @@ def test_mps_tm_multicoin_recursive_market_entry_does_not_expose_suffix(side):
     assert output["coin_fill_counts"].cpu().tolist() == [[1.0, 1.0]]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_batch_selects_market_mode_per_candidate(side):
     count = 6
@@ -9622,9 +8270,7 @@ def test_mps_tm_multicoin_batch_selects_market_mode_per_candidate(side):
         recursive[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key)] = value
     trailing = recursive.copy()
     trailing[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_retracement_base_pct"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_retracement_base_pct")
     ] = 0.01
 
     output = runner.run(np.asarray([recursive, trailing], dtype=np.float64))
@@ -9634,9 +8280,7 @@ def test_mps_tm_multicoin_batch_selects_market_mode_per_candidate(side):
     assert output["fill_count_entry"].cpu().tolist()[1] == 2.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_coin_override_controls_initial_ema_gate(side):
     count = 6
@@ -9679,9 +8323,7 @@ def test_mps_tm_multicoin_coin_override_controls_initial_ema_gate(side):
     assert output["coin_fill_counts"].cpu().tolist() == [[0.0, 1.0]]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_coin_override_controls_reentry_ema_gate(side):
     count = 7
@@ -9729,9 +8371,7 @@ def test_mps_tm_multicoin_coin_override_controls_reentry_ema_gate(side):
     assert coin_fills[1] > coin_fills[0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_fused_coin_overrides_resolve_ema_gates_per_side():
     count = 6
     closes = np.full((count, 2), 100.0)
@@ -9746,12 +8386,8 @@ def test_mps_tm_fused_coin_overrides_resolve_ema_gates_per_side():
     )
     long_overrides = empty.copy()
     short_overrides = empty.copy()
-    long_overrides[
-        1, TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN
-    ] = 0.0
-    short_overrides[
-        0, TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN
-    ] = 0.0
+    long_overrides[1, TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN] = 0.0
+    short_overrides[0, TRAILING_MARTINGALE_COIN_OVERRIDE_GATE_INITIAL_COLUMN] = 0.0
     _, row, run, data = _multicoin_exposure_fixture(
         "trailing_martingale",
         "long",
@@ -9773,6 +8409,7 @@ def test_mps_tm_fused_coin_overrides_resolve_ema_gates_per_side():
     runner = MpsTrailingMartingaleMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=long_overrides,
         short_coin_overrides=short_overrides,
         collect_coin_fill_counts=True,
@@ -9786,9 +8423,7 @@ def test_mps_tm_fused_coin_overrides_resolve_ema_gates_per_side():
     assert output["coin_fill_counts"].cpu().tolist() == [[1.0, 1.0]]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("cooldown, expands", [(0.0, True), (100.0, False)])
 def test_mps_tm_multicoin_recursive_market_entry_passive_suffix(
@@ -9838,9 +8473,7 @@ def test_mps_tm_multicoin_recursive_market_entry_passive_suffix(
         assert counts == [1.0, 1.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_recursive_market_entry_stops_duplicate_tick_suffix(
     side,
@@ -9883,16 +8516,16 @@ def test_mps_tm_multicoin_recursive_market_entry_stops_duplicate_tick_suffix(
     assert output["coin_fill_counts"].cpu().tolist() == [[1.0, 1.0]]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize(
     "threshold, expected_counts",
     [(0.06, [0.0, 1.0]), (0.16, [1.0, 2.0])],
 )
 def test_mps_tm_multicoin_recursive_entry_gate_orders_cross_coin_ladders(
-    side, threshold, expected_counts,
+    side,
+    threshold,
+    expected_counts,
 ):
     count = 5
     closes = np.tile(np.asarray([100.0, 100.0]), (count, 1))
@@ -9902,10 +8535,7 @@ def test_mps_tm_multicoin_recursive_entry_gate_orders_cross_coin_ladders(
         lows[3] = closes[3] * 0.8
     else:
         highs[3] = closes[3] * 1.2
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 20.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 20.0, 1.0, 0.0) for _ in range(2)]
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
         side,
@@ -9940,9 +8570,7 @@ def test_mps_tm_multicoin_recursive_entry_gate_orders_cross_coin_ladders(
     assert output["coin_fill_counts"].cpu().tolist() == [expected_counts]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_recursive_entry_gate_keeps_partial_boundary(side):
     count = 5
@@ -9988,9 +8616,7 @@ def test_mps_tm_multicoin_recursive_entry_gate_keeps_partial_boundary(side):
     assert 0.17 < exposure < 0.18
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_coin_override_selects_recursive_market_entry(side):
     count = 6
@@ -10001,7 +8627,9 @@ def test_mps_tm_multicoin_coin_override_selects_recursive_market_entry(side):
         lows[3] = closes[3] * 0.8
     else:
         highs[3] = closes[3] * 1.2
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 11] = 0.0
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -10036,9 +8664,7 @@ def test_mps_tm_multicoin_coin_override_selects_recursive_market_entry(side):
     assert counts[1] > 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_trailing_market_close_uses_stored_next_close_intent(side):
     count = 8
@@ -10115,9 +8741,7 @@ def test_mps_tm_multicoin_trailing_market_close_uses_stored_next_close_intent(si
     assert output["balance"][1].item() < output["balance"][0].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_recursive_next_close_promotes_without_suffix(side):
     count = 7
@@ -10127,8 +8751,13 @@ def test_mps_tm_multicoin_recursive_next_close_promotes_without_suffix(side):
     lows = closes.copy()
     markets = [
         ProxyMarket(
-            0.001, 0.01, 0.001, 0.0, 1.0,
-            maker_fee=0.0, taker_fee=0.01,
+            0.001,
+            0.01,
+            0.001,
+            0.0,
+            1.0,
+            maker_fee=0.0,
+            taker_fee=0.01,
         )
         for _ in range(2)
     ]
@@ -10167,9 +8796,7 @@ def test_mps_tm_multicoin_recursive_next_close_promotes_without_suffix(side):
     assert output["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_expanded_recursive_close_promotes_each_group(side):
     count = 6
@@ -10184,8 +8811,13 @@ def test_mps_tm_multicoin_expanded_recursive_close_promotes_each_group(side):
         lows[4] = base * (1.0 - trigger_distance)
     markets = [
         ProxyMarket(
-            0.001, 0.01, 0.001, 0.0, 1.0,
-            maker_fee=0.0, taker_fee=0.01,
+            0.001,
+            0.01,
+            0.001,
+            0.0,
+            1.0,
+            maker_fee=0.0,
+            taker_fee=0.01,
         )
         for _ in range(2)
     ]
@@ -10232,15 +8864,15 @@ def test_mps_tm_multicoin_expanded_recursive_close_promotes_each_group(side):
     assert output["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_coin_override_selects_recursive_market_close(side):
     count = 7
     base = np.asarray([100.0, 120.0])
     closes = np.tile(base, (count, 1))
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 20] = 0.0
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -10276,9 +8908,7 @@ def test_mps_tm_multicoin_coin_override_selects_recursive_market_close(side):
     assert output[size_key].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_recursive_market_close_uses_executable_minimum(side):
     count = 7
@@ -10287,7 +8917,9 @@ def test_mps_tm_multicoin_recursive_market_close_uses_executable_minimum(side):
         ProxyMarket(0.001, 0.01, 0.001, 100.04, 1.0, 0.0),
         ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0),
     ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -10326,14 +8958,10 @@ def test_mps_tm_multicoin_recursive_market_close_uses_executable_minimum(side):
     # The requested 10% close is below the executable market minimum; the
     # promoted order is raised to that minimum without closing the position.
     expected_remaining = 8.998 if side == "long" else 8.987
-    assert output[size_key].item() == pytest.approx(
-        expected_remaining, abs=0.002
-    )
+    assert output[size_key].item() == pytest.approx(expected_remaining, abs=0.002)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_recursive_market_close_preserves_below_min_position():
     count = 7
     closes = np.tile(np.asarray([100.0, 120.0]), (count, 1))
@@ -10345,7 +8973,9 @@ def test_mps_tm_multicoin_recursive_market_close_preserves_below_min_position():
         ProxyMarket(0.001, 0.01, 0.001, 600.0, 1.0, 0.0),
         ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0),
     ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -10387,9 +9017,7 @@ def test_mps_tm_multicoin_recursive_market_close_preserves_below_min_position():
     assert output["short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_short_market_entry_uses_executable_minimum():
     count = 5
     closes = np.tile(np.asarray([100.0, 120.0]), (count, 1))
@@ -10397,9 +9025,7 @@ def test_mps_ema_multicoin_short_market_entry_uses_executable_minimum():
         ProxyMarket(0.001, 0.01, 0.001, 100.04, 1.0, 0.0),
         ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0),
     ]
-    overrides = np.full(
-        (2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
-    )
+    overrides = np.full((2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
     overrides[1, 11] = 0.0
     runner, row = _multicoin_exposure_fixture(
         "ema_anchor",
@@ -10427,9 +9053,7 @@ def test_mps_ema_multicoin_short_market_entry_uses_executable_minimum():
     assert output["short_psize"].item() == pytest.approx(1.001)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_short_market_entry_uses_executable_minimum():
     count = 5
     closes = np.tile(np.asarray([100.0, 120.0]), (count, 1))
@@ -10437,7 +9061,9 @@ def test_mps_tm_multicoin_short_market_entry_uses_executable_minimum():
         ProxyMarket(0.001, 0.01, 0.001, 100.04, 1.0, 0.0),
         ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0),
     ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -10469,9 +9095,7 @@ def test_mps_tm_multicoin_short_market_entry_uses_executable_minimum():
     assert output["short_psize"].item() == pytest.approx(1.001)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_market_entry_cap_uses_market_touch(side):
     count = 5
@@ -10482,10 +9106,7 @@ def test_mps_ema_multicoin_market_entry_cap_uses_market_touch(side):
         lows[-1] = 99.0
     else:
         highs[-1] = 101.0
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0) for _ in range(2)]
     market_runner, row = _multicoin_exposure_fixture(
         "ema_anchor",
         side,
@@ -10499,9 +9120,7 @@ def test_mps_ema_multicoin_market_entry_cap_uses_market_touch(side):
     )
     row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("base_qty_pct")] = 1.0
     row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("offset")] = 0.002
-    row[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("total_wallet_exposure_limit")
-    ] = 0.2
+    row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("total_wallet_exposure_limit")] = 0.2
     row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("n_positions")] = 2.0
     params = np.asarray([row], dtype=np.float64)
 
@@ -10518,9 +9137,7 @@ def test_mps_ema_multicoin_market_entry_cap_uses_market_touch(side):
     assert promoted["total_wallet_exposure_max"].item() < 0.2
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_market_entry_cap_uses_market_touch(side):
     count = 5
@@ -10531,10 +9148,7 @@ def test_mps_tm_multicoin_market_entry_cap_uses_market_touch(side):
         lows[-1] = 99.0
     else:
         highs[-1] = 101.0
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0) for _ in range(2)]
     market_runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
         side,
@@ -10571,9 +9185,7 @@ def test_mps_tm_multicoin_market_entry_cap_uses_market_touch(side):
     assert promoted["total_wallet_exposure_max"].item() < 0.2
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_market_close_uses_stored_next_close_intent(side):
     count = 6
@@ -10616,9 +9228,7 @@ def test_mps_ema_multicoin_market_close_uses_stored_next_close_intent(side):
         market_order_slippage_pct=0.01,
     )
     row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("offset")] = 0.0005
-    row[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")
-    ] = 100.0
+    row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = 100.0
     params = np.asarray([row], dtype=np.float64)
 
     resting = resting_runner.run(params)
@@ -10640,9 +9250,7 @@ def test_mps_ema_multicoin_market_close_uses_stored_next_close_intent(side):
     assert promoted["balance"][1].item() < promoted["balance"][0].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_multicoin_fused_market_execution_covers_both_sides():
     count = 6
     closes = np.tile(np.asarray([100.0, 120.0]), (count, 1))
@@ -10669,16 +9277,13 @@ def test_mps_ema_multicoin_fused_market_execution_covers_both_sides():
         return_context=True,
     )
     row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("offset")] = 0.0005
-    row[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")
-    ] = 100.0
+    row[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = 100.0
     params = np.asarray([row + row, row + row], dtype=np.float64)
-    overrides = np.full(
-        (2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
-    )
+    overrides = np.full((2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
     resting_runner = MpsEmaAnchorMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         collect_coin_fill_counts=True,
@@ -10687,6 +9292,7 @@ def test_mps_ema_multicoin_fused_market_execution_covers_both_sides():
     market_runner = MpsEmaAnchorMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         collect_coin_fill_counts=True,
@@ -10711,16 +9317,11 @@ def test_mps_ema_multicoin_fused_market_execution_covers_both_sides():
         [4.0, 4.0],
     ]
     assert promoted["psize"][1].item() < promoted["psize"][0].item()
-    assert (
-        promoted["short_psize"][1].item()
-        < promoted["short_psize"][0].item()
-    )
+    assert promoted["short_psize"][1].item() < promoted["short_psize"][0].item()
     assert promoted["balance"][1].item() < promoted["balance"][0].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("hedge_mode", [True, False])
 def test_mps_tm_multicoin_fused_trailing_market_entries_respect_position_mode(
     hedge_mode,
@@ -10757,10 +9358,13 @@ def test_mps_tm_multicoin_fused_trailing_market_entries_respect_position_mode(
     }.items():
         row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key)] = value
     params = np.asarray([row + row], dtype=np.float64)
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     resting_runner = MpsTrailingMartingaleMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         collect_coin_fill_counts=True,
@@ -10769,6 +9373,7 @@ def test_mps_tm_multicoin_fused_trailing_market_entries_respect_position_mode(
     market_runner = MpsTrailingMartingaleMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         collect_coin_fill_counts=True,
@@ -10802,9 +9407,7 @@ def test_mps_tm_multicoin_fused_trailing_market_entries_respect_position_mode(
     assert promoted["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("hedge_mode", [True, False])
 def test_mps_tm_multicoin_fused_recursive_market_entries_respect_position_mode(
     hedge_mode,
@@ -10837,10 +9440,13 @@ def test_mps_tm_multicoin_fused_recursive_market_entries_respect_position_mode(
     }.items():
         row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key)] = value
     params = np.asarray([row + row], dtype=np.float64)
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     runner = MpsTrailingMartingaleMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         collect_coin_fill_counts=True,
@@ -10861,14 +9467,10 @@ def test_mps_tm_multicoin_fused_recursive_market_entries_respect_position_mode(
         assert output["psize"].item() > 0.0
         assert output["short_psize"].item() > 0.0
     else:
-        assert (output["psize"].item() > 0.0) != (
-            output["short_psize"].item() > 0.0
-        )
+        assert (output["psize"].item() > 0.0) != (output["short_psize"].item() > 0.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("hedge_mode", [True, False])
 def test_mps_tm_multicoin_fused_recursive_market_closes_respect_position_mode(
     hedge_mode,
@@ -10882,8 +9484,13 @@ def test_mps_tm_multicoin_fused_recursive_market_closes_respect_position_mode(
     lows[4] = base * 0.94
     markets = [
         ProxyMarket(
-            0.001, 0.01, 0.001, 0.0, 1.0,
-            maker_fee=0.0, taker_fee=0.01,
+            0.001,
+            0.01,
+            0.001,
+            0.0,
+            1.0,
+            maker_fee=0.0,
+            taker_fee=0.01,
         )
         for _ in range(2)
     ]
@@ -10909,10 +9516,13 @@ def test_mps_tm_multicoin_fused_recursive_market_closes_respect_position_mode(
     }.items():
         row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(key)] = value
     params = np.asarray([row + row], dtype=np.float64)
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     runner = MpsTrailingMartingaleMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=overrides,
         short_coin_overrides=overrides,
         collect_coin_fill_counts=True,
@@ -10931,15 +9541,12 @@ def test_mps_tm_multicoin_fused_recursive_market_closes_respect_position_mode(
     assert output["short_psize"].item() == 0.0
     expected_min_coin_fills = 4.0 if hedge_mode else 2.0
     assert all(
-        count > expected_min_coin_fills
-        for count in output["coin_fill_counts"][0].cpu()
+        count > expected_min_coin_fills for count in output["coin_fill_counts"][0].cpu()
     )
     assert output["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     import passivbot_rust
 
@@ -10950,7 +9557,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         raw_tail_enabled=True,
     )
     assert "kernel void passivbot_ema_anchor_multicoin_fused" in source
-    assert "constant int FUSED_SCALAR_COLS = 74" in source
+    assert "constant int FUSED_SCALAR_COLS = 72" in source
 
     count = 512
     coin_count = 3
@@ -10964,8 +9571,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         hlcvs[:, coin, 3] = 100.0 * (coin + 1)
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
-        for _ in range(coin_count)
+        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002) for _ in range(coin_count)
     ]
     runs = [
         ProxyRun(
@@ -11013,7 +9619,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         hsl["hsl_enabled"] = 1.0
         hsl["hsl_red_threshold"] = 0.9
         hsl["hsl_signal_mode"] = float(signal_mode)
-        row = base + list(hsl.values()) + [2.0, 3.0]
+        row = base + list(hsl.values()) + [2.0, 3.0] + list(_ADAPTIVE_DISABLED_VALUES.values())
         assert len(row) == len(EMA_ANCHOR_MULTICOIN_PARAM_KEYS)
         return row
 
@@ -11084,12 +9690,31 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     )
     daily[:, :, 1].fill_(float("inf"))
     daily[:, :, 5].fill_(float("inf"))
-    scalars = torch.zeros((batch_size, 74), dtype=torch.float32, device=gpu_device())
+    scalars = torch.zeros((batch_size, 72), dtype=torch.float32, device=gpu_device())
     gaps = torch.zeros((batch_size, 128), dtype=torch.int32, device=gpu_device())
     coin_fill_counts = torch.zeros(
         (batch_size, coin_count), dtype=torch.float32, device=gpu_device()
     )
 
+    # Match the production history specialization and scratch ABI.
+    capacity = min(count + 2, 1440 + 2)
+    _, nodes = _hsl_layout(capacity)
+    hsl_buffers = (
+        torch.empty(
+            (batch_size, 2 * (coin_count + 1), nodes, 32),
+            dtype=torch.uint8,
+            device=gpu_device(),
+        ),
+        torch.empty(
+            (batch_size, 2 * (coin_count + 1), capacity * 2),
+            dtype=torch.int32,
+            device=gpu_device(),
+        ),
+    )
+    source = "#define PASSIVBOT_HSL_LOOKBACK 1440\n" + _with_hsl(source, capacity)
+    source = source.replace(
+        "constant int MAX_COINS = 64;", f"constant int MAX_COINS = {coin_count};"
+    )
     library = compile_shader(source)
     library.passivbot_ema_anchor_multicoin_fused(
         data["bars"],
@@ -11107,6 +9732,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         scalars,
         gaps,
         coin_fill_counts,
+        *hsl_buffers,
         threads=(batch_size, 1, 1),
     )
     synchronize()
@@ -11118,19 +9744,13 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     assert (values[:3, 24] - values[:3, 26] > 0.0).all()
     assert values[:3, 32:34].tolist() == [[1.0, 1.0]] * 3
     assert (values[:3, 38] > 0.0).all()
+    assert (values[:3, 64] > 0.0).all()
+    assert (values[:3, 65] > 0.0).all()
     assert (values[:3, 66] > 0.0).all()
     assert (values[:3, 67] > 0.0).all()
-    assert (values[:3, 68] > 0.0).all()
-    assert (values[:3, 69] > 0.0).all()
-    np.testing.assert_allclose(
-        values[:3, 18], values[:3, 60] + values[:3, 62]
-    )
-    np.testing.assert_allclose(
-        values[:3, 19], values[:3, 61] + values[:3, 63]
-    )
-    np.testing.assert_allclose(
-        values[:3, 24], daily[:3, :, 8].sum(dim=1).cpu().numpy()
-    )
+    np.testing.assert_allclose(values[:3, 18], values[:3, 58] + values[:3, 60])
+    np.testing.assert_allclose(values[:3, 19], values[:3, 59] + values[:3, 61])
+    np.testing.assert_allclose(values[:3, 24], daily[:3, :, 8].sum(dim=1).cpu().numpy())
     # Rust analyzes abs(long TWE + signed short TWE), not gross exposure.
     assert (values[:3, 22] <= 1.01).all()
     assert (coin_fill_counts[:3].sum(dim=1).cpu().numpy() > 0.0).all()
@@ -11151,6 +9771,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     runner = MpsEmaAnchorMulticoinFusedRunner(
         runs[0],
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=override_matrix,
         short_coin_overrides=override_matrix,
         forager_score_hysteresis_pct=0.02,
@@ -11162,84 +9783,93 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         recovery_distribution_enabled=True,
     )
     torch.testing.assert_close(runner.settings, run_settings)
+    for invalid_row in rows[3:5]:
+        with pytest.raises(ValueError, match="HSL"):
+            runner.run(np.asarray([invalid_row], dtype=np.float64))
+    valid_indices = [0, 1, 2, 5, 6, 7]
     runner_output = runner.run(
-        np.asarray(rows, dtype=np.float64), profile=True
+        np.asarray(rows, dtype=np.float64)[valid_indices], profile=True
     )
     synchronize()
-    torch.testing.assert_close(runner_output["day_end_eq"], daily[:, :, 0])
-    torch.testing.assert_close(runner_output["day_min_eq"], daily[:, :, 1])
-    torch.testing.assert_close(runner_output["fill_count"], scalars[:, 24])
+    torch.testing.assert_close(runner_output["day_end_eq"], daily[valid_indices, :, 0])
+    torch.testing.assert_close(runner_output["day_min_eq"], daily[valid_indices, :, 1])
+    torch.testing.assert_close(runner_output["fill_count"], scalars[valid_indices, 24])
     torch.testing.assert_close(
-        runner_output["entry_initial_balance_pct_long"], scalars[:, 21]
+        runner_output["entry_initial_balance_pct_long"], scalars[valid_indices, 21]
     )
     torch.testing.assert_close(
-        runner_output["entry_initial_balance_pct_short"], scalars[:, 59]
+        runner_output["entry_initial_balance_pct_short"], scalars[valid_indices, 57]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_max_long"], scalars[:, 57]
+        runner_output["hsl_drawdown_ema_max_long"], scalars[valid_indices, 55]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_max_short"], scalars[:, 58]
-    )
-    torch.testing.assert_close(runner_output["profit_sum_long"], scalars[:, 60])
-    torch.testing.assert_close(runner_output["loss_sum_long"], scalars[:, 61])
-    torch.testing.assert_close(runner_output["profit_sum_short"], scalars[:, 62])
-    torch.testing.assert_close(runner_output["loss_sum_short"], scalars[:, 63])
-    torch.testing.assert_close(
-        runner_output["hsl_strategy_eq_recovery_max_ms_long"], scalars[:, 64]
+        runner_output["hsl_drawdown_ema_max_short"], scalars[valid_indices, 56]
     )
     torch.testing.assert_close(
-        runner_output["hsl_strategy_eq_recovery_max_ms_short"], scalars[:, 65]
+        runner_output["profit_sum_long"], scalars[valid_indices, 58]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_mean_worst_1pct_long"], scalars[:, 66]
+        runner_output["loss_sum_long"], scalars[valid_indices, 59]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_mean_worst_1pct_short"], scalars[:, 67]
+        runner_output["profit_sum_short"], scalars[valid_indices, 60]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_raw_max_long"], scalars[:, 68]
+        runner_output["loss_sum_short"], scalars[valid_indices, 61]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_raw_max_short"], scalars[:, 69]
+        runner_output["hsl_strategy_eq_recovery_max_ms_long"],
+        scalars[valid_indices, 62],
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_raw_mean_worst_1pct_long"], scalars[:, 70]
+        runner_output["hsl_strategy_eq_recovery_max_ms_short"],
+        scalars[valid_indices, 63],
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_raw_mean_worst_1pct_short"], scalars[:, 71]
+        runner_output["hsl_drawdown_ema_mean_worst_1pct_long"],
+        scalars[valid_indices, 64],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_ema_mean_worst_1pct_short"],
+        scalars[valid_indices, 65],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_raw_max_long"], scalars[valid_indices, 66]
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_raw_max_short"], scalars[valid_indices, 67]
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_raw_mean_worst_1pct_long"],
+        scalars[valid_indices, 68],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_raw_mean_worst_1pct_short"],
+        scalars[valid_indices, 69],
     )
     assert runner_output["alive"].cpu().tolist() == [
         True,
         True,
         True,
-        False,
-        False,
         True,
         True,
         True,
     ]
-    assert torch.equal(runner_output["coin_fill_counts"], coin_fill_counts)
+    assert torch.equal(
+        runner_output["coin_fill_counts"], coin_fill_counts[valid_indices]
+    )
     recovery = strategy_eq_recovery_distribution_from_samples(
         runner_output["strategy_eq_recovery_samples"],
-        sample_interval_days=runner_output[
-            "strategy_eq_recovery_sample_interval_days"
-        ],
+        sample_interval_days=runner_output["strategy_eq_recovery_sample_interval_days"],
     )
     assert torch.isfinite(recovery).all().item()
-    assert (recovery[[0, 1, 2, 5, 6, 7], 3] > 0.0).all().item()
-    assert (
-        runner_output["strategy_eq_recovery_samples"][3:5, 0] < 0.0
-    ).all().item()
+    assert (recovery[:, 3] > 0.0).all().item()
     assert runner.last_profile["kernel_seconds"] >= 0.0
 
     metric_rows = []
-    red_threshold_index = EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(
-        "hsl_red_threshold"
-    )
-    restart_policy_index = EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(
-        "hsl_restart_policy"
-    )
+    red_threshold_index = EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("hsl_red_threshold")
+    restart_policy_index = EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("hsl_restart_policy")
     for signal_mode in range(3):
         row = side_row(signal_mode) + side_row(signal_mode)
         for side_offset in (0, len(EMA_ANCHOR_MULTICOIN_PARAM_KEYS)):
@@ -11248,6 +9878,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         metric_rows.append(row)
 
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+    proxy.hsl_engine = "legacy"
     proxy.batch_size = 3
     proxy._torch = torch
     proxy.profile_enabled = False
@@ -11276,12 +9907,8 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     proxy.param_keys = EMA_ANCHOR_MULTICOIN_PARAM_KEYS
     width = len(EMA_ANCHOR_MULTICOIN_PARAM_KEYS)
     proxy.base_params = {
-        "long": dict(
-            zip(EMA_ANCHOR_MULTICOIN_PARAM_KEYS, metric_rows[0][:width])
-        ),
-        "short": dict(
-            zip(EMA_ANCHOR_MULTICOIN_PARAM_KEYS, metric_rows[0][width:])
-        ),
+        "long": dict(zip(EMA_ANCHOR_MULTICOIN_PARAM_KEYS, metric_rows[0][:width])),
+        "short": dict(zip(EMA_ANCHOR_MULTICOIN_PARAM_KEYS, metric_rows[0][width:])),
     }
     proxy.fused_runner = runner
     proxy.runners = {}
@@ -11359,7 +9986,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         for item in service_results
     )
 
-    with pytest.raises(ValueError, match="88 columns"):
+    with pytest.raises(ValueError, match=f"{2 * len(EMA_ANCHOR_MULTICOIN_PARAM_KEYS)} columns"):
         runner.run(np.asarray([side_row(0)], dtype=np.float64))
     truncated = runner.run(
         np.asarray([rows[0]], dtype=np.float64),
@@ -11380,7 +10007,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     )
     override_daily[:, :, 1].fill_(float("inf"))
     override_daily[:, :, 5].fill_(float("inf"))
-    override_scalars = torch.zeros((1, 74), dtype=torch.float32, device=gpu_device())
+    override_scalars = torch.zeros((1, 72), dtype=torch.float32, device=gpu_device())
     override_gaps = torch.zeros((1, 128), dtype=torch.int32, device=gpu_device())
     override_coin_fills = torch.zeros(
         (1, coin_count), dtype=torch.float32, device=gpu_device()
@@ -11401,6 +10028,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
         override_scalars,
         override_gaps,
         override_coin_fills,
+        *hsl_buffers,
         threads=(1, 1, 1),
     )
     synchronize()
@@ -11409,9 +10037,7 @@ def test_mps_ema_anchor_multicoin_fused_kernel_smoke_all_hsl_modes():
     assert override_scalars[0, 24].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("runner_cls", "param_keys"),
     [
@@ -11434,8 +10060,7 @@ def test_mps_fused_multicoin_one_way_arbitrates_each_flat_symbol(
     hlcvs[:, :, 3] = 100.0
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
-        for _ in range(coin_count)
+        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002) for _ in range(coin_count)
     ]
     runs = [
         ProxyRun(
@@ -11485,8 +10110,12 @@ def test_mps_fused_multicoin_one_way_arbitrates_each_flat_symbol(
     side_row = [values[key] for key in param_keys]
     params = np.asarray([side_row + side_row], dtype=np.float64)
 
-    hedge_output = runner_cls(runs[0], data, hedge_mode=True).run(params)
-    one_way_output = runner_cls(runs[0], data, hedge_mode=False).run(params)
+    hedge_output = runner_cls(
+        runs[0], data, pnl_lookback_bars=1440, hedge_mode=True
+    ).run(params)
+    one_way_output = runner_cls(
+        runs[0], data, pnl_lookback_bars=1440, hedge_mode=False
+    ).run(params)
     override_cols = (
         EMA_ANCHOR_COIN_OVERRIDE_COLS
         if runner_cls is MpsEmaAnchorMulticoinFusedRunner
@@ -11500,27 +10129,24 @@ def test_mps_fused_multicoin_one_way_arbitrates_each_flat_symbol(
     mixed_output = runner_cls(
         runs[0],
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=long_overrides,
         short_coin_overrides=short_overrides,
         hedge_mode=False,
     ).run(params)
     synchronize()
 
-    assert hedge_output["fill_count"].item() > hedge_output[
-        "fill_count_long"
-    ].item()
+    assert hedge_output["fill_count"].item() > hedge_output["fill_count_long"].item()
     assert one_way_output["fill_count"].item() > 0.0
-    assert one_way_output["fill_count"].item() == one_way_output[
-        "fill_count_long"
-    ].item()
-    assert 0.0 < mixed_output["fill_count_long"].item() < mixed_output[
-        "fill_count"
-    ].item()
+    assert (
+        one_way_output["fill_count"].item() == one_way_output["fill_count_long"].item()
+    )
+    assert (
+        0.0 < mixed_output["fill_count_long"].item() < mixed_output["fill_count"].item()
+    )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
     import passivbot_rust
 
@@ -11531,7 +10157,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         raw_tail_enabled=True,
     )
     assert "kernel void passivbot_trailing_martingale_multicoin_fused" in source
-    assert "constant int FUSED_SCALAR_COLS = 74" in source
+    assert "constant int FUSED_SCALAR_COLS = 72" in source
 
     count = 512
     coin_count = 3
@@ -11545,8 +10171,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         hlcvs[:, coin, 3] = 100.0 * (coin + 1)
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
-        for _ in range(coin_count)
+        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002) for _ in range(coin_count)
     ]
     runs = [
         ProxyRun(
@@ -11601,7 +10226,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         "forager_score_weights_volatility": 0.0,
         "n_positions": 2.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 1.0,
         "twel_enforcer_threshold": 1.0,
         "wel_enforcer_enabled": 0.0,
@@ -11609,6 +10234,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         "twel_enforcer_enabled": 0.0,
         "twel_enforcer_reduce_portfolio": 0.0,
         **_UNSTUCK_DISABLED_VALUES,
+        **_ADAPTIVE_DISABLED_VALUES,
         "unstuck_ema_span_0": 2.0,
         "unstuck_ema_span_1": 3.0,
         **_HSL_DISABLED_VALUES,
@@ -11619,18 +10245,16 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         side_values["hsl_enabled"] = 1.0
         side_values["hsl_red_threshold"] = 0.9
         side_values["hsl_signal_mode"] = float(signal_mode)
-        return [
-            side_values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-        ]
+        return [side_values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     unstuck_long = side_row(0)
-    unstuck_long[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("unstuck_enabled")
-    ] = 1.0
+    unstuck_long[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("unstuck_enabled")] = (
+        1.0
+    )
     unstuck_short = side_row(0)
-    unstuck_short[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("unstuck_enabled")
-    ] = 1.0
+    unstuck_short[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("unstuck_enabled")] = (
+        1.0
+    )
     rows = [
         side_row(0) + side_row(0),
         side_row(1) + side_row(1),
@@ -11693,12 +10317,31 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
     )
     daily[:, :, 1].fill_(float("inf"))
     daily[:, :, 5].fill_(float("inf"))
-    scalars = torch.zeros((batch_size, 74), dtype=torch.float32, device=gpu_device())
+    scalars = torch.zeros((batch_size, 72), dtype=torch.float32, device=gpu_device())
     gaps = torch.zeros((batch_size, 128), dtype=torch.int32, device=gpu_device())
     coin_fill_counts = torch.zeros(
         (batch_size, coin_count), dtype=torch.float32, device=gpu_device()
     )
 
+    # Match the production history specialization and scratch ABI.
+    capacity = min(count + 2, 1440 + 2)
+    _, nodes = _hsl_layout(capacity)
+    hsl_buffers = (
+        torch.empty(
+            (batch_size, 2 * (coin_count + 1), nodes, 32),
+            dtype=torch.uint8,
+            device=gpu_device(),
+        ),
+        torch.empty(
+            (batch_size, 2 * (coin_count + 1), capacity * 2),
+            dtype=torch.int32,
+            device=gpu_device(),
+        ),
+    )
+    source = "#define PASSIVBOT_HSL_LOOKBACK 1440\n" + _with_hsl(source, capacity)
+    source = source.replace(
+        "constant int MAX_COINS = 64;", f"constant int MAX_COINS = {coin_count};"
+    )
     library = compile_shader(source)
     library.passivbot_trailing_martingale_multicoin_fused(
         data["bars"],
@@ -11719,6 +10362,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         scalars,
         gaps,
         coin_fill_counts,
+        *hsl_buffers,
         threads=(batch_size, 1, 1),
     )
     synchronize()
@@ -11730,15 +10374,13 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
     assert (output[:3, 24] - output[:3, 26] > 0.0).all()
     assert output[:3, 32:34].tolist() == [[1.0, 1.0]] * 3
     assert (output[:3, 38] > 0.0).all()
+    assert (output[:3, 64] > 0.0).all()
+    assert (output[:3, 65] > 0.0).all()
     assert (output[:3, 66] > 0.0).all()
     assert (output[:3, 67] > 0.0).all()
-    assert (output[:3, 68] > 0.0).all()
-    assert (output[:3, 69] > 0.0).all()
-    np.testing.assert_allclose(output[:3, 18], output[:3, 60] + output[:3, 62])
-    np.testing.assert_allclose(output[:3, 19], output[:3, 61] + output[:3, 63])
-    np.testing.assert_allclose(
-        output[:3, 24], daily[:3, :, 8].sum(dim=1).cpu().numpy()
-    )
+    np.testing.assert_allclose(output[:3, 18], output[:3, 58] + output[:3, 60])
+    np.testing.assert_allclose(output[:3, 19], output[:3, 59] + output[:3, 61])
+    np.testing.assert_allclose(output[:3, 24], daily[:3, :, 8].sum(dim=1).cpu().numpy())
     assert (output[:3, 22] <= 1.01).all()
     assert (coin_fill_counts[:3].sum(dim=1).cpu().numpy() > 0.0).all()
     assert output[3:5, 9].tolist() == [0.0, 0.0]
@@ -11756,6 +10398,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
     runner = MpsTrailingMartingaleMulticoinFusedRunner(
         runs[0],
         data,
+        pnl_lookback_bars=1440,
         long_coin_overrides=override_matrix,
         short_coin_overrides=override_matrix,
         forager_score_hysteresis_pct=0.02,
@@ -11767,67 +10410,80 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         recovery_distribution_enabled=True,
     )
     torch.testing.assert_close(runner.settings, run_settings)
-    runner_output = runner.run(np.asarray(rows, dtype=np.float64), profile=True)
+    for invalid_row in rows[3:5]:
+        with pytest.raises(ValueError, match="HSL"):
+            runner.run(np.asarray([invalid_row], dtype=np.float64))
+    valid_indices = [0, 1, 2, 5, 6, 7]
+    runner_output = runner.run(
+        np.asarray(rows, dtype=np.float64)[valid_indices], profile=True
+    )
     synchronize()
-    torch.testing.assert_close(runner_output["day_end_eq"], daily[:, :, 0])
-    torch.testing.assert_close(runner_output["day_min_eq"], daily[:, :, 1])
-    torch.testing.assert_close(runner_output["fill_count"], scalars[:, 24])
+    torch.testing.assert_close(runner_output["day_end_eq"], daily[valid_indices, :, 0])
+    torch.testing.assert_close(runner_output["day_min_eq"], daily[valid_indices, :, 1])
+    torch.testing.assert_close(runner_output["fill_count"], scalars[valid_indices, 24])
     torch.testing.assert_close(
-        runner_output["entry_initial_balance_pct_long"], scalars[:, 21]
+        runner_output["entry_initial_balance_pct_long"], scalars[valid_indices, 21]
     )
     torch.testing.assert_close(
-        runner_output["entry_initial_balance_pct_short"], scalars[:, 59]
+        runner_output["entry_initial_balance_pct_short"], scalars[valid_indices, 57]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_max_long"], scalars[:, 57]
+        runner_output["hsl_drawdown_ema_max_long"], scalars[valid_indices, 55]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_max_short"], scalars[:, 58]
-    )
-    torch.testing.assert_close(runner_output["profit_sum_long"], scalars[:, 60])
-    torch.testing.assert_close(runner_output["loss_sum_long"], scalars[:, 61])
-    torch.testing.assert_close(runner_output["profit_sum_short"], scalars[:, 62])
-    torch.testing.assert_close(runner_output["loss_sum_short"], scalars[:, 63])
-    torch.testing.assert_close(
-        runner_output["hsl_strategy_eq_recovery_max_ms_long"], scalars[:, 64]
+        runner_output["hsl_drawdown_ema_max_short"], scalars[valid_indices, 56]
     )
     torch.testing.assert_close(
-        runner_output["hsl_strategy_eq_recovery_max_ms_short"], scalars[:, 65]
+        runner_output["profit_sum_long"], scalars[valid_indices, 58]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_mean_worst_1pct_long"], scalars[:, 66]
+        runner_output["loss_sum_long"], scalars[valid_indices, 59]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_ema_mean_worst_1pct_short"], scalars[:, 67]
+        runner_output["profit_sum_short"], scalars[valid_indices, 60]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_raw_max_long"], scalars[:, 68]
+        runner_output["loss_sum_short"], scalars[valid_indices, 61]
     )
     torch.testing.assert_close(
-        runner_output["hsl_drawdown_raw_max_short"], scalars[:, 69]
+        runner_output["hsl_strategy_eq_recovery_max_ms_long"],
+        scalars[valid_indices, 62],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_strategy_eq_recovery_max_ms_short"],
+        scalars[valid_indices, 63],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_ema_mean_worst_1pct_long"],
+        scalars[valid_indices, 64],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_ema_mean_worst_1pct_short"],
+        scalars[valid_indices, 65],
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_raw_max_long"], scalars[valid_indices, 66]
+    )
+    torch.testing.assert_close(
+        runner_output["hsl_drawdown_raw_max_short"], scalars[valid_indices, 67]
     )
     assert runner_output["alive"].cpu().tolist() == [
         True,
         True,
         True,
-        False,
-        False,
         True,
         True,
         True,
     ]
-    assert torch.equal(runner_output["coin_fill_counts"], coin_fill_counts)
+    assert torch.equal(
+        runner_output["coin_fill_counts"], coin_fill_counts[valid_indices]
+    )
     recovery = strategy_eq_recovery_distribution_from_samples(
         runner_output["strategy_eq_recovery_samples"],
-        sample_interval_days=runner_output[
-            "strategy_eq_recovery_sample_interval_days"
-        ],
+        sample_interval_days=runner_output["strategy_eq_recovery_sample_interval_days"],
     )
     assert torch.isfinite(recovery).all().item()
-    assert (recovery[[0, 1, 2, 5, 6, 7], 3] > 0.0).all().item()
-    assert (
-        runner_output["strategy_eq_recovery_samples"][3:5, 0] < 0.0
-    ).all().item()
+    assert (recovery[:, 3] > 0.0).all().item()
     assert runner.last_profile["kernel_seconds"] >= 0.0
 
     metric_rows = []
@@ -11848,6 +10504,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         metric_rows.append(row)
 
     proxy = MpsMulticoinEmaProxy.__new__(MpsMulticoinEmaProxy)
+
     proxy.batch_size = 3
     proxy._torch = torch
     proxy.profile_enabled = False
@@ -11888,15 +10545,11 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         {
             **{
                 f"long_{key}": row[index]
-                for index, key in enumerate(
-                    TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-                )
+                for index, key in enumerate(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS)
             },
             **{
                 f"short_{key}": row[width + index]
-                for index, key in enumerate(
-                    TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-                )
+                for index, key in enumerate(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS)
             },
         }
         for row in metric_rows
@@ -11961,12 +10614,13 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         for item in service_results
     )
 
-    with pytest.raises(ValueError, match="122 columns"):
+    with pytest.raises(ValueError, match=f"{2 * len(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS)} columns"):
         runner.run(np.asarray([side_row(0)], dtype=np.float64))
     with pytest.raises(ValueError, match="short override matrix shaped"):
         MpsTrailingMartingaleMulticoinFusedRunner(
             runs[0],
             data,
+            pnl_lookback_bars=1440,
             short_coin_overrides=np.empty(
                 (coin_count, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS - 1),
                 dtype=np.float32,
@@ -11989,7 +10643,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
     )
     override_daily[:, :, 1].fill_(float("inf"))
     override_daily[:, :, 5].fill_(float("inf"))
-    override_scalars = torch.zeros((1, 74), dtype=torch.float32, device=gpu_device())
+    override_scalars = torch.zeros((1, 72), dtype=torch.float32, device=gpu_device())
     override_gaps = torch.zeros((1, 128), dtype=torch.int32, device=gpu_device())
     override_coin_fills = torch.zeros(
         (1, coin_count), dtype=torch.float32, device=gpu_device()
@@ -12013,6 +10667,7 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
         override_scalars,
         override_gaps,
         override_coin_fills,
+        *hsl_buffers,
         threads=(1, 1, 1),
     )
     synchronize()
@@ -12021,16 +10676,14 @@ def test_mps_trailing_martingale_multicoin_fused_kernel_smoke_all_hsl_modes():
     assert override_scalars[0, 24].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
     import passivbot_rust
 
     source = passivbot_rust.mps_trailing_martingale_multicoin_source_py()
     assert "kernel void passivbot_trailing_martingale_multicoin" in source
-    assert "constant int PARAM_COLS = 61" in source
+    assert f"constant int PARAM_COLS = {len(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS)}" in source
     assert "effective_n_positions" in source
     assert "min_since_open" in source
     assert "entry_retracement_base" in source
@@ -12064,8 +10717,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
         hlcvs[:, coin, 3] = 100.0 * (coin + 1)
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
-        for _ in range(coin_count)
+        ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002) for _ in range(coin_count)
     ]
     runs = [
         ProxyRun(
@@ -12123,7 +10775,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
         "forager_score_weights_volatility": 0.0,
         "n_positions": 2.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 1.0,
         "twel_enforcer_threshold": 1.0,
         "wel_enforcer_enabled": 0.0,
@@ -12131,6 +10783,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
         "twel_enforcer_enabled": 0.0,
         "twel_enforcer_reduce_portfolio": 0.0,
         **_UNSTUCK_DISABLED_VALUES,
+        **_ADAPTIVE_DISABLED_VALUES,
         "unstuck_ema_span_0": 2.0,
         "unstuck_ema_span_1": 3.0,
         **_HSL_DISABLED_VALUES,
@@ -12140,6 +10793,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
     runner = MpsTrailingMartingaleMulticoinRunner(
         runs[0],
         data,
+        pnl_lookback_bars=1440,
         side=side,
         forager_score_hysteresis_pct=0.02,
         max_realized_loss_pct=0.1,
@@ -12152,7 +10806,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
 
     assert output["balance"].device.type == gpu_device()
     assert output["balance"].shape == (2,)
-    assert runner._buffers[2][1].shape == (2, 67)
+    assert runner._buffers[2][1].shape == (2, 65)
     assert (output["hsl_drawdown_raw_max_long"] == 0.0).all()
     assert (output["hsl_drawdown_raw_max_short"] == 0.0).all()
     assert torch.isfinite(output["balance"]).all()
@@ -12160,9 +10814,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
     assert (output["open_positions"] <= 2.0).all()
     recovery = strategy_eq_recovery_distribution_from_samples(
         output["strategy_eq_recovery_samples"],
-        sample_interval_days=output[
-            "strategy_eq_recovery_sample_interval_days"
-        ],
+        sample_interval_days=output["strategy_eq_recovery_sample_interval_days"],
     )
     assert torch.isfinite(recovery).all().item()
     assert (recovery[:, 3] > 0.0).all().item()
@@ -12174,7 +10826,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
     )
     disabled[:, 24] = 0.0
     disabled_output = MpsTrailingMartingaleMulticoinRunner(
-        runs[0], data, side=side, coin_overrides=disabled
+        runs[0], data, pnl_lookback_bars=1440, side=side, coin_overrides=disabled
     ).run(np.array([row], dtype=np.float64))
     synchronize()
     assert disabled_output["day_has_fill"].sum().item() == 0
@@ -12215,7 +10867,7 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
         1.0,
     ]
     exact_last_output = MpsTrailingMartingaleMulticoinRunner(
-        runs[0], data, side=side, coin_overrides=exact_last
+        runs[0], data, pnl_lookback_bars=1440, side=side, coin_overrides=exact_last
     ).run(np.array([row, changed_candidate], dtype=np.float64))
     synchronize()
     assert torch.equal(
@@ -12228,12 +10880,10 @@ def test_mps_trailing_martingale_multicoin_directional_shader_smoke(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_multicoin_legacy_raw_allowance_with_gate_disabled_expands_volume(
+def test_mps_multicoin_bounded_allowance_with_gate_disabled_expands_volume(
     strategy_kind, side
 ):
     runner, baseline = _multicoin_exposure_fixture(strategy_kind, side)
@@ -12244,7 +10894,7 @@ def test_mps_multicoin_legacy_raw_allowance_with_gate_disabled_expands_volume(
         else TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
     )
     expanded[keys.index("we_excess_allowance_pct")] = 0.5
-    expanded[keys.index("we_excess_allowance_legacy_raw")] = 1.0
+    expanded[keys.index("hsl_scale_budget_with_excess_allowance")] = 1.0
     expanded[keys.index("twel_entry_gate_enabled")] = 0.0
 
     output = runner.run(np.asarray([baseline, expanded], dtype=np.float64))
@@ -12255,9 +10905,7 @@ def test_mps_multicoin_legacy_raw_allowance_with_gate_disabled_expands_volume(
     assert volume[1] > volume[0] * 1.1
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_multicoin_coin_override_allowance_expands_one_symbol(strategy_kind):
     override_cols = (
@@ -12280,12 +10928,8 @@ def test_mps_multicoin_coin_override_allowance_expands_one_symbol(strategy_kind)
     baseline[keys.index("twel_entry_gate_enabled")] = 0.0
     overridden[keys.index("twel_entry_gate_enabled")] = 0.0
 
-    baseline_output = baseline_runner.run(
-        np.asarray([baseline], dtype=np.float64)
-    )
-    override_output = override_runner.run(
-        np.asarray([overridden], dtype=np.float64)
-    )
+    baseline_output = baseline_runner.run(np.asarray([baseline], dtype=np.float64))
+    override_output = override_runner.run(np.asarray([overridden], dtype=np.float64))
     synchronize()
 
     baseline_volume = baseline_output["day_volume"].sum().item()
@@ -12294,9 +10938,7 @@ def test_mps_multicoin_coin_override_allowance_expands_one_symbol(strategy_kind)
     assert override_volume > baseline_volume * 1.1
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_multicoin_twel_threshold_reduces_entry_volume(strategy_kind):
     runner, full_cap = _multicoin_exposure_fixture(strategy_kind, "long")
@@ -12316,9 +10958,7 @@ def test_mps_multicoin_twel_threshold_reduces_entry_volume(strategy_kind):
     assert 0.0 < volume[1] < volume[0] * 0.75
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_multicoin_equal_distance_twel_tie_keeps_higher_coin_index(
     strategy_kind,
@@ -12332,10 +10972,7 @@ def test_mps_multicoin_equal_distance_twel_tie_keeps_higher_coin_index(
     overrides = np.full((2, override_cols), np.nan, dtype=np.float32)
     overrides[0, wallet_exposure_column] = 0.4
     overrides[1, wallet_exposure_column] = 0.5
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 300.0, 1.0, 0.0)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 300.0, 1.0, 0.0) for _ in range(2)]
     runner, candidate = _multicoin_exposure_fixture(
         strategy_kind,
         "long",
@@ -12364,9 +11001,7 @@ def test_mps_multicoin_equal_distance_twel_tie_keeps_higher_coin_index(
     assert expected_volume - 0.05 < volume < expected_volume + 0.05
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_anchor_preserves_tick_aligned_computed_target():
     count = 5
     close = np.full(count, 100.0)
@@ -12391,7 +11026,12 @@ def test_mps_ema_anchor_preserves_tick_aligned_computed_target():
     row += _single_coin_exposure_fields() + _tm_twel_enforcer_fields()
 
     output = MpsEmaAnchorRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -12400,9 +11040,7 @@ def test_mps_ema_anchor_preserves_tick_aligned_computed_target():
     assert output["psize"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_anchor_directionally_rounds_non_aligned_candle_touch():
     count = 5
     close = np.full(count, 100.006)
@@ -12427,7 +11065,12 @@ def test_mps_ema_anchor_directionally_rounds_non_aligned_candle_touch():
     row += _single_coin_exposure_fields() + _tm_twel_enforcer_fields()
 
     output = MpsEmaAnchorRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -12436,9 +11079,7 @@ def test_mps_ema_anchor_directionally_rounds_non_aligned_candle_touch():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_recovery_captures_early_post_fill_liquidation_endpoint():
     count = 64
     close = np.full(count, 100.0)
@@ -12480,6 +11121,7 @@ def test_mps_recovery_captures_early_post_fill_liquidation_endpoint():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         recovery_distribution_enabled=True,
         btc_prices=btc_prices,
         btc_risk_enabled=False,
@@ -12515,122 +11157,16 @@ def test_mps_recovery_captures_early_post_fill_liquidation_endpoint():
     )
     recovery = strategy_eq_recovery_distribution_from_samples(
         output["strategy_eq_recovery_samples"],
-        sample_interval_days=output[
-            "strategy_eq_recovery_sample_interval_days"
-        ],
+        sample_interval_days=output["strategy_eq_recovery_sample_interval_days"],
     )
     assert recovery[0, 3].item() > 0.0
-    assert output["account_recovery_max_ms"][0].item() == (
-        output["last_eq_ts"][0] - output["first_eq_ts"][0]
-    ).item()
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-@pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
-def test_mps_recovery_fails_closed_on_coin_hsl_rolling_overflow(strategy_kind):
-    count = 12
-    close = np.full(count, 100.0)
-    high = np.full(count, 101.0)
-    low = np.full(count, 99.0)
-    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
-    market = ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001)
-    run = ProxyRun(
-        1_000.0,
-        1,
-        1,
-        int(timestamps[0]),
-        int(timestamps[0]),
-        int(timestamps[0]),
-        60_000,
-        0.05,
-        0,
-        count - 1,
-    )
-    data = build_mps_data(high, low, close, timestamps, run, market)
-    if strategy_kind == "trailing_martingale":
-        row = _tm_single_row(initial_ema_dist=0.0)
-        keys = TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS
-        runner_cls = MpsTrailingMartingaleRunner
-    else:
-        row = _single_coin_param_row(
-            {
-                "base_qty_pct": 0.5,
-                "ema_span_0": 2.0,
-                "ema_span_1": 3.0,
-                "entry_double_down_factor": 1.0,
-                "offset": 0.0,
-                "offset_psize_weight": 0.0,
-                "offset_volatility_1h_weight": 0.0,
-                "offset_volatility_1m_weight": 0.0,
-                "offset_volatility_ema_span_1h": 2.0,
-                "offset_volatility_ema_span_1m": 2.0,
-                "entry_cooldown_minutes": 0.0,
-                "total_wallet_exposure_limit": 1.0,
-                "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
-                "twel_entry_gate_enabled": 1.0,
-                "twel_enforcer_threshold": 1.0,
-                "twel_enforcer_enabled": 0.0,
-            },
-            EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS,
-        )
-        keys = EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS
-        runner_cls = MpsEmaAnchorRunner
-    for key, value in {
-        "hsl_enabled": 1.0,
-        "hsl_red_threshold": 1.0e-8,
-        "hsl_ema_span_minutes": 1.0,
-        "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
-        "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
-        "hsl_signal_mode": 2.0,
-        "hsl_slot_count": 1.0,
-    }.items():
-        row[keys.index(key)] = value
-
-    runner = runner_cls(
-        market,
-        run,
-        data,
-        long_enabled=True,
-        short_enabled=False,
-        pnl_lookback_bars=count,
-        hsl_panic_market_long=True,
-        recovery_distribution_enabled=True,
-    )
-    # Exercise the production overflow path without needing 2,049 fills.
-    runner.rolling_capacity = 1
-    output = runner.run(np.asarray([row + row], dtype=np.float64))
-    recovery = strategy_eq_recovery_distribution_from_samples(
-        output["strategy_eq_recovery_samples"],
-        sample_interval_days=output[
-            "strategy_eq_recovery_sample_interval_days"
-        ],
-    )
-    synchronize()
-
-    assert not output["alive"].item()
-    assert output["balance"].item() == 0.0
-    samples = output["strategy_eq_recovery_samples"][0]
-    assert torch.isfinite(samples[0]).item()
-    assert samples[0].item() < 0.0
-    expected_full_horizon_days = (
-        runner.n_recovery_samples - 1
-    ) * runner.recovery_stride * run.interval_ms / 86_400_000.0
-    assert torch.allclose(
-        recovery[0],
-        torch.full_like(recovery[0], expected_full_horizon_days),
+    assert (
+        output["account_recovery_max_ms"][0].item()
+        == (output["last_eq_ts"][0] - output["first_eq_ts"][0]).item()
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("hedge_mode", [False, True])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_dual_side_respects_one_way_initial_arbitration(
@@ -12669,6 +11205,7 @@ def test_mps_dual_side_respects_one_way_initial_arbitration(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=hedge_mode,
@@ -12681,9 +11218,7 @@ def test_mps_dual_side_respects_one_way_initial_arbitration(
     assert (output["short_psize"].item() > 0.0) is hedge_mode
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_short_only_opens_short_position():
     count = 5
     close = np.full(count, 100.0)
@@ -12708,7 +11243,12 @@ def test_mps_short_only_opens_short_position():
     row += _single_coin_exposure_fields() + _tm_twel_enforcer_fields()
 
     output = MpsEmaAnchorRunner(
-        market, run, data, long_enabled=False, short_enabled=True
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=False,
+        short_enabled=True,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -12754,7 +11294,7 @@ def _tm_single_row(
     gate_initial=1.0,
     gate_reentry=1.0,
     allowance_pct=0.0,
-    legacy_raw=False,
+    scale_budget=False,
     entry_gate=True,
     threshold=1.0,
     wel_enforcer_enabled=False,
@@ -12775,7 +11315,7 @@ def _tm_single_row(
         )
         + _single_coin_exposure_fields(
             allowance_pct=allowance_pct,
-            legacy_raw=legacy_raw,
+            scale_budget=scale_budget,
             entry_gate=entry_gate,
             threshold=threshold,
         )
@@ -12793,6 +11333,7 @@ def _tm_single_row(
             unstuck_threshold=unstuck_threshold,
         )
         + [-1.0, 2.0, 3.0]
+        + list(_ADAPTIVE_DISABLED_VALUES.values())
     )
 
 
@@ -12833,13 +11374,16 @@ def test_tm_dispatch_specialization_requires_every_enabled_side_and_row():
         "entry_threshold_volatility_1m_weight"
     )
     matrix[1, volatility_column] = 0.1
-    assert _tm_dispatch_specialization(
-        matrix,
-        long_enabled=True,
-        short_enabled=False,
-        market_orders_allowed=False,
-        loss_gate_enabled=False,
-    )[6] is False
+    assert (
+        _tm_dispatch_specialization(
+            matrix,
+            long_enabled=True,
+            short_enabled=False,
+            market_orders_allowed=False,
+            loss_gate_enabled=False,
+        )[6]
+        is False
+    )
     matrix[1, volatility_column] = 0.0
 
     matrix[:, entry_column] = 0.001
@@ -12848,20 +11392,26 @@ def test_tm_dispatch_specialization_requires_every_enabled_side_and_row():
         "wel_enforcer_enabled"
     )
     matrix[:, short_wel_column] = 1.0
-    assert _tm_dispatch_specialization(
-        matrix,
-        long_enabled=True,
-        short_enabled=False,
-        market_orders_allowed=False,
-        loss_gate_enabled=False,
-    )[3] is True
-    assert _tm_dispatch_specialization(
-        matrix,
-        long_enabled=True,
-        short_enabled=True,
-        market_orders_allowed=False,
-        loss_gate_enabled=False,
-    )[3] is False
+    assert (
+        _tm_dispatch_specialization(
+            matrix,
+            long_enabled=True,
+            short_enabled=False,
+            market_orders_allowed=False,
+            loss_gate_enabled=False,
+        )[3]
+        is True
+    )
+    assert (
+        _tm_dispatch_specialization(
+            matrix,
+            long_enabled=True,
+            short_enabled=True,
+            market_orders_allowed=False,
+            loss_gate_enabled=False,
+        )[3]
+        is False
+    )
 
 
 def test_tm_dispatch_feature_defines_are_opt_in_and_guarded():
@@ -12890,16 +11440,19 @@ def test_tm_dispatch_feature_defines_are_opt_in_and_guarded():
         assert f"#define {name} 1" in transformed
         assert f"#ifndef {name}" in transformed
 
-    assert _with_tm_dispatch_features(
-        source,
-        trailing_entry_only=False,
-        recursive_entry_only=False,
-        trailing_close_only=False,
-        reducers_disabled=False,
-        market_orders_disabled=False,
-        loss_gate_disabled=False,
-        volatility_disabled=False,
-    ) == source
+    assert (
+        _with_tm_dispatch_features(
+            source,
+            trailing_entry_only=False,
+            recursive_entry_only=False,
+            trailing_close_only=False,
+            reducers_disabled=False,
+            market_orders_disabled=False,
+            loss_gate_disabled=False,
+            volatility_disabled=False,
+        )
+        == source
+    )
 
     recursive = _with_tm_dispatch_features(
         source,
@@ -12927,13 +11480,9 @@ def test_tm_dispatch_feature_defines_are_opt_in_and_guarded():
         )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_tm_recursive_entry_specialization_matches_generic(
-    monkeypatch, side
-):
+def test_mps_tm_recursive_entry_specialization_matches_generic(monkeypatch, side):
     import optimization.gpu.mps_kernel as mps_kernel
 
     count = 512
@@ -12957,21 +11506,22 @@ def test_mps_tm_recursive_entry_specialization_matches_generic(
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
     row = _tm_single_row(initial_ema_dist=0.0, gate_initial=0.0, gate_reentry=0.0)
-    row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-        "entry_double_down_factor"
-    )] = 1.5
-    row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-        "entry_initial_qty_pct"
-    )] = 0.05
-    row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-        "entry_retracement_base_pct"
-    )] = 0.0
+    row[
+        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_double_down_factor")
+    ] = 1.5
+    row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_initial_qty_pct")] = (
+        0.05
+    )
+    row[
+        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_retracement_base_pct")
+    ] = 0.0
     parameters = np.asarray([row + row], dtype=np.float64)
 
     specialized_runner = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -12992,6 +11542,7 @@ def test_mps_tm_recursive_entry_specialization_matches_generic(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -12999,12 +11550,16 @@ def test_mps_tm_recursive_entry_specialization_matches_generic(
     generic = generic_runner.run(parameters, profile=True)
     synchronize()
 
-    assert specialized_runner.last_profile["dispatch_specialization"][
-        "recursive_entry_only"
-    ] is True
-    assert generic_runner.last_profile["dispatch_specialization"][
-        "recursive_entry_only"
-    ] is False
+    assert (
+        specialized_runner.last_profile["dispatch_specialization"][
+            "recursive_entry_only"
+        ]
+        is True
+    )
+    assert (
+        generic_runner.last_profile["dispatch_specialization"]["recursive_entry_only"]
+        is False
+    )
     assert specialized.keys() == generic.keys()
     for key in specialized:
         if isinstance(specialized[key], torch.Tensor):
@@ -13019,9 +11574,7 @@ def test_mps_tm_recursive_entry_specialization_matches_generic(
             assert specialized[key] == generic[key]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("topology", "hsl_enabled"),
     [
@@ -13060,12 +11613,12 @@ def test_mps_tm_zero_volatility_specialization_matches_generic(
     rows = []
     for initial_dist, threshold in ((0.005, 0.03), (0.01, 0.08)):
         row = _tm_single_row(initial_ema_dist=initial_dist)
-        row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("hsl_enabled")] = (
-            float(hsl_enabled)
+        row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("hsl_enabled")] = float(
+            hsl_enabled
         )
-        row[
-            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("hsl_red_threshold")
-        ] = threshold
+        row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("hsl_red_threshold")] = (
+            threshold
+        )
         rows.append(row + row)
     parameters = np.asarray(rows, dtype=np.float64)
 
@@ -13073,6 +11626,7 @@ def test_mps_tm_zero_volatility_specialization_matches_generic(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=topology != "short",
         short_enabled=topology != "long",
         hsl_enabled=hsl_enabled,
@@ -13091,6 +11645,7 @@ def test_mps_tm_zero_volatility_specialization_matches_generic(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=topology != "short",
         short_enabled=topology != "long",
         hsl_enabled=hsl_enabled,
@@ -13098,12 +11653,16 @@ def test_mps_tm_zero_volatility_specialization_matches_generic(
     generic = generic_runner.run(parameters, profile=True)
     synchronize()
 
-    assert specialized_runner.last_profile["dispatch_specialization"][
-        "volatility_disabled"
-    ] is True
-    assert generic_runner.last_profile["dispatch_specialization"][
-        "volatility_disabled"
-    ] is False
+    assert (
+        specialized_runner.last_profile["dispatch_specialization"][
+            "volatility_disabled"
+        ]
+        is True
+    )
+    assert (
+        generic_runner.last_profile["dispatch_specialization"]["volatility_disabled"]
+        is False
+    )
     assert specialized.keys() == generic.keys()
     for key in specialized:
         if isinstance(specialized[key], torch.Tensor):
@@ -13118,9 +11677,7 @@ def test_mps_tm_zero_volatility_specialization_matches_generic(
             assert specialized[key] == generic[key]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_reducer_free_recursive_close_matches_generic(monkeypatch, side):
     import optimization.gpu.mps_kernel as mps_kernel
@@ -13158,6 +11715,7 @@ def test_mps_tm_reducer_free_recursive_close_matches_generic(monkeypatch, side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13176,6 +11734,7 @@ def test_mps_tm_reducer_free_recursive_close_matches_generic(monkeypatch, side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13183,12 +11742,14 @@ def test_mps_tm_reducer_free_recursive_close_matches_generic(monkeypatch, side):
     generic = generic_runner.run(parameters, profile=True)
     synchronize()
 
-    assert specialized_runner.last_profile["dispatch_specialization"][
-        "reducers_disabled"
-    ] is True
-    assert generic_runner.last_profile["dispatch_specialization"][
-        "reducers_disabled"
-    ] is False
+    assert (
+        specialized_runner.last_profile["dispatch_specialization"]["reducers_disabled"]
+        is True
+    )
+    assert (
+        generic_runner.last_profile["dispatch_specialization"]["reducers_disabled"]
+        is False
+    )
     assert specialized.keys() == generic.keys()
     for key in specialized:
         if isinstance(specialized[key], torch.Tensor):
@@ -13203,9 +11764,7 @@ def test_mps_tm_reducer_free_recursive_close_matches_generic(monkeypatch, side):
             assert specialized[key] == generic[key]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("topology", ["long", "short", "fused"])
 def test_mps_tm_single_coin_entry_intervals_track_only_fresh_positions(topology):
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
@@ -13245,6 +11804,7 @@ def test_mps_tm_single_coin_entry_intervals_track_only_fresh_positions(topology)
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=topology in {"long", "fused"},
         short_enabled=topology in {"short", "fused"},
         hsl_enabled=False,
@@ -13262,9 +11822,7 @@ def test_mps_tm_single_coin_entry_intervals_track_only_fresh_positions(topology)
     assert metrics["entry_interval_hours_median"].item() >= 0.25
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_same_candle_close_then_reentry_is_not_an_initial_entry(side):
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
@@ -13302,6 +11860,7 @@ def test_mps_tm_same_candle_close_then_reentry_is_not_an_initial_entry(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13314,9 +11873,7 @@ def test_mps_tm_same_candle_close_then_reentry_is_not_an_initial_entry(side):
     assert output["entry_interval_hist"].sum().item() == 0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_single_coin_retains_synchronized_btc_risk_surface(strategy_kind):
     from optimization.gpu.mps_kernel import (
@@ -13355,6 +11912,7 @@ def test_mps_single_coin_retains_synchronized_btc_risk_surface(strategy_kind):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         btc_prices=btc_prices,
     ).run(np.asarray([row + row], dtype=np.float64))
     synchronize()
@@ -13364,9 +11922,7 @@ def test_mps_single_coin_retains_synchronized_btc_risk_surface(strategy_kind):
     assert output["btc_day_max_dd"][0, 0].item() == pytest.approx(0.75)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_no_hsl_specializations_retain_synchronized_btc_risk_surface(
     side,
@@ -13394,6 +11950,7 @@ def test_mps_tm_no_hsl_specializations_retain_synchronized_btc_risk_surface(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13403,15 +11960,13 @@ def test_mps_tm_no_hsl_specializations_retain_synchronized_btc_risk_surface(
     output = runner.run(np.asarray([row + row], dtype=np.float64))
     synchronize()
 
-    assert runner.shader_topology == f"{side}_no_hsl"
+    assert runner.shader_topology == "generic"
     assert output["btc_day_end_eq"][0, 0].item() == pytest.approx(5.0)
     assert output["btc_day_min_eq"][0, 0].item() == pytest.approx(5.0)
     assert output["btc_day_max_dd"][0, 0].item() == pytest.approx(0.75)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     "btc_prices",
     [
@@ -13429,14 +11984,10 @@ def test_mps_btc_risk_prices_fail_closed_after_float32_packing(btc_prices):
         _btc_risk_price_tensor(btc_prices, expected_count=3)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("recursive_entry", [False, True])
-def test_mps_tm_near_touch_market_entry_uses_taker_fill(
-    side, recursive_entry
-):
+def test_mps_tm_near_touch_market_entry_uses_taker_fill(side, recursive_entry):
     count = 5
     close = np.full(count, 100.0)
     high = np.full(count, 100.0)
@@ -13468,12 +12019,13 @@ def test_mps_tm_near_touch_market_entry_uses_taker_fill(
     }
 
     resting = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(params)
     market_output = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         taker_fee=0.01,
         market_order_slippage_pct=0.01,
         market_orders_allowed=True,
@@ -13495,9 +12047,7 @@ def test_mps_tm_near_touch_market_entry_uses_taker_fill(
     assert market_output["fill_count_entry"].item() == 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_batch_selects_recursive_or_trailing_market_mode_per_candidate(side):
     count = 5
@@ -13536,14 +12086,13 @@ def test_mps_tm_batch_selects_recursive_or_trailing_market_mode_per_candidate(si
     recursive[20] = 0.001
     trailing = recursive.copy()
     trailing[11] = 0.001
-    params = np.asarray(
-        [recursive + recursive, trailing + trailing], dtype=np.float64
-    )
+    params = np.asarray([recursive + recursive, trailing + trailing], dtype=np.float64)
 
     output = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13557,9 +12106,7 @@ def test_mps_tm_batch_selects_recursive_or_trailing_market_mode_per_candidate(si
     assert output["fill_count_entry"].cpu().tolist() == [3.0, 1.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("side", "threshold", "expected_size"),
     [("long", 0.1202, 1.201), ("short", 0.15, 1.499)],
@@ -13612,12 +12159,13 @@ def test_mps_tm_recursive_market_entry_retains_exact_twel_prefix(
     }
 
     resting = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(params)
     promoted = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         taker_fee=0.01,
         market_order_slippage_pct=0.01,
         market_orders_allowed=True,
@@ -13631,9 +12179,7 @@ def test_mps_tm_recursive_market_entry_retains_exact_twel_prefix(
     # Exact Rust retains the nearest full rungs plus at most one partially
     # TWEL-cropped boundary rung.  It never lets a farther order reappear.
     assert promoted["fill_count_entry"].item() == 3.0
-    assert promoted["fill_count_entry"].item() > resting[
-        "fill_count_entry"
-    ].item()
+    assert promoted["fill_count_entry"].item() > resting["fill_count_entry"].item()
     assert promoted[size_key].item() == pytest.approx(expected_size, abs=1.0e-4)
     # Rust's entry gate measures wallet exposure at the executable market
     # snapshot, before backtest-only adverse slippage is applied to the fill.
@@ -13641,11 +12187,9 @@ def test_mps_tm_recursive_market_entry_retains_exact_twel_prefix(
     assert promoted["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_tm_coin_hsl_coalesces_recursive_same_candle_entry_fees(side):
+def test_mps_tm_coin_hsl_accepts_recursive_same_candle_entry_fees(side):
     count = 5
     close = np.full(count, 100.0)
     high = np.full(count, 100.0)
@@ -13693,15 +12237,14 @@ def test_mps_tm_coin_hsl_coalesces_recursive_same_candle_entry_fees(side):
         data,
         long_enabled=side == "long",
         short_enabled=side == "short",
-        pnl_lookback_bars=count,
+        pnl_lookback_bars=1440,
         taker_fee=0.01,
         market_order_slippage_pct=0.01,
         market_orders_allowed=True,
         market_order_near_touch_threshold=0.003,
     )
-    # Three production ladder fills land on one candle. A one-slot ring proves
-    # their fees are coalesced rather than overflowing per fill.
-    runner.rolling_capacity = 1
+    # Three ladder fills and their fees land on one candle; the HSL history
+    # accepts the whole batch without blocking the next evaluation.
 
     output = runner.run(params)
     synchronize()
@@ -13711,9 +12254,7 @@ def test_mps_tm_coin_hsl_coalesces_recursive_same_candle_entry_fees(side):
     assert output["balance"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_market_entry_applies_twel_at_executable_touch(side):
     count = 5
@@ -13747,6 +12288,7 @@ def test_mps_tm_recursive_market_entry_applies_twel_at_executable_touch(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13760,9 +12302,7 @@ def test_mps_tm_recursive_market_entry_applies_twel_at_executable_touch(side):
     assert output[size_key].item() == pytest.approx(1.199, abs=1.0e-4)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_long_market_entry_crop_requires_total_exposure_gate():
     count = 5
     close = np.full(count, 100.0)
@@ -13795,10 +12335,10 @@ def test_mps_tm_long_market_entry_crop_requires_total_exposure_gate():
     }
 
     without_gate = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(np.asarray([disabled + disabled], dtype=np.float64))
     with_gate = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(np.asarray([enabled + enabled], dtype=np.float64))
     synchronize()
 
@@ -13808,9 +12348,7 @@ def test_mps_tm_long_market_entry_crop_requires_total_exposure_gate():
     assert with_gate["psize"].item() * 100.0 / run.starting_balance < 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_market_entry_gate_drops_unexecutable_cap_remainder(side):
     count = 5
@@ -13839,6 +12377,7 @@ def test_mps_tm_market_entry_gate_drops_unexecutable_cap_remainder(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13851,9 +12390,7 @@ def test_mps_tm_market_entry_gate_drops_unexecutable_cap_remainder(side):
     assert output["psize" if side == "long" else "short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_market_entry_gate_handles_qty_step_below_float32_ulp(side):
     count = 5
@@ -13882,6 +12419,7 @@ def test_mps_tm_market_entry_gate_handles_qty_step_below_float32_ulp(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -13895,9 +12433,7 @@ def test_mps_tm_market_entry_gate_handles_qty_step_below_float32_ulp(side):
     assert output["psize" if side == "long" else "short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_next_close_promotes_without_expanding_ladder(side):
     count = 7
@@ -13938,12 +12474,13 @@ def test_mps_tm_recursive_next_close_promotes_without_expanding_ladder(side):
     }
 
     resting = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(params)
     zero_cost_market = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         market_orders_allowed=True,
         market_order_near_touch_threshold=0.006,
         **common,
@@ -13952,6 +12489,7 @@ def test_mps_tm_recursive_next_close_promotes_without_expanding_ladder(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         taker_fee=0.01,
         market_order_slippage_pct=0.01,
         market_orders_allowed=True,
@@ -13973,9 +12511,7 @@ def test_mps_tm_recursive_next_close_promotes_without_expanding_ladder(side):
     assert costly_market["loss_sum"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("risk_reducer", [False, True])
 def test_mps_tm_expanded_recursive_close_promotes_each_emitted_group(
@@ -14030,12 +12566,13 @@ def test_mps_tm_expanded_recursive_close_promotes_each_emitted_group(
     }
 
     resting = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(params)
     promoted = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         taker_fee=0.01,
         market_order_slippage_pct=0.01,
         market_orders_allowed=True,
@@ -14046,6 +12583,7 @@ def test_mps_tm_expanded_recursive_close_promotes_each_emitted_group(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         taker_fee=0.01,
         market_order_slippage_pct=0.01,
         market_orders_allowed=True,
@@ -14069,9 +12607,7 @@ def test_mps_tm_expanded_recursive_close_promotes_each_emitted_group(
     assert gated[size_key].item() > resting[size_key].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_market_loss_gate_uses_generation_projection(side):
     count = 6
@@ -14123,10 +12659,10 @@ def test_mps_tm_recursive_market_loss_gate_uses_generation_projection(side):
     }
 
     ungated = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(params)
     gated = MpsTrailingMartingaleRunner(
-        market, run, data, max_realized_loss_pct=0.0, **common
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=0.0, **common
     ).run(params)
     synchronize()
 
@@ -14141,9 +12677,7 @@ def test_mps_tm_recursive_market_loss_gate_uses_generation_projection(side):
     assert gated[size_key].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_market_reducer_is_not_regated_at_next_candle_price(side):
     count = 7
@@ -14210,7 +12744,7 @@ def test_mps_tm_market_reducer_is_not_regated_at_next_candle_price(side):
     }
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, **common
+        market, run, data, pnl_lookback_bars=1440, **common
     ).run(params)
     synchronize()
 
@@ -14224,14 +12758,10 @@ def test_mps_tm_market_reducer_is_not_regated_at_next_candle_price(side):
     assert output["balance"].item() < 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("winning_reducer", ["wel", "twel"])
-def test_mps_tm_same_tick_wel_merges_into_recursive_market_group(
-    side, winning_reducer
-):
+def test_mps_tm_same_tick_wel_merges_into_recursive_market_group(side, winning_reducer):
     count = 6
     close = np.full(count, 99.0 if side == "long" else 101.0)
     close[:3] = 100.0
@@ -14277,6 +12807,7 @@ def test_mps_tm_same_tick_wel_merges_into_recursive_market_group(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hsl_enabled=False,
@@ -14291,15 +12822,11 @@ def test_mps_tm_same_tick_wel_merges_into_recursive_market_group(
     # protective reducer, retaining the later ordinary type. The merged WEL
     # quantity therefore remains in the ordinary group even when larger TWEL
     # wins; market execution and loss gating still close the full position.
-    assert output["fill_count"].item() == (
-        2.0 if winning_reducer == "wel" else 3.0
-    )
+    assert output["fill_count"].item() == (2.0 if winning_reducer == "wel" else 3.0)
     assert output[size_key].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_close_sizing_uses_generation_market(side):
     import passivbot_rust
@@ -14375,9 +12902,7 @@ kernel void passivbot_tm_recursive_close_generation_market_probe(
     np.testing.assert_allclose(values[:3], values[3:], atol=1.0e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_close_group_uses_market_touch_minimum(side):
     import passivbot_rust
@@ -14454,9 +12979,7 @@ kernel void passivbot_tm_recursive_close_market_minimum_probe(
         assert values[2] == pytest.approx(0.203, abs=1.0e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_recursive_wel_seed_precedes_market_resize():
     import passivbot_rust
 
@@ -14510,9 +13033,7 @@ kernel void passivbot_tm_recursive_wel_seed_probe(
     assert values[3] == pytest.approx(0.299, abs=1.0e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_expansion_keeps_pregate_wel_reachability(side):
     import passivbot_rust
@@ -14574,9 +13095,7 @@ kernel void passivbot_tm_recursive_close_pregate_wel_probe(
     assert output.cpu().tolist() == [1.0, 1.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_recursive_close_quantity_tolerance_scales_with_magnitude():
     import passivbot_rust
 
@@ -14616,14 +13135,10 @@ kernel void passivbot_tm_recursive_close_quantity_tolerance_probe(
     assert output.cpu().tolist() == [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_recursive_market_groups_trim_to_position_before_fill():
     count = 8
-    close = np.asarray(
-        [100.0, 100.0, 100.0, 100.0, 90.0, 90.0, 90.0, 90.0]
-    )
+    close = np.asarray([100.0, 100.0, 100.0, 100.0, 90.0, 90.0, 90.0, 90.0])
     high = close.copy()
     low = close.copy()
     low[3] = 98.0
@@ -14656,6 +13171,7 @@ def test_mps_tm_recursive_market_groups_trim_to_position_before_fill():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         market_orders_allowed=True,
@@ -14670,9 +13186,7 @@ def test_mps_tm_recursive_market_groups_trim_to_position_before_fill():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_recursive_ladder_refinalizes_requested_reducer_qty():
     count = 7
     close = np.full(count, 100.0)
@@ -14716,6 +13230,7 @@ def test_mps_tm_recursive_ladder_refinalizes_requested_reducer_qty():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         hsl_enabled=False,
@@ -14733,9 +13248,7 @@ def test_mps_tm_recursive_ladder_refinalizes_requested_reducer_qty():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_recursive_reselects_after_candidate_finalization():
     import passivbot_rust
 
@@ -14832,9 +13345,7 @@ kernel void passivbot_tm_recursive_candidate_reselection_probe(
     assert values[1:] == [10.0, 6.0, 5.5, 6.0, 1.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_recursive_finalization_drops_mixed_minimum_reducer():
     import passivbot_rust
 
@@ -14901,9 +13412,7 @@ kernel void passivbot_tm_recursive_mixed_minimum_reducer_probe(
     assert values[1:] == [0.0, 4.0, 1.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_reducer_gate_falls_back_to_next_candidate(side):
     import passivbot_rust
@@ -14957,9 +13466,7 @@ kernel void passivbot_tm_recursive_reducer_gate_fallback_probe(
     assert output.item() == 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_reducer_gate_uses_generation_market_snapshot(side):
     import passivbot_rust
@@ -15020,9 +13527,7 @@ kernel void passivbot_tm_recursive_reducer_generation_gate_probe(
     assert output.cpu().tolist() == [0.0, 0.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_recursive_reducer_gate_uses_generation_pnl_snapshot(side):
     import passivbot_rust
@@ -15084,16 +13589,12 @@ kernel void passivbot_tm_recursive_reducer_generation_pnl_probe(
     assert output.cpu().tolist() == [0.0, -1.0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_hsl_panic_replacement_clears_ordinary_market_state(side):
     import passivbot_rust
 
-    params = torch.tensor(
-        _tm_single_row(), dtype=torch.float32, device=gpu_device()
-    )
+    params = torch.tensor(_tm_single_row(), dtype=torch.float32, device=gpu_device())
     probe_kernel = r"""
 kernel void passivbot_tm_hsl_panic_state_probe(
     constant float* params,
@@ -15146,9 +13647,7 @@ kernel void passivbot_tm_hsl_panic_state_probe(
     assert values[9] == 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("hedge_mode", [False, True])
 def test_mps_tm_dual_side_market_entries_respect_position_mode(hedge_mode):
     count = 5
@@ -15177,6 +13676,7 @@ def test_mps_tm_dual_side_market_entries_respect_position_mode(hedge_mode):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=hedge_mode,
@@ -15190,9 +13690,7 @@ def test_mps_tm_dual_side_market_entries_respect_position_mode(hedge_mode):
     assert (output["short_psize"].item() > 0.0) is hedge_mode
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_position_unchanged_includes_open_tail(strategy_kind, side):
@@ -15238,7 +13736,7 @@ def test_mps_position_unchanged_includes_open_tail(strategy_kind, side):
                 "entry_cooldown_minutes": 0.0,
                 "total_wallet_exposure_limit": 1.0,
                 "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
+                "hsl_scale_budget_with_excess_allowance": 0.0,
                 "twel_entry_gate_enabled": 1.0,
                 "twel_enforcer_threshold": 1.0,
                 "twel_enforcer_enabled": 0.0,
@@ -15251,6 +13749,7 @@ def test_mps_position_unchanged_includes_open_tail(strategy_kind, side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -15280,280 +13779,7 @@ def test_mps_position_unchanged_includes_open_tail(strategy_kind, side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
-@pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
-@pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_single_coin_hsl_panics_and_permanently_halts(strategy_kind, side):
-    count = 30
-    close = np.full(count, 100.0)
-    close[8:] = 70.0 if side == "long" else 130.0
-    high = close * 1.02
-    low = close * 0.98
-    timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
-    market = ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0)
-    run = ProxyRun(
-        1_000.0,
-        1,
-        1,
-        int(timestamps[0]),
-        int(timestamps[0]),
-        int(timestamps[0]),
-        60_000,
-        0.05,
-        0,
-        count - 1,
-    )
-    data = build_mps_data(high, low, close, timestamps, run, market)
-    if strategy_kind == "trailing_martingale":
-        baseline = _tm_single_row(initial_ema_dist=0.0)
-        baseline[6] = 0.5
-        baseline[7] = 0.5
-        baseline[16] = 0.5
-        keys = TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS
-        runner_cls = MpsTrailingMartingaleRunner
-    else:
-        baseline = _single_coin_param_row(
-            {
-                "base_qty_pct": 0.5,
-                "ema_span_0": 2.0,
-                "ema_span_1": 3.0,
-                "entry_double_down_factor": 1.0,
-                "offset": 0.0,
-                "offset_psize_weight": 0.0,
-                "offset_volatility_1h_weight": 0.0,
-                "offset_volatility_1m_weight": 0.0,
-                "offset_volatility_ema_span_1h": 2.0,
-                "offset_volatility_ema_span_1m": 2.0,
-                "entry_cooldown_minutes": 0.0,
-                "total_wallet_exposure_limit": 1.0,
-                "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
-                "twel_entry_gate_enabled": 1.0,
-                "twel_enforcer_threshold": 1.0,
-                "twel_enforcer_enabled": 0.0,
-            },
-            EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS,
-        )
-        keys = EMA_ANCHOR_SINGLE_COIN_PARAM_KEYS
-        runner_cls = MpsEmaAnchorRunner
-    baseline[keys.index("hsl_signal_mode")] = 2.0
-    hsl = list(baseline)
-    for key, value in {
-        "hsl_enabled": 1.0,
-        "hsl_red_threshold": 0.01,
-        "hsl_ema_span_minutes": 1.0,
-        "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
-        "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
-        "hsl_signal_mode": 2.0,
-        "hsl_slot_count": 1.0,
-    }.items():
-        hsl[keys.index(key)] = value
-    restarting_hsl = list(hsl)
-    restarting_hsl[keys.index("hsl_restart_policy")] = 0.0
-    restarting_hsl[keys.index("hsl_cooldown_minutes_after_red")] = 2.0
-    zero_cooldown_hsl = list(hsl)
-    zero_cooldown_hsl[keys.index("hsl_restart_policy")] = 0.0
-    unscaled_coin_hsl = list(hsl)
-    unscaled_coin_hsl[keys.index("hsl_red_threshold")] = 0.6
-    scaled_coin_hsl = list(unscaled_coin_hsl)
-    scaled_coin_hsl[keys.index("hsl_slot_count")] = 4.0
-    capped_coin_hsl = list(hsl)
-    capped_coin_hsl[keys.index("hsl_restart_policy")] = 1.0
-    capped_coin_hsl[keys.index("hsl_cooldown_minutes_after_red")] = 2.0
-    capped_coin_hsl[keys.index("hsl_slot_count")] = 4.0
-    tiny_threshold_hsl = list(hsl)
-    tiny_threshold_hsl[keys.index("hsl_red_threshold")] = 1.0e-8
-    negative_span_hsl = list(hsl)
-    negative_span_hsl[keys.index("hsl_ema_span_minutes")] = -2.0
-    recursive_close_hsl = list(hsl)
-    if strategy_kind == "trailing_martingale":
-        recursive_close_hsl[keys.index("close_retracement_base_pct")] = 0.0
-    inactive = list(baseline)
-    rows = (
-        [
-            baseline + inactive,
-            hsl + inactive,
-            restarting_hsl + inactive,
-            zero_cooldown_hsl + inactive,
-            unscaled_coin_hsl + inactive,
-            scaled_coin_hsl + inactive,
-            capped_coin_hsl + inactive,
-            tiny_threshold_hsl + inactive,
-            negative_span_hsl + inactive,
-            recursive_close_hsl + inactive,
-        ]
-        if side == "long"
-        else [
-            inactive + baseline,
-            inactive + hsl,
-            inactive + restarting_hsl,
-            inactive + zero_cooldown_hsl,
-            inactive + unscaled_coin_hsl,
-            inactive + scaled_coin_hsl,
-            inactive + capped_coin_hsl,
-            inactive + tiny_threshold_hsl,
-            inactive + negative_span_hsl,
-            inactive + recursive_close_hsl,
-        ]
-    )
-    runner = runner_cls(
-        market,
-        run,
-        data,
-        long_enabled=side == "long",
-        short_enabled=side == "short",
-        pnl_lookback_bars=5,
-        hsl_ema_tail_enabled=True,
-        hsl_raw_drawdown_enabled=True,
-        hsl_raw_tail_enabled=True,
-    )
-    output = runner.run(np.asarray(rows, dtype=np.float64))
-    generic_output = None
-    if strategy_kind == "trailing_martingale":
-        assert runner.shader_topology == f"{side}_hsl"
-        generic_runner = runner_cls(
-            market,
-            run,
-            data,
-            long_enabled=side == "long",
-            short_enabled=side == "short",
-            pnl_lookback_bars=5,
-            hsl_ema_tail_enabled=True,
-            hsl_raw_drawdown_enabled=True,
-            hsl_raw_tail_enabled=True,
-        )
-        generic_runner.shader_topology = "generic"
-        generic_output = generic_runner.run(np.asarray(rows, dtype=np.float64))
-    market_runner = runner_cls(
-        market,
-        run,
-        data,
-        long_enabled=side == "long",
-        short_enabled=side == "short",
-        taker_fee=0.01,
-        market_order_slippage_pct=0.02,
-        hsl_panic_market_long=side == "long",
-        hsl_panic_market_short=side == "short",
-    )
-    market_output = market_runner.run(
-        np.asarray([rows[1]], dtype=np.float64)
-    )
-    ordinary_market_runner = runner_cls(
-        market,
-        run,
-        data,
-        long_enabled=side == "long",
-        short_enabled=side == "short",
-        taker_fee=0.01,
-        market_order_slippage_pct=0.02,
-        market_orders_allowed=True,
-        market_order_near_touch_threshold=0.001,
-        hsl_panic_market_long=side == "long",
-        hsl_panic_market_short=side == "short",
-    )
-    ordinary_market_output = ordinary_market_runner.run(
-        np.asarray([rows[1]], dtype=np.float64)
-    )
-    gated_output = runner_cls(
-        market,
-        run,
-        data,
-        long_enabled=side == "long",
-        short_enabled=side == "short",
-        max_realized_loss_pct=0.0,
-    ).run(np.asarray([rows[9]], dtype=np.float64))
-    synchronize()
-
-    if generic_output is not None:
-        assert output.keys() == generic_output.keys()
-        for key in output:
-            torch.testing.assert_close(
-                output[key].cpu(),
-                generic_output[key].cpu(),
-                rtol=1.0e-6,
-                atol=1.0e-6,
-                equal_nan=True,
-            )
-
-    size_key = "psize" if side == "long" else "short_psize"
-    assert output[size_key][0].item() > 0.0
-    assert output[size_key][1].item() == 0.0
-    assert output[size_key][2].item() > 0.0
-    assert output[size_key][3].item() == 0.0
-    assert output[size_key][4].item() > 0.0
-    assert output[size_key][5].item() == 0.0
-    assert output[size_key][6].item() > 0.0
-    assert output[size_key][7].item() == 0.0
-    assert output["balance"][7].item() < 990.0
-    assert output[size_key][8].item() == 0.0
-    assert output["balance"][8].item() == pytest.approx(
-        output["balance"][1].item(), abs=1.0e-4
-    )
-    assert output["day_volume"][1].sum().item() > 1.0
-    trigger_key = f"hsl_triggers_{side}"
-    other_trigger_key = (
-        "hsl_triggers_short" if side == "long" else "hsl_triggers_long"
-    )
-    restart_key = f"hsl_restarts_{side}"
-    assert output[trigger_key][0].item() == 0.0
-    assert output[trigger_key][1].item() == 1.0
-    assert output[other_trigger_key][1].item() == 0.0
-    assert output[restart_key][1].item() == 0.0
-    assert output[restart_key][2].item() >= 1.0
-    assert output["hsl_tier_samples_total"][1].item() > 0.0
-    assert output["hsl_tier_samples_red"][1].item() > 0.0
-    assert output["hsl_duration_count"][1].item() == 1.0
-    assert output["hsl_duration_max_steps"][1].item() > 0.0
-    assert output["hsl_trigger_drawdown_sum"][1].item() > 0.0
-    assert output["hsl_trigger_drawdown_count"][1].item() == 1.0
-    assert output["hsl_flatten_time_count"][1].item() == 1.0
-    assert output["hsl_panic_close_loss_sum"][1].item() > 0.0
-    assert output["hsl_panic_close_loss_max"][1].item() > 0.0
-    assert output["hsl_panic_loss_drawdown_count"][1].item() == 1.0
-    assert output["hsl_panic_loss_drawdown_min"][1].item() > 0.0
-    assert output["hsl_panic_loss_drawdown_sum"][1].item() > 0.0
-    assert output["hsl_panic_loss_drawdown_max"][1].item() > 0.0
-    assert output[f"hsl_strategy_eq_recovery_max_ms_{side}"][1].item() > 0.0
-    assert output[f"hsl_drawdown_ema_mean_worst_1pct_{side}"][1].item() > 0.0
-    assert output[f"hsl_drawdown_raw_max_{side}"][1].item() > 0.0
-    assert output[
-        f"hsl_drawdown_raw_mean_worst_1pct_{side}"
-    ][1].item() > 0.0
-    assert output[
-        f"hsl_drawdown_ema_mean_worst_1pct_{'short' if side == 'long' else 'long'}"
-    ][1].item() == 0.0
-    assert output[size_key][9].item() == 0.0
-    assert output["hsl_panic_close_loss_sum"][9].item() > 0.0
-    assert output["hsl_panic_loss_drawdown_count"][9].item() == 1.0
-    assert gated_output[size_key].item() == 0.0
-    assert gated_output["hsl_panic_close_loss_sum"].item() > 0.0
-    assert market_runner.settings[15].item() == pytest.approx(0.01)
-    assert market_runner.settings[16].item() == pytest.approx(0.02)
-    assert market_runner.settings[17].item() == float(side == "long")
-    assert market_runner.settings[18].item() == float(side == "short")
-    assert market_output[size_key].item() == 0.0
-    assert market_output["balance"].item() < output["balance"][1].item()
-    assert (
-        market_output["hsl_panic_close_loss_sum"].item()
-        > output["hsl_panic_close_loss_sum"][1].item()
-    )
-    assert ordinary_market_runner.settings[19].item() == 1.0
-    assert ordinary_market_output[size_key].item() == 0.0
-    assert ordinary_market_output[trigger_key].item() == 1.0
-    assert ordinary_market_output["hsl_flatten_time_count"].item() == 1.0
-    assert ordinary_market_output["hsl_panic_close_loss_sum"].item() > 0.0
-    assert torch.isfinite(ordinary_market_output["balance"]).all()
-
-
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("signal_mode", ["unified", "pside", "coin"])
 def test_mps_dual_side_single_coin_hsl_respects_signal_scope(
@@ -15604,7 +13830,7 @@ def test_mps_dual_side_single_coin_hsl_respects_signal_scope(
                 "entry_cooldown_minutes": 0.0,
                 "total_wallet_exposure_limit": 1.0,
                 "we_excess_allowance_pct": 0.0,
-                "we_excess_allowance_legacy_raw": 0.0,
+                "hsl_scale_budget_with_excess_allowance": 0.0,
                 "twel_entry_gate_enabled": 1.0,
                 "twel_enforcer_threshold": 1.0,
                 "twel_enforcer_enabled": 0.0,
@@ -15619,21 +13845,13 @@ def test_mps_dual_side_single_coin_hsl_respects_signal_scope(
         "hsl_red_threshold": 0.01,
         "hsl_ema_span_minutes": 1.0,
         "hsl_cooldown_minutes_after_red": 0.0,
-        "hsl_no_restart_drawdown_threshold": 1.0,
         "hsl_restart_policy": 2.0,
-        "hsl_tier_ratio_yellow": 0.5,
-        "hsl_tier_ratio_orange": 0.75,
-        "hsl_orange_graceful_stop": 0.0,
-        "hsl_signal_mode": {"unified": 0.0, "pside": 1.0, "coin": 2.0}[
-            signal_mode
-        ],
+        "hsl_signal_mode": {"unified": 0.0, "pside": 1.0, "coin": 2.0}[signal_mode],
         "hsl_slot_count": 1.0,
     }.items():
         hsl[keys.index(key)] = value
     inactive = list(baseline)
-    inactive[keys.index("hsl_signal_mode")] = hsl[
-        keys.index("hsl_signal_mode")
-    ]
+    inactive[keys.index("hsl_signal_mode")] = hsl[keys.index("hsl_signal_mode")]
     long_hsl = list(hsl)
     short_hsl = list(hsl)
     if signal_mode == "unified":
@@ -15656,55 +13874,54 @@ def test_mps_dual_side_single_coin_hsl_respects_signal_scope(
         ],
         dtype=np.float64,
     )
-    output = runner_cls(
+    runner = runner_cls(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hsl_ema_tail_enabled=True,
         hsl_raw_drawdown_enabled=True,
         hsl_raw_tail_enabled=True,
-    ).run(rows)
+    )
+    with pytest.raises(ValueError, match="HSL"):
+        runner.run(rows[3:4])
+    if signal_mode == "unified":
+        # A portfolio policy cannot be independently enabled on one view.
+        for invalid_row in rows[:2]:
+            with pytest.raises(ValueError, match="HSL"):
+                runner.run(invalid_row[None, :])
+        output = runner.run(rows[2:3])
+        both = 0
+    else:
+        output = runner.run(rows[:3])
+        both = 2
     synchronize()
 
-    # EMA closes can briefly flatten the entire account before a resting entry
-    # reopens the other side in the same bar. That exact boundary now finalizes
-    # the enabled controller even though the final position snapshot is held.
-    enabled_side_triggers = (
-        0.0 if signal_mode == "unified" and strategy_kind == "trailing_martingale" else 1.0
-    )
-    assert output["hsl_triggers_long"][0].item() == enabled_side_triggers
-    assert output["hsl_triggers_short"][0].item() == 0.0
-    assert output["hsl_triggers_long"][1].item() == 0.0
-    assert output["hsl_triggers_short"][1].item() == enabled_side_triggers
-    assert output["hsl_triggers_long"][2].item() == 1.0
-    assert output["hsl_triggers_short"][2].item() == 1.0
-    assert output["hsl_trigger_drawdown_count"][2].item() == 2.0
-    assert output["hsl_strategy_eq_recovery_max_ms_long"][2].item() > 0.0
-    assert output["hsl_strategy_eq_recovery_max_ms_short"][2].item() > 0.0
-    assert output["hsl_drawdown_ema_mean_worst_1pct_long"][2].item() > 0.0
-    assert output["hsl_drawdown_ema_mean_worst_1pct_short"][2].item() > 0.0
-    assert output["hsl_drawdown_raw_max_long"][2].item() > 0.0
-    assert output["hsl_drawdown_raw_max_short"][2].item() > 0.0
-    assert output["hsl_drawdown_raw_mean_worst_1pct_long"][2].item() > 0.0
-    assert output["hsl_drawdown_raw_mean_worst_1pct_short"][2].item() > 0.0
+    if signal_mode != "unified":
+        assert output["hsl_triggers_long"][0].item() == 1.0
+        assert output["hsl_triggers_short"][0].item() == 0.0
+        assert output["hsl_triggers_long"][1].item() == 0.0
+        assert output["hsl_triggers_short"][1].item() == 1.0
+    assert output["hsl_triggers_long"][both].item() == 1.0
+    assert output["hsl_triggers_short"][both].item() == 1.0
+    assert output["hsl_trigger_drawdown_count"][both].item() == 2.0
+    assert output["hsl_strategy_eq_recovery_max_ms_long"][both].item() > 0.0
+    assert output["hsl_strategy_eq_recovery_max_ms_short"][both].item() > 0.0
+    assert output["hsl_drawdown_ema_mean_worst_1pct_long"][both].item() > 0.0
+    assert output["hsl_drawdown_ema_mean_worst_1pct_short"][both].item() > 0.0
+    assert output["hsl_drawdown_raw_max_long"][both].item() > 0.0
+    assert output["hsl_drawdown_raw_max_short"][both].item() > 0.0
+    assert output["hsl_drawdown_raw_mean_worst_1pct_long"][both].item() > 0.0
+    assert output["hsl_drawdown_raw_mean_worst_1pct_short"][both].item() > 0.0
     if signal_mode == "unified":
-        assert output["hsl_panic_loss_drawdown_count"][2].item() >= 1.0
+        assert output["hsl_panic_loss_drawdown_count"][both].item() >= 1.0
     else:
-        assert output["hsl_panic_loss_drawdown_count"][2].item() == 2.0
-    if signal_mode == "unified":
-        assert output["short_psize"][0].item() > 0.0
-        assert output["psize"][1].item() > 0.0
-    assert not output["alive"][3].item()
-    assert output["liq_step"][3].item() == 0
-    assert output["balance"][3].item() == 0.0
-    assert output["fill_count"][3].item() == 0.0
+        assert output["hsl_panic_loss_drawdown_count"][both].item() == 2.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("strategy_kind", "market_orders_allowed"),
     [
@@ -15715,8 +13932,9 @@ def test_mps_dual_side_single_coin_hsl_respects_signal_scope(
     ],
 )
 @pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("fill_buffer", [0.0, 0.0015])
 def test_mps_single_coin_auto_unstuck_reduces_eligible_position(
-    strategy_kind, market_orders_allowed, side
+    strategy_kind, market_orders_allowed, side, fill_buffer
 ):
     count = 6
     close = np.full(count, 100.0)
@@ -15742,7 +13960,15 @@ def test_mps_single_coin_auto_unstuck_reduces_eligible_position(
         0,
         count - 1,
     )
-    data = build_mps_data(high, low, close, timestamps, run, market)
+    data = build_mps_data(
+        high,
+        low,
+        close,
+        timestamps,
+        run,
+        market,
+        limit_order_fill_buffer_pct=fill_buffer,
+    )
 
     def candidate(unstuck_enabled, *, ema_gating=False, ema_dist=0.0):
         if strategy_kind == "trailing_martingale":
@@ -15799,6 +14025,7 @@ def test_mps_single_coin_auto_unstuck_reduces_eligible_position(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         max_realized_loss_pct=0.05,
@@ -15822,18 +14049,18 @@ def test_mps_single_coin_auto_unstuck_reduces_eligible_position(
     # whole contracts; both strategy kernels must share that result.
     initial_size = 9.0 if side == "short" else 10.0
     assert remaining[0] == pytest.approx(initial_size)
-    assert remaining[1] == pytest.approx(initial_size - 1.0)
+    assert remaining[1] == pytest.approx(
+        initial_size
+        if fill_buffer and not market_orders_allowed
+        else initial_size - 1.0
+    )
     assert remaining[2] == pytest.approx(initial_size)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_single_coin_auto_unstuck_scales_loss_to_own_allowance(
-    strategy_kind, side
-):
+def test_mps_single_coin_auto_unstuck_scales_loss_to_own_allowance(strategy_kind, side):
     count = 6
     close = np.full(count, 100.0)
     if side == "long":
@@ -15913,6 +14140,7 @@ def test_mps_single_coin_auto_unstuck_scales_loss_to_own_allowance(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         max_realized_loss_pct=0.05,
@@ -15939,6 +14167,7 @@ def test_mps_single_coin_auto_unstuck_scales_loss_to_own_allowance(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         max_realized_loss_pct=0.0005,
@@ -15952,9 +14181,7 @@ def test_mps_single_coin_auto_unstuck_scales_loss_to_own_allowance(
     assert strict_output[key].item() == pytest.approx(initial_size)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_single_side_multicoin_auto_unstuck_selects_only_one_coin(
@@ -16066,16 +14293,12 @@ def test_mps_single_side_multicoin_auto_unstuck_selects_only_one_coin(
         market_order_near_touch_threshold=0.001,
         market_order_slippage_pct=0.01,
     )
-    strict_output = strict_runner.run(
-        np.asarray([enabled], dtype=np.float64)
-    )
+    strict_output = strict_runner.run(np.asarray([enabled], dtype=np.float64))
     synchronize()
     assert strict_output[key].item() == pytest.approx(remaining[0])
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_single_coin_auto_unstuck_selects_one_least_stuck_side(strategy_kind):
     count = 6
@@ -16151,6 +14374,7 @@ def test_mps_single_coin_auto_unstuck_selects_one_least_stuck_side(strategy_kind
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -16160,9 +14384,7 @@ def test_mps_single_coin_auto_unstuck_selects_one_least_stuck_side(strategy_kind
     assert output["short_psize"].item() == pytest.approx(9.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_equal_unstuck_twel_reducers_keep_nearer_twel(side):
     count = 6
@@ -16212,6 +14434,7 @@ def test_mps_tm_equal_unstuck_twel_reducers_keep_nearer_twel(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         max_realized_loss_pct=0.05,
@@ -16231,18 +14454,14 @@ def test_mps_tm_equal_unstuck_twel_reducers_keep_nearer_twel(side):
     assert torch.isfinite(output["day_net_pnl"][fill_days]).all()
     assert (output["day_last_fill_balance"][fill_days] > 0.0).all()
     assert (output["day_fill_count"][fill_days] >= 1.0).all()
-    assert torch.equal(
-        output["day_fill_count"], output["day_fill_count"].round()
-    )
+    assert torch.equal(output["day_fill_count"], output["day_fill_count"].round())
     assert (
         output["total_wallet_exposure_max"].item()
         >= output["total_wallet_exposure_mean"].item()
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_unstuck_finalization_keeps_valid_ordinary_close_remainder():
     count = 7
     close = np.full(count, 100.0)
@@ -16291,6 +14510,7 @@ def test_mps_tm_unstuck_finalization_keeps_valid_ordinary_close_remainder():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         max_realized_loss_pct=0.05,
@@ -16305,9 +14525,7 @@ def test_mps_tm_unstuck_finalization_keeps_valid_ordinary_close_remainder():
     assert output["psize"].item() < 3.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_unstuck_finalization_keeps_ordinary_close_remainder():
     count = 7
     closes = np.full((count, 2), 100.0)
@@ -16319,7 +14537,9 @@ def test_mps_tm_multicoin_unstuck_finalization_keeps_ordinary_close_remainder():
         ProxyMarket(0.5, 0.01, 0.5, 500.0, 1.0, 0.0),
         ProxyMarket(0.5, 0.01, 0.5, 0.0, 1.0, 0.0),
     ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     runner, candidate = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -16354,9 +14574,7 @@ def test_mps_tm_multicoin_unstuck_finalization_keeps_ordinary_close_remainder():
             "unstuck_threshold": 0.5,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     output = runner.run(np.asarray([candidate], dtype=np.float64))
     synchronize()
@@ -16366,14 +14584,10 @@ def test_mps_tm_multicoin_unstuck_finalization_keeps_ordinary_close_remainder():
     assert output["psize"].item() < 3.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_mps_single_coin_exposure_headroom_and_entry_gate(
-    strategy_kind, side
-):
+def test_mps_single_coin_exposure_headroom_and_entry_gate(strategy_kind, side):
     count = 6
     close = np.full(count, 100.0)
     high = np.array([100.0, 100.0, 100.0, 102.0, 100.0, 100.0])
@@ -16394,10 +14608,10 @@ def test_mps_single_coin_exposure_headroom_and_entry_gate(
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
 
-    def row(*, legacy_raw, entry_gate):
+    def row(*, scale_budget, entry_gate):
         exposure = _single_coin_exposure_fields(
             allowance_pct=0.5,
-            legacy_raw=legacy_raw,
+            scale_budget=scale_budget,
             entry_gate=entry_gate,
             threshold=0.5,
         )
@@ -16439,30 +14653,27 @@ def test_mps_single_coin_exposure_headroom_and_entry_gate(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     )
     rows = [
-        row(legacy_raw=False, entry_gate=False),
-        row(legacy_raw=True, entry_gate=False),
-        row(legacy_raw=True, entry_gate=True),
+        row(scale_budget=False, entry_gate=False),
+        row(scale_budget=True, entry_gate=False),
+        row(scale_budget=True, entry_gate=True),
     ]
     output = runner.run(
         np.asarray([values + values for values in rows], dtype=np.float64)
     )
     synchronize()
-    sizes = (
-        output["psize"] if side == "long" else output["short_psize"]
-    ).cpu().numpy()
+    sizes = (output["psize"] if side == "long" else output["short_psize"]).cpu().numpy()
 
     assert sizes[0] > 0.0
-    assert sizes[1] > sizes[0] * 1.4
+    assert sizes[1] == pytest.approx(sizes[0])
     assert sizes[2] < sizes[0] * 0.6
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_position_exposure_repair_reduces_strictly_below_target(
@@ -16495,28 +14706,21 @@ def test_mps_tm_position_exposure_repair_reduces_strictly_below_target(
     baseline[20] = 0.001 if market_orders_allowed else 0.0
     repaired = list(baseline)
     repaired[
-        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-            "wel_enforcer_enabled"
-        )
+        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("wel_enforcer_enabled")
     ] = 1.0
     repaired[
-        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-            "wel_enforcer_threshold"
-        )
+        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("wel_enforcer_threshold")
     ] = 0.5
     output = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         market_orders_allowed=market_orders_allowed,
         market_order_near_touch_threshold=0.001,
-    ).run(
-        np.asarray(
-            [baseline + baseline, repaired + repaired], dtype=np.float64
-        )
-    )
+    ).run(np.asarray([baseline + baseline, repaired + repaired], dtype=np.float64))
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
@@ -16529,10 +14733,7 @@ def test_mps_tm_position_exposure_repair_reduces_strictly_below_target(
     )
     assert 0.0 < sizes[1] < sizes[0]
     assert 0.45 < repaired_we < 0.5
-    assert (
-        output["day_volume"][1].sum().item()
-        > output["day_volume"][0].sum().item()
-    )
+    assert output["day_volume"][1].sum().item() > output["day_volume"][0].sum().item()
     other_side = "short" if side == "long" else "long"
     assert torch.allclose(output[f"profit_sum_{side}"], output["profit_sum"])
     assert torch.allclose(output[f"loss_sum_{side}"], output["loss_sum"])
@@ -16540,9 +14741,7 @@ def test_mps_tm_position_exposure_repair_reduces_strictly_below_target(
     assert (output[f"loss_sum_{other_side}"] == 0.0).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_single_coin_total_exposure_repair(side, market_orders_allowed):
@@ -16576,38 +14775,28 @@ def test_mps_tm_single_coin_total_exposure_repair(side, market_orders_allowed):
     baseline[20] = 0.001 if market_orders_allowed else 0.0
     repaired = list(baseline)
     repaired[
-        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-            "twel_enforcer_enabled"
-        )
+        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("twel_enforcer_enabled")
     ] = 1.0
     output = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         market_orders_allowed=market_orders_allowed,
         market_order_near_touch_threshold=0.001,
-    ).run(
-        np.asarray(
-            [baseline + baseline, repaired + repaired], dtype=np.float64
-        )
-    )
+    ).run(np.asarray([baseline + baseline, repaired + repaired], dtype=np.float64))
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
     sizes = output[size_key].cpu().numpy()
     assert sizes[0] > 9.0
     assert sizes[1] == pytest.approx(5.0)
-    assert (
-        output["day_volume"][1].sum().item()
-        > output["day_volume"][0].sum().item()
-    )
+    assert output["day_volume"][1].sum().item() > output["day_volume"][0].sum().item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_ema_single_coin_total_exposure_repair(side, market_orders_allowed):
@@ -16656,7 +14845,7 @@ def test_mps_ema_single_coin_total_exposure_repair(side, market_orders_allowed):
         "entry_cooldown_minutes": 100.0,
         "total_wallet_exposure_limit": 1.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 0.0,
         "twel_enforcer_threshold": 0.5,
         "twel_enforcer_enabled": 0.0,
@@ -16670,32 +14859,22 @@ def test_mps_ema_single_coin_total_exposure_repair(side, market_orders_allowed):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         market_orders_allowed=market_orders_allowed,
         market_order_near_touch_threshold=0.001,
-    ).run(
-        np.asarray(
-            [baseline + baseline, repaired + repaired], dtype=np.float64
-        )
-    )
+    ).run(np.asarray([baseline + baseline, repaired + repaired], dtype=np.float64))
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
     sizes = output[size_key].cpu().numpy()
     assert sizes[0] > 8.0
     pprice_key = "pprice" if side == "long" else "short_pprice"
-    repaired_we = (
-        sizes[1]
-        * output[pprice_key][1].item()
-        / output["balance"][1].item()
-    )
+    repaired_we = sizes[1] * output[pprice_key][1].item() / output["balance"][1].item()
     assert 0.0 < sizes[1] < sizes[0]
     assert 0.35 < repaired_we <= 0.51
-    assert (
-        output["day_volume"][1].sum().item()
-        > output["day_volume"][0].sum().item()
-    )
+    assert output["day_volume"][1].sum().item() > output["day_volume"][0].sum().item()
     other_side = "short" if side == "long" else "long"
     assert torch.allclose(output[f"profit_sum_{side}"], output["profit_sum"])
     assert torch.allclose(output[f"loss_sum_{side}"], output["loss_sum"])
@@ -16703,9 +14882,7 @@ def test_mps_ema_single_coin_total_exposure_repair(side, market_orders_allowed):
     assert (output[f"loss_sum_{other_side}"] == 0.0).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_ema_realized_loss_gate_blocks_lossy_total_exposure_repair(
@@ -16754,7 +14931,7 @@ def test_mps_ema_realized_loss_gate_blocks_lossy_total_exposure_repair(
         "entry_cooldown_minutes": 100.0,
         "total_wallet_exposure_limit": 1.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 0.0,
         "twel_enforcer_threshold": 0.5,
         "twel_enforcer_enabled": 1.0,
@@ -16770,10 +14947,10 @@ def test_mps_ema_realized_loss_gate_blocks_lossy_total_exposure_repair(
     }
 
     ungated = MpsEmaAnchorRunner(
-        market, run, data, max_realized_loss_pct=1.0, **kwargs
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=1.0, **kwargs
     ).run(np.asarray([row + row], dtype=np.float64))
     gated = MpsEmaAnchorRunner(
-        market, run, data, max_realized_loss_pct=0.0, **kwargs
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=0.0, **kwargs
     ).run(np.asarray([row + row], dtype=np.float64))
     synchronize()
 
@@ -16783,9 +14960,7 @@ def test_mps_ema_realized_loss_gate_blocks_lossy_total_exposure_repair(
     assert gated["balance"][0].item() >= ungated["balance"][0].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_realized_loss_gate_shares_budget_between_sides():
     count = 8
     close = np.full(count, 100.0)
@@ -16820,7 +14995,7 @@ def test_mps_ema_realized_loss_gate_shares_budget_between_sides():
         "entry_cooldown_minutes": 100.0,
         "total_wallet_exposure_limit": 1.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 0.0,
         "twel_enforcer_threshold": 0.5,
         "twel_enforcer_enabled": 1.0,
@@ -16831,6 +15006,7 @@ def test_mps_ema_realized_loss_gate_shares_budget_between_sides():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=True,
@@ -16843,9 +15019,7 @@ def test_mps_ema_realized_loss_gate_shares_budget_between_sides():
     assert sizes[1] > 8.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_realized_loss_gate_reserves_unfilled_batch_loss():
     count = 6
     close = np.array([100.0, 100.0, 100.0, 100.0, 99.9, 99.9])
@@ -16880,7 +15054,7 @@ def test_mps_ema_realized_loss_gate_reserves_unfilled_batch_loss():
         "entry_cooldown_minutes": 100.0,
         "total_wallet_exposure_limit": 1.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 0.0,
         "twel_enforcer_threshold": 0.5,
         "twel_enforcer_enabled": 1.0,
@@ -16893,10 +15067,15 @@ def test_mps_ema_realized_loss_gate_reserves_unfilled_batch_loss():
     }
 
     ungated = MpsEmaAnchorRunner(
-        market, run, data, max_realized_loss_pct=1.0, **common
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=1.0, **common
     ).run(np.asarray([row + row], dtype=np.float64))
     gated = MpsEmaAnchorRunner(
-        market, run, data, max_realized_loss_pct=0.0031, **common
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        max_realized_loss_pct=0.0031,
+        **common,
     ).run(np.asarray([row + row], dtype=np.float64))
     synchronize()
 
@@ -16912,9 +15091,7 @@ def test_mps_ema_realized_loss_gate_reserves_unfilled_batch_loss():
     assert sizes["gated_short"] > 8.0, sizes
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_ema_zero_loss_budget_blocks_loss_below_balance_ulp():
     count = 6
     close = np.full(count, 100.0)
@@ -16949,7 +15126,7 @@ def test_mps_ema_zero_loss_budget_blocks_loss_below_balance_ulp():
         "entry_cooldown_minutes": 100.0,
         "total_wallet_exposure_limit": 1.0,
         "we_excess_allowance_pct": 0.0,
-        "we_excess_allowance_legacy_raw": 0.0,
+        "hsl_scale_budget_with_excess_allowance": 0.0,
         "twel_entry_gate_enabled": 0.0,
         "twel_enforcer_threshold": 1.0,
         "twel_enforcer_enabled": 0.0,
@@ -16960,6 +15137,7 @@ def test_mps_ema_zero_loss_budget_blocks_loss_below_balance_ulp():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         max_realized_loss_pct=1.0,
@@ -16968,6 +15146,7 @@ def test_mps_ema_zero_loss_budget_blocks_loss_below_balance_ulp():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
         max_realized_loss_pct=0.0,
@@ -16978,9 +15157,7 @@ def test_mps_ema_zero_loss_budget_blocks_loss_below_balance_ulp():
     assert gated["psize"][0].item() > 0.0009
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_realized_loss_gate_blocks_lossy_total_exposure_repair(
@@ -17034,10 +15211,10 @@ def test_mps_tm_realized_loss_gate_blocks_lossy_total_exposure_repair(
     }
 
     ungated = MpsTrailingMartingaleRunner(
-        market, run, data, max_realized_loss_pct=1.0, **kwargs
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=1.0, **kwargs
     ).run(np.asarray([row + row], dtype=np.float64))
     gated = MpsTrailingMartingaleRunner(
-        market, run, data, max_realized_loss_pct=0.1, **kwargs
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=0.1, **kwargs
     ).run(np.asarray([row + row], dtype=np.float64))
     synchronize()
 
@@ -17046,9 +15223,7 @@ def test_mps_tm_realized_loss_gate_blocks_lossy_total_exposure_repair(
     assert gated[size_key][0].item() > 9.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_loss_gate_rebuilds_profitable_ordinary_close_after_reducer(side):
     count = 8
@@ -17096,6 +15271,7 @@ def test_mps_tm_loss_gate_rebuilds_profitable_ordinary_close_after_reducer(side)
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         max_realized_loss_pct=0.1,
@@ -17106,9 +15282,7 @@ def test_mps_tm_loss_gate_rebuilds_profitable_ordinary_close_after_reducer(side)
     assert output[size_key][0].item() == pytest.approx(0.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_realized_loss_gate_blocks_fee_only_ordinary_close(
@@ -17169,10 +15343,10 @@ def test_mps_tm_realized_loss_gate_blocks_fee_only_ordinary_close(
     }
 
     ungated = MpsTrailingMartingaleRunner(
-        market, run, data, max_realized_loss_pct=1.0, **kwargs
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=1.0, **kwargs
     ).run(np.asarray([row + row], dtype=np.float64))
     gated = MpsTrailingMartingaleRunner(
-        market, run, data, max_realized_loss_pct=0.1, **kwargs
+        market, run, data, pnl_lookback_bars=1440, max_realized_loss_pct=0.1, **kwargs
     ).run(np.asarray([row + row], dtype=np.float64))
     synchronize()
 
@@ -17181,9 +15355,7 @@ def test_mps_tm_realized_loss_gate_blocks_fee_only_ordinary_close(
     assert gated[size_key][0].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_equal_wel_twel_reducers_keep_nearer_wel(side):
     count = 6
@@ -17222,6 +15394,7 @@ def test_mps_tm_equal_wel_twel_reducers_keep_nearer_wel(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -17233,9 +15406,7 @@ def test_mps_tm_equal_wel_twel_reducers_keep_nearer_wel(side):
     assert output[size_key][0].item() == pytest.approx(10.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_finalized_reducer_tie_keeps_nearer_wel(side):
     count = 6
@@ -17272,21 +15443,16 @@ def test_mps_tm_finalized_reducer_tie_keeps_nearer_wel(side):
 
     twel_only = list(row)
     twel_only[
-        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
-            "wel_enforcer_enabled"
-        )
+        TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("wel_enforcer_enabled")
     ] = 0.0
     output = MpsTrailingMartingaleRunner(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
-    ).run(
-        np.asarray(
-            [row + row, twel_only + twel_only], dtype=np.float64
-        )
-    )
+    ).run(np.asarray([row + row, twel_only + twel_only], dtype=np.float64))
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
@@ -17297,9 +15463,7 @@ def test_mps_tm_finalized_reducer_tie_keeps_nearer_wel(side):
     assert output[size_key][1].item() == pytest.approx(0.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_twel_offsets_raw_close_before_tick_quantization(side):
     count = 6
@@ -17346,6 +15510,7 @@ def test_mps_tm_twel_offsets_raw_close_before_tick_quantization(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -17358,9 +15523,7 @@ def test_mps_tm_twel_offsets_raw_close_before_tick_quantization(side):
     assert output[size_key][0].item() == pytest.approx(10.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_twel_repair_preserves_triggered_trailing_close(side):
     count = 7
@@ -17405,6 +15568,7 @@ def test_mps_tm_twel_repair_preserves_triggered_trailing_close(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -17417,9 +15581,7 @@ def test_mps_tm_twel_repair_preserves_triggered_trailing_close(side):
     assert 0.0 < output[size_key][0].item() < 5.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_wel_repair_suppresses_triggered_trailing_close(side):
     count = 7
@@ -17467,6 +15629,7 @@ def test_mps_tm_wel_repair_suppresses_triggered_trailing_close(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([trailing + trailing, nontrailing + nontrailing]))
@@ -17475,15 +15638,11 @@ def test_mps_tm_wel_repair_suppresses_triggered_trailing_close(side):
     size_key = "psize" if side == "long" else "short_psize"
     # Strategy WEL takes precedence inside calc_closes_*; unlike an appended
     # TWEL reducer, it must not retain a triggered trailing close.
-    assert output[size_key][0].item() == pytest.approx(
-        output[size_key][1].item()
-    )
+    assert output[size_key][0].item() == pytest.approx(output[size_key][1].item())
     assert output[size_key][0].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_twel_and_trailing_close_absorb_dust_in_signed_order(side):
     count = 7
@@ -17532,6 +15691,7 @@ def test_mps_tm_twel_and_trailing_close_absorb_dust_in_signed_order(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -17547,16 +15707,12 @@ def test_mps_tm_twel_and_trailing_close_absorb_dust_in_signed_order(side):
     balance = 1_000.0 - 10.0 * entry_price * market.maker_fee
     expected_volume = 10.0 * entry_price / balance
     reducer_pnl = 6.0 * (
-        reducer_price - entry_price
-        if side == "long"
-        else entry_price - reducer_price
+        reducer_price - entry_price if side == "long" else entry_price - reducer_price
     )
     balance += reducer_pnl - 6.0 * reducer_price * market.maker_fee
     expected_volume += 6.0 * reducer_price / balance
     ordinary_pnl = 4.0 * (
-        ordinary_price - entry_price
-        if side == "long"
-        else entry_price - ordinary_price
+        ordinary_price - entry_price if side == "long" else entry_price - ordinary_price
     )
     balance += ordinary_pnl - 4.0 * ordinary_price * market.maker_fee
     expected_volume += 4.0 * ordinary_price / balance
@@ -17567,9 +15723,7 @@ def test_mps_tm_twel_and_trailing_close_absorb_dust_in_signed_order(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_twel_grid_uses_pre_repair_strategy_state(side):
     count = 6
@@ -17609,6 +15763,7 @@ def test_mps_tm_twel_grid_uses_pre_repair_strategy_state(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([row + row], dtype=np.float64))
@@ -17621,9 +15776,7 @@ def test_mps_tm_twel_grid_uses_pre_repair_strategy_state(side):
     assert output[size_key][0].item() > 3.5
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_position_reducer_reachability_survives_grid_pruning(side):
     count = 6
@@ -17645,9 +15798,7 @@ def test_mps_tm_position_reducer_reachability_survives_grid_pruning(side):
         count - 1,
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
-    candidate = _tm_single_row(
-        wel_enforcer_enabled=True, wel_enforcer_threshold=0.5
-    )
+    candidate = _tm_single_row(wel_enforcer_enabled=True, wel_enforcer_threshold=0.5)
     candidate[6] = 1.0
     candidate[7] = 10.0
     candidate[11] = 0.0
@@ -17659,6 +15810,7 @@ def test_mps_tm_position_reducer_reachability_survives_grid_pruning(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([candidate + candidate], dtype=np.float64))
@@ -17672,9 +15824,7 @@ def test_mps_tm_position_reducer_reachability_survives_grid_pruning(side):
     assert output["day_volume"].sum().item() > 1.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_grid_can_fill_without_off_tick_reducer(side):
     count = 6
@@ -17697,9 +15847,7 @@ def test_mps_tm_grid_can_fill_without_off_tick_reducer(side):
         count - 1,
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
-    candidate = _tm_single_row(
-        wel_enforcer_enabled=True, wel_enforcer_threshold=0.5
-    )
+    candidate = _tm_single_row(wel_enforcer_enabled=True, wel_enforcer_threshold=0.5)
     candidate[6] = 1.0
     candidate[7] = 10.0
     candidate[11] = 0.0
@@ -17711,6 +15859,7 @@ def test_mps_tm_grid_can_fill_without_off_tick_reducer(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([candidate + candidate], dtype=np.float64))
@@ -17725,9 +15874,7 @@ def test_mps_tm_grid_can_fill_without_off_tick_reducer(side):
     assert 1.0 < output["day_volume"].sum().item() < 2.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_off_tick_grid_precedes_reducer_for_volume(side):
     count = 6
@@ -17750,9 +15897,7 @@ def test_mps_tm_off_tick_grid_precedes_reducer_for_volume(side):
         count - 1,
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
-    candidate = _tm_single_row(
-        wel_enforcer_enabled=True, wel_enforcer_threshold=0.5
-    )
+    candidate = _tm_single_row(wel_enforcer_enabled=True, wel_enforcer_threshold=0.5)
     candidate[6] = 1.0
     candidate[7] = 10.0
     candidate[11] = 0.0
@@ -17764,6 +15909,7 @@ def test_mps_tm_off_tick_grid_precedes_reducer_for_volume(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([candidate + candidate], dtype=np.float64))
@@ -17785,9 +15931,7 @@ def test_mps_tm_off_tick_grid_precedes_reducer_for_volume(side):
     balance += grid_pnl - grid_qty * grid_price * market.maker_fee
     expected_volume += grid_qty * grid_price / balance
     reducer_pnl = reducer_qty * (
-        reducer_price - entry_price
-        if side == "long"
-        else entry_price - reducer_price
+        reducer_price - entry_price if side == "long" else entry_price - reducer_price
     )
     balance += reducer_pnl - reducer_qty * reducer_price * market.maker_fee
     expected_volume += reducer_qty * reducer_price / balance
@@ -17809,9 +15953,7 @@ def test_mps_tm_off_tick_grid_precedes_reducer_for_volume(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_reducer_consumes_one_recursive_close_slot(side):
     count = 6
@@ -17834,9 +15976,7 @@ def test_mps_tm_reducer_consumes_one_recursive_close_slot(side):
         count - 1,
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
-    candidate = _tm_single_row(
-        wel_enforcer_enabled=True, wel_enforcer_threshold=0.5
-    )
+    candidate = _tm_single_row(wel_enforcer_enabled=True, wel_enforcer_threshold=0.5)
     candidate[6] = 1.0
     candidate[7] = 10.0
     candidate[11] = 0.0
@@ -17849,6 +15989,7 @@ def test_mps_tm_reducer_consumes_one_recursive_close_slot(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([candidate + candidate], dtype=np.float64))
@@ -17862,9 +16003,7 @@ def test_mps_tm_reducer_consumes_one_recursive_close_slot(side):
     assert output[size_key].item() == pytest.approx(expected_size, abs=2.0e-4)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_small_excess_reducer_crosses_strict_target(side):
     count = 6
@@ -17888,9 +16027,7 @@ def test_mps_tm_small_excess_reducer_crosses_strict_target(side):
     )
     target = 0.99999
     data = build_mps_data(high, low, close, timestamps, run, market)
-    candidate = _tm_single_row(
-        wel_enforcer_enabled=True, wel_enforcer_threshold=target
-    )
+    candidate = _tm_single_row(wel_enforcer_enabled=True, wel_enforcer_threshold=target)
     candidate[6] = 1.0
     candidate[7] = 10.0
     candidate[11] = 0.0
@@ -17900,6 +16037,7 @@ def test_mps_tm_small_excess_reducer_crosses_strict_target(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([candidate + candidate], dtype=np.float64))
@@ -17908,17 +16046,13 @@ def test_mps_tm_small_excess_reducer_crosses_strict_target(side):
     size_key = "psize" if side == "long" else "short_psize"
     pprice_key = "pprice" if side == "long" else "short_pprice"
     exposure = (
-        output[size_key].item()
-        * output[pprice_key].item()
-        / output["balance"].item()
+        output[size_key].item() * output[pprice_key].item() / output["balance"].item()
     )
     assert output[size_key].item() > 0.0
     assert exposure < target
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_same_tick_twel_and_grid_use_separate_volume_denominators(side):
     count = 6
@@ -17955,6 +16089,7 @@ def test_mps_tm_same_tick_twel_and_grid_use_separate_volume_denominators(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
     ).run(np.asarray([candidate + candidate], dtype=np.float64))
@@ -17970,29 +16105,19 @@ def test_mps_tm_same_tick_twel_and_grid_use_separate_volume_denominators(side):
     close_price = 100.0 if side == "long" else 101.0
     balance_after_entry = 1_000.0 - entry_qty * entry_price * 0.001
     grid_pnl = grid_qty * (
-        close_price - entry_price
-        if side == "long"
-        else entry_price - close_price
+        close_price - entry_price if side == "long" else entry_price - close_price
     )
-    balance_after_grid = (
-        balance_after_entry + grid_pnl - grid_qty * close_price * 0.001
-    )
+    balance_after_grid = balance_after_entry + grid_pnl - grid_qty * close_price * 0.001
     reducer_pnl = reducer_qty * (
-        close_price - entry_price
-        if side == "long"
-        else entry_price - close_price
+        close_price - entry_price if side == "long" else entry_price - close_price
     )
     balance_after_close = (
-        balance_after_grid
-        + reducer_pnl
-        - reducer_qty * close_price * 0.001
+        balance_after_grid + reducer_pnl - reducer_qty * close_price * 0.001
     )
     expected_volume = entry_qty * entry_price / balance_after_entry
     expected_volume += grid_qty * close_price / balance_after_grid
     expected_volume += reducer_qty * close_price / balance_after_close
-    assert output["balance"].item() == pytest.approx(
-        balance_after_close, abs=2.0e-4
-    )
+    assert output["balance"].item() == pytest.approx(balance_after_close, abs=2.0e-4)
     assert output["day_volume"].sum().item() == pytest.approx(
         expected_volume, rel=2.0e-5
     )
@@ -18037,9 +16162,7 @@ def _tm_multicoin_off_tick_reducer_case(
     hlcvs[:, 1, 1] = 119.0
     hlcvs[:, 1, 2] = 120.0
     hlcvs[:, 1, 3] = 100.0
-    market = ProxyMarket(
-        0.001, price_step, 0.001, min_cost, 1.0, maker_fee, taker_fee
-    )
+    market = ProxyMarket(0.001, price_step, 0.001, min_cost, 1.0, maker_fee, taker_fee)
     run = ProxyRun(
         1_000.0,
         1,
@@ -18052,12 +16175,8 @@ def _tm_multicoin_off_tick_reducer_case(
         0,
         count - 1,
     )
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, [run, run], [market, market]
-    )
-    _, row = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=count
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, [run, run], [market, market])
+    _, row = _multicoin_exposure_fixture("trailing_martingale", side, count=count)
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, row))
     values.update(
         {
@@ -18076,14 +16195,15 @@ def _tm_multicoin_off_tick_reducer_case(
             "wel_enforcer_threshold": 0.5,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     runner = MpsTrailingMartingaleMulticoinRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         side=side,
         coin_overrides=overrides,
         market_orders_allowed=market_orders_allowed,
@@ -18094,9 +16214,7 @@ def _tm_multicoin_off_tick_reducer_case(
     return runner, candidate, market
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_market_wel_keeps_passive_grid_reservation():
     import passivbot_rust
 
@@ -18169,17 +16287,15 @@ kernel void passivbot_tm_multicoin_market_wel_reservation_probe(
         dtype=torch.float32,
         device=gpu_device(),
     )
-    touch_ticks = torch.full(
-        (2, 1, 2), 20_000, dtype=torch.int32, device=gpu_device()
-    )
+    touch_ticks = torch.full((2, 1, 2), 20_000, dtype=torch.int32, device=gpu_device())
     touch_nearest_ticks = torch.full(
         (2, 1), 20_000, dtype=torch.int32, device=gpu_device()
     )
-    touch_min_qty_bits = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
-    )
+    touch_min_qty_bits = torch.zeros((2, 1), dtype=torch.int32, device=gpu_device())
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
+        (2, 1),
+        dtype=torch.int8 if gpu_device() == "cuda" else torch.int32,
+        device=gpu_device(),
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.001
@@ -18189,12 +16305,14 @@ kernel void passivbot_tm_multicoin_market_wel_reservation_probe(
     coin_settings[0, 4] = 1.0
     coin_settings[0, 7] = 10.0
     coin_overrides = torch.full(
-        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
     output = torch.zeros(5, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_market_wel_reservation_probe(
         bars,
@@ -18219,9 +16337,7 @@ kernel void passivbot_tm_multicoin_market_wel_reservation_probe(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_market_unstuck_sizes_at_touch_without_reseeding_grid(
     side,
@@ -18304,17 +16420,15 @@ kernel void passivbot_tm_multicoin_market_unstuck_reservation_probe(
         dtype=torch.float32,
         device=gpu_device(),
     )
-    touch_ticks = torch.full(
-        (2, 1, 2), 20_000, dtype=torch.int32, device=gpu_device()
-    )
+    touch_ticks = torch.full((2, 1, 2), 20_000, dtype=torch.int32, device=gpu_device())
     touch_nearest_ticks = torch.full(
         (2, 1), 20_000, dtype=torch.int32, device=gpu_device()
     )
-    touch_min_qty_bits = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
-    )
+    touch_min_qty_bits = torch.zeros((2, 1), dtype=torch.int32, device=gpu_device())
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
+        (2, 1),
+        dtype=torch.int8 if gpu_device() == "cuda" else torch.int32,
+        device=gpu_device(),
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.001
@@ -18324,12 +16438,14 @@ kernel void passivbot_tm_multicoin_market_unstuck_reservation_probe(
     coin_settings[0, 4] = 1.0
     coin_settings[0, 7] = 10.0
     coin_overrides = torch.full(
-        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
     output = torch.zeros(7, dtype=torch.float32, device=gpu_device())
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
     library.passivbot_tm_multicoin_market_unstuck_reservation_probe(
         bars,
@@ -18354,9 +16470,7 @@ kernel void passivbot_tm_multicoin_market_unstuck_reservation_probe(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_market_unstuck_override_pays_slippage_and_taker_fee(
     side,
@@ -18379,7 +16493,9 @@ def test_mps_tm_multicoin_market_unstuck_override_pays_slippage_and_taker_fee(
             ProxyMarket(1.0, 0.01, 1.0, 0.0, 1.0, 0.0, taker_fee),
             ProxyMarket(1.0, 0.01, 2.0, 0.0, 1.0, 0.0, taker_fee),
         ]
-        overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+        overrides = np.full(
+            (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+        )
         # Exercise the effective per-coin runtime: the side template remains
         # disabled while coin one alone enables auto-unstuck.
         overrides[1, 28] = 1.0
@@ -18397,9 +16513,7 @@ def test_mps_tm_multicoin_market_unstuck_override_pays_slippage_and_taker_fee(
             market_order_slippage_pct=slippage,
             max_realized_loss_pct=max_realized_loss_pct,
         )
-        values = dict(
-            zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, candidate)
-        )
+        values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, candidate))
         values.update(
             {
                 "entry_initial_ema_dist": 0.01,
@@ -18419,12 +16533,7 @@ def test_mps_tm_multicoin_market_unstuck_override_pays_slippage_and_taker_fee(
         )
         output = runner.run(
             np.asarray(
-                [
-                    [
-                        values[key]
-                        for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-                    ]
-                ],
+                [[values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]],
                 dtype=np.float64,
             )
         )
@@ -18434,9 +16543,7 @@ def test_mps_tm_multicoin_market_unstuck_override_pays_slippage_and_taker_fee(
     no_cost = run_case(slippage=0.0, taker_fee=0.0)
     slipped = run_case(slippage=0.01, taker_fee=0.0)
     charged = run_case(slippage=0.01, taker_fee=0.002)
-    strict = run_case(
-        slippage=0.01, taker_fee=0.002, max_realized_loss_pct=0.0
-    )
+    strict = run_case(slippage=0.01, taker_fee=0.002, max_realized_loss_pct=0.0)
     position_key = "psize" if side == "long" else "short_psize"
 
     assert no_cost["fill_count"].item() > 2.0
@@ -18454,9 +16561,7 @@ def test_mps_tm_multicoin_market_unstuck_override_pays_slippage_and_taker_fee(
     assert strict["balance"].item() >= charged["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_market_reducer_keeps_generation_dust_allocation():
     import passivbot_rust
 
@@ -18557,11 +16662,11 @@ kernel void passivbot_tm_multicoin_market_reducer_dust_probe(
     touch_nearest_ticks = torch.full(
         (2, 1), 400, dtype=torch.int32, device=gpu_device()
     )
-    touch_min_qty_bits = torch.zeros(
-        (2, 1), dtype=torch.int32, device=gpu_device()
-    )
+    touch_min_qty_bits = torch.zeros((2, 1), dtype=torch.int32, device=gpu_device())
     touch_min_qty_relation = torch.zeros(
-        (2, 1), dtype=torch.int8 if gpu_device() == "cuda" else torch.int32, device=gpu_device()
+        (2, 1),
+        dtype=torch.int8 if gpu_device() == "cuda" else torch.int32,
+        device=gpu_device(),
     )
     coin_settings = torch.zeros((1, 13), dtype=torch.float32, device=gpu_device())
     coin_settings[0, 0] = 0.1
@@ -18571,11 +16676,13 @@ kernel void passivbot_tm_multicoin_market_reducer_dust_probe(
     coin_settings[0, 4] = 1.0
     coin_settings[0, 7] = 10.0
     coin_overrides = torch.full(
-        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), float("nan"), dtype=torch.float32, device=gpu_device()
+        (1, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS),
+        float("nan"),
+        dtype=torch.float32,
+        device=gpu_device(),
     )
     library = compile_shader(
-        passivbot_rust.mps_trailing_martingale_multicoin_source_py()
-        + probe_kernel
+        passivbot_rust.mps_trailing_martingale_multicoin_source_py() + probe_kernel
     )
 
     remaining_sizes = []
@@ -18583,7 +16690,7 @@ kernel void passivbot_tm_multicoin_market_reducer_dust_probe(
         bars = torch.tensor(
             [
                 [[100.0, 40.0, 100.0, 1.0]],
-                    [[220.0, 30.0, next_close, 1.0]],
+                [[220.0, 30.0, next_close, 1.0]],
             ],
             dtype=torch.float32,
             device=gpu_device(),
@@ -18624,9 +16731,7 @@ kernel void passivbot_tm_multicoin_market_reducer_dust_probe(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_off_tick_grid_precedes_reducer_for_volume(side):
     runner, candidate, market = _tm_multicoin_off_tick_reducer_case(
@@ -18650,9 +16755,7 @@ def test_mps_tm_multicoin_off_tick_grid_precedes_reducer_for_volume(side):
     balance += grid_pnl - grid_qty * grid_price * market.maker_fee
     expected_volume += grid_qty * grid_price / balance
     reducer_pnl = reducer_qty * (
-        reducer_price - entry_price
-        if side == "long"
-        else entry_price - reducer_price
+        reducer_price - entry_price if side == "long" else entry_price - reducer_price
     )
     balance += reducer_pnl - reducer_qty * reducer_price * market.maker_fee
     expected_volume += reducer_qty * reducer_price / balance
@@ -18667,9 +16770,7 @@ def test_mps_tm_multicoin_off_tick_grid_precedes_reducer_for_volume(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_market_grid_precedes_farther_reducer_for_volume(
     side,
@@ -18697,20 +16798,14 @@ def test_mps_tm_multicoin_market_grid_precedes_farther_reducer_for_volume(
         if side == "long"
         else entry_price - market_fill_price
     )
-    balance += (
-        grid_pnl
-        - grid_qty * market_fill_price * market.taker_fee
-    )
+    balance += grid_pnl - grid_qty * market_fill_price * market.taker_fee
     expected_volume += grid_qty * market_fill_price / balance
     reducer_pnl = reducer_qty * (
         market_fill_price - entry_price
         if side == "long"
         else entry_price - market_fill_price
     )
-    balance += (
-        reducer_pnl
-        - reducer_qty * market_fill_price * market.taker_fee
-    )
+    balance += reducer_pnl - reducer_qty * market_fill_price * market.taker_fee
     expected_volume += reducer_qty * market_fill_price / balance
 
     assert output["balance"].item() == pytest.approx(balance, abs=3.0e-4)
@@ -18719,9 +16814,7 @@ def test_mps_tm_multicoin_market_grid_precedes_farther_reducer_for_volume(
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_same_tick_wel_resizes_merged_market_group_once(side):
     runner, candidate, _ = _tm_multicoin_off_tick_reducer_case(
@@ -18742,9 +16835,7 @@ def test_mps_tm_multicoin_same_tick_wel_resizes_merged_market_group_once(side):
     )
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, candidate))
     values["wel_enforcer_threshold"] = 0.99
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     output = runner.run(np.asarray([candidate], dtype=np.float64))
     synchronize()
@@ -18758,9 +16849,7 @@ def test_mps_tm_multicoin_same_tick_wel_resizes_merged_market_group_once(side):
     assert output[size_key].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_early_market_reducer_charges_taker_fee(side):
     common = {
@@ -18785,18 +16874,14 @@ def test_mps_tm_multicoin_early_market_reducer_charges_taker_fee(side):
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
-    assert charged[size_key].item() == pytest.approx(
-        free[size_key].item(), abs=2.0e-4
-    )
+    assert charged[size_key].item() == pytest.approx(free[size_key].item(), abs=2.0e-4)
     # Only the near-touch WEL reducer is promoted; the farther recursive
     # groups stay passive.  The reducer sorts before the first group, so a
     # lower balance here specifically proves that early path used taker_fee.
     assert charged["balance"].item() < free["balance"].item() - 0.01
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_reducer_consumes_one_recursive_close_slot(side):
     runner, candidate, _ = _tm_multicoin_off_tick_reducer_case(
@@ -18813,18 +16898,16 @@ def test_mps_tm_multicoin_reducer_consumes_one_recursive_close_slot(side):
     assert output[size_key].item() == pytest.approx(expected_size, abs=2.0e-4)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_global_position_exposure_repair(side):
     runner, baseline = _multicoin_exposure_fixture(
         "trailing_martingale", side, count=10
     )
     repaired = list(baseline)
-    repaired[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_enabled")
-    ] = 1.0
+    repaired[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_enabled")] = (
+        1.0
+    )
     repaired[
         TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_threshold")
     ] = 0.5
@@ -18834,27 +16917,20 @@ def test_mps_tm_multicoin_global_position_exposure_repair(side):
     size_key = "psize" if side == "long" else "short_psize"
     sizes = output[size_key].cpu().numpy()
     assert 0.0 < sizes[1] < sizes[0]
-    assert (
-        output["day_volume"][1].sum().item()
-        > output["day_volume"][0].sum().item()
-    )
+    assert output["day_volume"][1].sum().item() > output["day_volume"][0].sum().item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("repair_kind", ["position", "total"])
 def test_mps_tm_multicoin_market_exposure_repair_uses_slippage_and_taker_fee(
     side, repair_kind
 ):
     market_no_fee = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0, 0.0)
-        for _ in range(2)
+        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0, 0.0) for _ in range(2)
     ]
     market_with_taker_fee = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0, 0.002)
-        for _ in range(2)
+        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0, 0.002) for _ in range(2)
     ]
     passive_runner, row = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -18889,18 +16965,11 @@ def test_mps_tm_multicoin_market_exposure_repair_uses_slippage_and_taker_fee(
             "twel_enforcer_threshold": 0.5,
             "wel_enforcer_enabled": float(repair_kind == "position"),
             "twel_enforcer_enabled": float(repair_kind == "total"),
-            "twel_enforcer_reduce_portfolio": float(
-                repair_kind == "total"
-            ),
+            "twel_enforcer_reduce_portfolio": float(repair_kind == "total"),
         }
     )
     candidate = np.asarray(
-        [
-            [
-                values[key]
-                for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-            ]
-        ],
+        [[values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]],
         dtype=np.float64,
     )
 
@@ -18916,9 +16985,7 @@ def test_mps_tm_multicoin_market_exposure_repair_uses_slippage_and_taker_fee(
     assert charged["balance"].item() < promoted["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_trailing_market_exposure_repair_stays_partial(side):
     baseline_runner, row = _multicoin_exposure_fixture(
@@ -18942,12 +17009,7 @@ def test_mps_tm_multicoin_trailing_market_exposure_repair_stays_partial(side):
         }
     )
     candidate = np.asarray(
-        [
-            [
-                values[key]
-                for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-            ]
-        ],
+        [[values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]],
         dtype=np.float64,
     )
 
@@ -18966,9 +17028,7 @@ def test_mps_tm_multicoin_trailing_market_exposure_repair_stays_partial(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("strategy_kind", "repair_kind"),
     [
@@ -19004,6 +17064,7 @@ def test_mps_fused_dual_multicoin_exposure_repair(
         runner = MpsEmaAnchorMulticoinFusedRunner(
             run,
             data,
+            pnl_lookback_bars=1440,
             market_orders_allowed=market_orders_allowed,
             market_order_near_touch_threshold=0.002,
             market_order_slippage_pct=0.01,
@@ -19013,6 +17074,7 @@ def test_mps_fused_dual_multicoin_exposure_repair(
         runner = MpsTrailingMartingaleMulticoinFusedRunner(
             run,
             data,
+            pnl_lookback_bars=1440,
             market_orders_allowed=market_orders_allowed,
             market_order_near_touch_threshold=0.002,
             market_order_slippage_pct=0.01,
@@ -19036,9 +17098,7 @@ def test_mps_fused_dual_multicoin_exposure_repair(
         repaired[param_keys.index("wel_enforcer_threshold")] = 0.5
 
     output = runner.run(
-        np.asarray(
-            [baseline + baseline, repaired + repaired], dtype=np.float64
-        )
+        np.asarray([baseline + baseline, repaired + repaired], dtype=np.float64)
     )
     synchronize()
 
@@ -19050,9 +17110,7 @@ def test_mps_fused_dual_multicoin_exposure_repair(
     assert output["fill_count"][1].item() > output["fill_count"][0].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("repair_kind", ["position", "total"])
 def test_mps_tm_fused_one_way_multicoin_market_exposure_repair(repair_kind):
     _, baseline, run, data = _multicoin_exposure_fixture(
@@ -19064,6 +17122,7 @@ def test_mps_tm_fused_one_way_multicoin_market_exposure_repair(repair_kind):
     runner = MpsTrailingMartingaleMulticoinFusedRunner(
         run,
         data,
+        pnl_lookback_bars=1440,
         hedge_mode=False,
         market_orders_allowed=True,
         market_order_near_touch_threshold=0.002,
@@ -19071,42 +17130,28 @@ def test_mps_tm_fused_one_way_multicoin_market_exposure_repair(repair_kind):
     )
     baseline = list(baseline)
     baseline[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_cooldown_minutes"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")
     ] = 100.0
     baseline[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_initial_ema_dist"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_ema_dist")
     ] = 0.01
     repaired = list(baseline)
     if repair_kind == "position":
         repaired[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "wel_enforcer_enabled"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_enabled")
         ] = 1.0
         repaired[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "wel_enforcer_threshold"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_threshold")
         ] = 0.5
     else:
         repaired[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "twel_entry_gate_enabled"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_entry_gate_enabled")
         ] = 0.0
         repaired[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "twel_enforcer_threshold"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_threshold")
         ] = 0.5
         repaired[
-            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-                "twel_enforcer_enabled"
-            )
+            TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")
         ] = 1.0
         repaired[
             TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
@@ -19115,31 +17160,23 @@ def test_mps_tm_fused_one_way_multicoin_market_exposure_repair(repair_kind):
         ] = 1.0
 
     output = runner.run(
-        np.asarray(
-            [baseline + baseline, repaired + repaired], dtype=np.float64
-        )
+        np.asarray([baseline + baseline, repaired + repaired], dtype=np.float64)
     )
     synchronize()
 
-    baseline_size = (
-        output["psize"][0].item() + output["short_psize"][0].item()
-    )
-    repaired_size = (
-        output["psize"][1].item() + output["short_psize"][1].item()
-    )
-    assert (output["psize"][0].item() > 0.0) != (
-        output["short_psize"][0].item() > 0.0
-    )
+    baseline_size = output["psize"][0].item() + output["short_psize"][0].item()
+    repaired_size = output["psize"][1].item() + output["short_psize"][1].item()
+    assert (output["psize"][0].item() > 0.0) != (output["short_psize"][0].item() > 0.0)
     assert 0.0 < repaired_size < baseline_size
     assert output["fill_count"][1].item() > output["fill_count"][0].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_total_exposure_repair_policy(side):
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[0, 24] = 0.1
     runner, baseline = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -19150,25 +17187,17 @@ def test_mps_tm_multicoin_total_exposure_repair_policy(side):
     )
     overweight = list(baseline)
     overweight[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_entry_gate_enabled"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_entry_gate_enabled")
     ] = 0.0
     overweight[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_threshold"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_threshold")
     ] = 0.5
     overweight[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_enabled"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")
     ] = 1.0
     portfolio = list(overweight)
     portfolio[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_reduce_portfolio"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_reduce_portfolio")
     ] = 1.0
 
     output = runner.run(np.asarray([overweight, portfolio], dtype=np.float64))
@@ -19180,15 +17209,15 @@ def test_mps_tm_multicoin_total_exposure_repair_policy(side):
     assert (total_twe < 0.5).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_multicoin_loss_gate_blocks_lossy_total_exposure_repair(
     side, market_orders_allowed
 ):
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[0, 24] = 0.1
     runner_kwargs = {
         "strategy_kind": "trailing_martingale",
@@ -19216,9 +17245,7 @@ def test_mps_tm_multicoin_loss_gate_blocks_lossy_total_exposure_repair(
             "twel_enforcer_reduce_portfolio": 1.0,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     ungated = ungated_runner.run(np.asarray([candidate], dtype=np.float64))
     gated = gated_runner.run(np.asarray([candidate], dtype=np.float64))
@@ -19230,9 +17257,7 @@ def test_mps_tm_multicoin_loss_gate_blocks_lossy_total_exposure_repair(
     assert gated["balance"].item() >= ungated["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_multicoin_loss_gate_blocks_fee_only_ordinary_close(
@@ -19275,9 +17300,7 @@ def test_mps_tm_multicoin_loss_gate_blocks_fee_only_ordinary_close(
             "entry_cooldown_minutes": 100.0,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     ungated = ungated_runner.run(np.asarray([candidate], dtype=np.float64))
     gated = gated_runner.run(np.asarray([candidate], dtype=np.float64))
@@ -19289,12 +17312,12 @@ def test_mps_tm_multicoin_loss_gate_blocks_fee_only_ordinary_close(
     assert gated["balance"].item() >= ungated["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_loss_gate_preserves_profitable_close_after_repair(side):
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[0, 24] = 0.1
     count = 10
     blocked_highs = np.full((count, 2), 100.5)
@@ -19332,9 +17355,7 @@ def test_mps_tm_multicoin_loss_gate_preserves_profitable_close_after_repair(side
             "twel_enforcer_reduce_portfolio": 1.0,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     blocked = blocked_runner.run(np.asarray([candidate], dtype=np.float64))
     recovered = recovery_runner.run(np.asarray([candidate], dtype=np.float64))
@@ -19346,9 +17367,7 @@ def test_mps_tm_multicoin_loss_gate_preserves_profitable_close_after_repair(side
     assert recovered["balance"].item() > blocked["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_loss_gate_scans_past_blocked_recursive_rung(side):
     count = 10
@@ -19358,7 +17377,9 @@ def test_mps_tm_multicoin_loss_gate_scans_past_blocked_recursive_rung(side):
         highs[5:, 0] = 102.0
     else:
         lows[5:, 0] = 98.0
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     runner, candidate = _multicoin_exposure_fixture(
         "trailing_martingale",
@@ -19381,9 +17402,7 @@ def test_mps_tm_multicoin_loss_gate_scans_past_blocked_recursive_rung(side):
             "n_positions": 1.0,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
 
     output = runner.run(np.asarray([candidate], dtype=np.float64))
     synchronize()
@@ -19396,9 +17415,7 @@ def test_mps_tm_multicoin_loss_gate_scans_past_blocked_recursive_rung(side):
     assert output["balance"].item() > 1_000.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_loss_gate_does_not_reallocate_blocked_twel(side):
     count = 10
@@ -19409,11 +17426,10 @@ def test_mps_tm_multicoin_loss_gate_does_not_reallocate_blocked_twel(side):
         closes[5:, 1] = 98.0
     highs = closes * 1.01
     lows = closes * 0.99
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001)
-        for _ in range(2)
-    ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001) for _ in range(2)]
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[0, 24] = 0.6
     overrides[1, 24] = 0.4
     runner, candidate = _multicoin_exposure_fixture(
@@ -19436,13 +17452,10 @@ def test_mps_tm_multicoin_loss_gate_does_not_reallocate_blocked_twel(side):
             "twel_enforcer_reduce_portfolio": 1.0,
         }
     )
-    baseline = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    baseline = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
     repaired_values = dict(values, twel_enforcer_enabled=1.0)
     repaired = [
-        repaired_values[key]
-        for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
+        repaired_values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
     ]
 
     output = runner.run(np.asarray([baseline, repaired], dtype=np.float64))
@@ -19458,14 +17471,10 @@ def test_mps_tm_multicoin_loss_gate_does_not_reallocate_blocked_twel(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_total_exposure_repair_policy(side):
-    overrides = np.full(
-        (2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
-    )
+    overrides = np.full((2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
     overrides[0, 11] = 0.1
     count = 70
     highs = np.full((count, 2), 100.5)
@@ -19485,23 +17494,13 @@ def test_mps_ema_multicoin_total_exposure_repair_policy(side):
     )
     overweight = list(baseline)
     overweight[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("offset")] = 0.01
-    overweight[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")
-    ] = 100.0
-    overweight[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_entry_gate_enabled")
-    ] = 0.0
-    overweight[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_threshold")
-    ] = 0.5
-    overweight[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")
-    ] = 1.0
+    overweight[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = 100.0
+    overweight[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_entry_gate_enabled")] = 0.0
+    overweight[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_threshold")] = 0.5
+    overweight[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")] = 1.0
     portfolio = list(overweight)
     portfolio[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_reduce_portfolio"
-        )
+        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_reduce_portfolio")
     ] = 1.0
 
     output = runner.run(np.asarray([overweight, portfolio], dtype=np.float64))
@@ -19513,14 +17512,10 @@ def test_mps_ema_multicoin_total_exposure_repair_policy(side):
     assert (total_twe < 0.5).all()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_loss_gate_blocks_lossy_total_exposure_repair(side):
-    overrides = np.full(
-        (2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
-    )
+    overrides = np.full((2, EMA_ANCHOR_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
     overrides[0, 11] = 0.1
     count = 70
     closes = np.full((count, 2), 100.0)
@@ -19581,15 +17576,10 @@ def test_mps_ema_multicoin_loss_gate_blocks_lossy_total_exposure_repair(side):
     assert gated["balance"].item() >= ungated["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_loss_gate_blocks_fee_only_ordinary_close(side):
-    markets = [
-        ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001)
-        for _ in range(2)
-    ]
+    markets = [ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.001) for _ in range(2)]
     runner_kwargs = {
         "strategy_kind": "ema_anchor",
         "side": side,
@@ -19603,9 +17593,7 @@ def test_mps_ema_multicoin_loss_gate_blocks_fee_only_ordinary_close(side):
     gated_runner, _ = _multicoin_exposure_fixture(
         max_realized_loss_pct=0.0, **runner_kwargs
     )
-    candidate[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")
-    ] = 100.0
+    candidate[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = 100.0
 
     ungated = ungated_runner.run(np.asarray([candidate], dtype=np.float64))
     gated = gated_runner.run(np.asarray([candidate], dtype=np.float64))
@@ -19617,9 +17605,7 @@ def test_mps_ema_multicoin_loss_gate_blocks_fee_only_ordinary_close(side):
     assert gated["balance"].item() >= ungated["balance"].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_rejects_held_tails_before_twel_repair(side):
     count = 7
@@ -19650,12 +17636,8 @@ def test_mps_tm_multicoin_rejects_held_tails_before_twel_repair(side):
         )
         for last_valid in (3, count - 1)
     ]
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, runs, [market, market]
-    )
-    _, row = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=count
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, runs, [market, market])
+    _, row = _multicoin_exposure_fixture("trailing_martingale", side, count=count)
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, row))
     values.update(
         {
@@ -19666,24 +17648,18 @@ def test_mps_tm_multicoin_rejects_held_tails_before_twel_repair(side):
             "twel_enforcer_reduce_portfolio": 1.0,
         }
     )
-    repaired = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    repaired = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
     baseline = list(repaired)
     baseline[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_enabled"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")
     ] = 0.0
     with pytest.raises(ValueError, match="held-position valuation"):
         MpsTrailingMartingaleMulticoinRunner(
-            runs[1], data, side=side
+            runs[1], data, pnl_lookback_bars=1440, side=side
         ).run(np.asarray([baseline, repaired], dtype=np.float64))
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_ema_multicoin_rejects_held_tails_before_twel_repair(side):
     count = 70
@@ -19715,9 +17691,7 @@ def test_mps_ema_multicoin_rejects_held_tails_before_twel_repair(side):
         )
         for last_valid in (62, count - 1)
     ]
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, runs, [market, market]
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, runs, [market, market])
     _, row = _multicoin_exposure_fixture("ema_anchor", side, count=count)
     values = dict(zip(EMA_ANCHOR_MULTICOIN_PARAM_KEYS, row))
     values.update(
@@ -19732,18 +17706,14 @@ def test_mps_ema_multicoin_rejects_held_tails_before_twel_repair(side):
     )
     repaired = [values[key] for key in EMA_ANCHOR_MULTICOIN_PARAM_KEYS]
     baseline = list(repaired)
-    baseline[
-        EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")
-    ] = 0.0
+    baseline[EMA_ANCHOR_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")] = 0.0
     with pytest.raises(ValueError, match="held-position valuation"):
         MpsEmaAnchorMulticoinRunner(
-            runs[1], data, side=side
+            runs[1], data, pnl_lookback_bars=1440, side=side
         ).run(np.asarray([baseline, repaired], dtype=np.float64))
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_twel_repair_preserves_trailing_closes(side):
     highs = np.full((7, 2), 100.0)
@@ -19770,43 +17740,21 @@ def test_mps_tm_multicoin_twel_repair_preserves_trailing_closes(side):
         highs=highs,
         lows=lows,
     )
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_qty_pct")] = 0.2
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_threshold_base_pct")] = (
+        0.0
+    )
     row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_qty_pct")
-    ] = 0.2
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "close_threshold_base_pct"
-        )
-    ] = 0.0
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "close_retracement_base_pct"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_retracement_base_pct")
     ] = 0.001
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_cooldown_minutes")] = (
+        100.0
+    )
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_entry_gate_enabled")] = 0.0
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_threshold")] = 0.8
+    row[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_enabled")] = 1.0
     row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "entry_cooldown_minutes"
-        )
-    ] = 100.0
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_entry_gate_enabled"
-        )
-    ] = 0.0
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_threshold"
-        )
-    ] = 0.8
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_enabled"
-        )
-    ] = 1.0
-    row[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "twel_enforcer_reduce_portfolio"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("twel_enforcer_reduce_portfolio")
     ] = 1.0
 
     output = runner.run(np.asarray([row], dtype=np.float64))
@@ -19820,18 +17768,14 @@ def test_mps_tm_multicoin_twel_repair_preserves_trailing_closes(side):
     assert total_twe < 0.65
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_reducer_retains_reachable_post_repair_grid(side):
-    runner, row = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=6
-    )
+    runner, row = _multicoin_exposure_fixture("trailing_martingale", side, count=6)
     enabled = list(row)
-    enabled[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_enabled")
-    ] = 1.0
+    enabled[TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_enabled")] = (
+        1.0
+    )
     enabled[
         TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("wel_enforcer_threshold")
     ] = 0.5
@@ -19840,9 +17784,7 @@ def test_mps_tm_multicoin_reducer_retains_reachable_post_repair_grid(side):
     ] = 100.0
     reducer_only = list(enabled)
     reducer_only[
-        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index(
-            "close_retracement_base_pct"
-        )
+        TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_retracement_base_pct")
     ] = 0.001
     repaired_grid = list(enabled)
     repaired_grid[
@@ -19851,9 +17793,7 @@ def test_mps_tm_multicoin_reducer_retains_reachable_post_repair_grid(side):
     repaired_grid[
         TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("close_threshold_we_weight")
     ] = 0.0
-    output = runner.run(
-        np.asarray([reducer_only, repaired_grid], dtype=np.float64)
-    )
+    output = runner.run(np.asarray([reducer_only, repaired_grid], dtype=np.float64))
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
@@ -19864,9 +17804,7 @@ def test_mps_tm_multicoin_reducer_retains_reachable_post_repair_grid(side):
     assert volumes[1] > volumes[0]
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_grid_can_fill_without_off_tick_reducer(side):
     count = 6
@@ -19894,12 +17832,8 @@ def test_mps_tm_multicoin_grid_can_fill_without_off_tick_reducer(side):
         0,
         count - 1,
     )
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, [run, run], [market, market]
-    )
-    _, row = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=count
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, [run, run], [market, market])
+    _, row = _multicoin_exposure_fixture("trailing_martingale", side, count=count)
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, row))
     values.update(
         {
@@ -19913,13 +17847,13 @@ def test_mps_tm_multicoin_grid_can_fill_without_off_tick_reducer(side):
             "wel_enforcer_threshold": 0.5,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     output = MpsTrailingMartingaleMulticoinRunner(
-        run, data, side=side, coin_overrides=overrides
+        run, data, pnl_lookback_bars=1440, side=side, coin_overrides=overrides
     ).run(np.asarray([candidate], dtype=np.float64))
     synchronize()
 
@@ -19928,9 +17862,7 @@ def test_mps_tm_multicoin_grid_can_fill_without_off_tick_reducer(side):
     assert 1.0 < output["day_volume"].sum().item() < 2.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_small_excess_reducer_crosses_strict_target(side):
     count = 6
@@ -19957,12 +17889,8 @@ def test_mps_tm_multicoin_small_excess_reducer_crosses_strict_target(side):
         0,
         count - 1,
     )
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, [run, run], [market, market]
-    )
-    _, row = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=count
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, [run, run], [market, market])
+    _, row = _multicoin_exposure_fixture("trailing_martingale", side, count=count)
     target = 0.99999
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, row))
     values.update(
@@ -19974,13 +17902,13 @@ def test_mps_tm_multicoin_small_excess_reducer_crosses_strict_target(side):
             "wel_enforcer_threshold": target,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     output = MpsTrailingMartingaleMulticoinRunner(
-        run, data, side=side, coin_overrides=overrides
+        run, data, pnl_lookback_bars=1440, side=side, coin_overrides=overrides
     ).run(np.asarray([candidate], dtype=np.float64))
     synchronize()
 
@@ -19990,9 +17918,7 @@ def test_mps_tm_multicoin_small_excess_reducer_crosses_strict_target(side):
     assert exposure < target
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_tm_multicoin_short_post_repair_grid_uses_negative_target_tick():
     count = 6
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
@@ -20018,12 +17944,8 @@ def test_mps_tm_multicoin_short_post_repair_grid_uses_negative_target_tick():
         0,
         count - 1,
     )
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, [run, run], [market, market]
-    )
-    _, row = _multicoin_exposure_fixture(
-        "trailing_martingale", "short", count=count
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, [run, run], [market, market])
+    _, row = _multicoin_exposure_fixture("trailing_martingale", "short", count=count)
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, row))
     values.update(
         {
@@ -20035,13 +17957,13 @@ def test_mps_tm_multicoin_short_post_repair_grid_uses_negative_target_tick():
             "wel_enforcer_threshold": 0.5,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     output = MpsTrailingMartingaleMulticoinRunner(
-        run, data, side="short", coin_overrides=overrides
+        run, data, pnl_lookback_bars=1440, side="short", coin_overrides=overrides
     ).run(np.asarray([candidate], dtype=np.float64))
     synchronize()
 
@@ -20050,9 +17972,7 @@ def test_mps_tm_multicoin_short_post_repair_grid_uses_negative_target_tick():
     assert output["short_psize"].item() == pytest.approx(4.999, abs=0.002)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_post_repair_grid_volume_uses_per_fill_balance(side):
     markets = [
@@ -20076,9 +17996,7 @@ def test_mps_tm_multicoin_post_repair_grid_volume_uses_per_fill_balance(side):
             "wel_enforcer_threshold": 0.5,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
     output = runner.run(np.asarray([candidate], dtype=np.float64))
     synchronize()
 
@@ -20103,9 +18021,7 @@ def test_mps_tm_multicoin_post_repair_grid_volume_uses_per_fill_balance(side):
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_same_tick_twel_and_grid_use_separate_denominators(side):
     runner, candidate, market = _tm_multicoin_off_tick_reducer_case(
@@ -20120,9 +18036,7 @@ def test_mps_tm_multicoin_same_tick_twel_and_grid_use_separate_denominators(side
             "twel_enforcer_enabled": 1.0,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
     output = runner.run(np.asarray([candidate], dtype=np.float64))
     synchronize()
 
@@ -20131,43 +18045,29 @@ def test_mps_tm_multicoin_same_tick_twel_and_grid_use_separate_denominators(side
     grid_qty = 5.045 if side == "long" else 4.945
     reducer_qty = entry_qty - grid_qty
     close_price = 100.0 if side == "long" else 101.0
-    balance_after_entry = (
-        1_000.0 - entry_qty * entry_price * market.maker_fee
-    )
+    balance_after_entry = 1_000.0 - entry_qty * entry_price * market.maker_fee
     expected_volume = entry_qty * entry_price / balance_after_entry
     grid_pnl = grid_qty * (
-        close_price - entry_price
-        if side == "long"
-        else entry_price - close_price
+        close_price - entry_price if side == "long" else entry_price - close_price
     )
     balance_after_grid = (
-        balance_after_entry
-        + grid_pnl
-        - grid_qty * close_price * market.maker_fee
+        balance_after_entry + grid_pnl - grid_qty * close_price * market.maker_fee
     )
     expected_volume += grid_qty * close_price / balance_after_grid
     reducer_pnl = reducer_qty * (
-        close_price - entry_price
-        if side == "long"
-        else entry_price - close_price
+        close_price - entry_price if side == "long" else entry_price - close_price
     )
     balance_after_close = (
-        balance_after_grid
-        + reducer_pnl
-        - reducer_qty * close_price * market.maker_fee
+        balance_after_grid + reducer_pnl - reducer_qty * close_price * market.maker_fee
     )
     expected_volume += reducer_qty * close_price / balance_after_close
-    assert output["balance"].item() == pytest.approx(
-        balance_after_close, abs=3.0e-4
-    )
+    assert output["balance"].item() == pytest.approx(balance_after_close, abs=3.0e-4)
     assert output["day_volume"].sum().item() == pytest.approx(
         expected_volume, rel=2.0e-5
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_tm_multicoin_finalized_reducer_tie_keeps_nearer_wel(side):
     count = 6
@@ -20197,12 +18097,8 @@ def test_mps_tm_multicoin_finalized_reducer_tie_keeps_nearer_wel(side):
         0,
         count - 1,
     )
-    data = build_mps_multicoin_data(
-        hlcvs, timestamps, [run, run], markets
-    )
-    _, row = _multicoin_exposure_fixture(
-        "trailing_martingale", side, count=count
-    )
+    data = build_mps_multicoin_data(hlcvs, timestamps, [run, run], markets)
+    _, row = _multicoin_exposure_fixture("trailing_martingale", side, count=count)
     values = dict(zip(TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS, row))
     values.update(
         {
@@ -20220,19 +18116,18 @@ def test_mps_tm_multicoin_finalized_reducer_tie_keeps_nearer_wel(side):
             "twel_enforcer_enabled": 1.0,
         }
     )
-    candidate = [
-        values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
-    ]
+    candidate = [values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS]
     twel_only_values = dict(values)
     twel_only_values["wel_enforcer_enabled"] = 0.0
     twel_only = [
-        twel_only_values[key]
-        for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
+        twel_only_values[key] for key in TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
     ]
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[1, 24] = 0.0
     output = MpsTrailingMartingaleMulticoinRunner(
-        run, data, side=side, coin_overrides=overrides
+        run, data, pnl_lookback_bars=1440, side=side, coin_overrides=overrides
     ).run(np.asarray([candidate, twel_only], dtype=np.float64))
     synchronize()
 
@@ -20242,15 +18137,15 @@ def test_mps_tm_multicoin_finalized_reducer_tie_keeps_nearer_wel(side):
     assert sizes[1] == pytest.approx(0.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("market_orders_allowed", [False, True])
 def test_mps_tm_multicoin_static_override_repairs_only_selected_symbol(
     side, market_orders_allowed
 ):
-    overrides = np.full((2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32)
+    overrides = np.full(
+        (2, TRAILING_MARTINGALE_COIN_OVERRIDE_COLS), np.nan, dtype=np.float32
+    )
     overrides[0, 26] = 1.0
     overrides[0, 27] = 0.5
     baseline_runner, baseline = _multicoin_exposure_fixture(
@@ -20268,29 +18163,19 @@ def test_mps_tm_multicoin_static_override_repairs_only_selected_symbol(
         market_orders_allowed=market_orders_allowed,
         market_order_near_touch_threshold=0.002,
     )
-    baseline_output = baseline_runner.run(
-        np.asarray([baseline], dtype=np.float64)
-    )
-    override_output = override_runner.run(
-        np.asarray([overridden], dtype=np.float64)
-    )
+    baseline_output = baseline_runner.run(np.asarray([baseline], dtype=np.float64))
+    override_output = override_runner.run(np.asarray([overridden], dtype=np.float64))
     synchronize()
 
     size_key = "psize" if side == "long" else "short_psize"
-    assert (
-        0.0
-        < override_output[size_key].item()
-        < baseline_output[size_key].item()
-    )
+    assert 0.0 < override_output[size_key].item() < baseline_output[size_key].item()
     assert (
         override_output["day_volume"].sum().item()
         > baseline_output["day_volume"].sum().item()
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_single_coin_min_effective_cost_filter_blocks_only_flat_entries(
@@ -20342,13 +18227,14 @@ def test_mps_single_coin_min_effective_cost_filter_blocks_only_flat_entries(
         "hedge_mode": True,
     }
 
-    promoted = runner_cls(market, run, data, **common).run(
+    promoted = runner_cls(market, run, data, pnl_lookback_bars=1440, **common).run(
         np.array([row + row], dtype=np.float64)
     )
     filtered_runner = runner_cls(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         filter_by_min_effective_cost=True,
         **common,
     )
@@ -20362,9 +18248,7 @@ def test_mps_single_coin_min_effective_cost_filter_blocks_only_flat_entries(
     assert filtered["short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_min_effective_cost_uses_downward_projected_cost_bound():
     count = 5
     close = np.full(count, 100.0)
@@ -20402,9 +18286,7 @@ def test_mps_min_effective_cost_uses_downward_projected_cost_bound():
     ]
     row += _single_coin_exposure_fields() + _tm_twel_enforcer_fields()
     guaranteed_balance_lower = run.starting_balance * run.liquidation_threshold
-    rounded_projection = np.float32(guaranteed_balance_lower) * np.float32(
-        base_qty_pct
-    )
+    rounded_projection = np.float32(guaranteed_balance_lower) * np.float32(base_qty_pct)
 
     assert guaranteed_balance_lower * base_qty_pct < 10.0
     assert rounded_projection >= np.float32(data["max_effective_min_cost"])
@@ -20413,6 +18295,7 @@ def test_mps_min_effective_cost_uses_downward_projected_cost_bound():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         filter_by_min_effective_cost=True,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
@@ -20421,9 +18304,7 @@ def test_mps_min_effective_cost_uses_downward_projected_cost_bound():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 def test_mps_short_market_entry_respects_eligible_min_effective_cost_filter(
     strategy_kind,
@@ -20473,6 +18354,7 @@ def test_mps_short_market_entry_respects_eligible_min_effective_cost_filter(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=False,
         short_enabled=True,
         filter_by_min_effective_cost=True,
@@ -20486,9 +18368,7 @@ def test_mps_short_market_entry_respects_eligible_min_effective_cost_filter(
     assert output["short_pprice"].item() == pytest.approx(100.0)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("hedge_mode", [False, True])
 def test_mps_dual_single_coin_min_cost_rejection_blocks_other_side(
@@ -20543,6 +18423,7 @@ def test_mps_dual_single_coin_min_cost_rejection_blocks_other_side(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=hedge_mode,
@@ -20555,9 +18436,7 @@ def test_mps_dual_single_coin_min_cost_rejection_blocks_other_side(
     assert output["short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_min_effective_cost_filter_keeps_managing_an_open_position(side):
     count = 7
@@ -20607,6 +18486,7 @@ def test_mps_min_effective_cost_filter_keeps_managing_an_open_position(side):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=side == "long",
         short_enabled=side == "short",
         hedge_mode=True,
@@ -20632,18 +18512,14 @@ def test_mps_min_effective_cost_filter_keeps_managing_an_open_position(side):
         },
         run,
     )
-    assert all(
-        torch.isfinite(value).all().item()
-        for value in gap_metrics.values()
+    assert all(torch.isfinite(value).all().item() for value in gap_metrics.values())
+    assert (
+        gap_metrics["fills_gap_p99_hours"].item()
+        >= gap_metrics["fills_gap_p95_hours"].item()
     )
-    assert gap_metrics["fills_gap_p99_hours"].item() >= gap_metrics[
-        "fills_gap_p95_hours"
-    ].item()
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_mps_trailing_martingale_multicoin_sizes_raw_touch_close_before_price_finalization(
     side,
@@ -20707,10 +18583,11 @@ def test_mps_trailing_martingale_multicoin_sizes_raw_touch_close_before_price_fi
     row.extend(_UNSTUCK_DISABLED_VALUES.values())
     row.extend(_HSL_DISABLED_VALUES.values())
     row.extend([2.0, 3.0])
+    row.extend(_ADAPTIVE_DISABLED_VALUES.values())
 
-    output = MpsTrailingMartingaleMulticoinRunner(runs[0], data, side=side).run(
-        np.array([row], dtype=np.float64)
-    )
+    output = MpsTrailingMartingaleMulticoinRunner(
+        runs[0], data, pnl_lookback_bars=1440, side=side
+    ).run(np.array([row], dtype=np.float64))
     synchronize()
 
     # Exact Rust sizes against the raw 100.004 touch before finalizing the
@@ -20720,9 +18597,7 @@ def test_mps_trailing_martingale_multicoin_sizes_raw_touch_close_before_price_fi
     assert output[position_key].item() == pytest.approx(0.9, abs=1e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     ("long_enabled", "short_enabled"),
     [(True, False), (False, True), (True, True)],
@@ -20735,7 +18610,7 @@ def test_mps_trailing_martingale_shader_contract_and_directional_smoke(
 
     source = passivbot_rust.mps_trailing_martingale_source_py()
     assert "kernel void passivbot_trailing_martingale" in source
-    assert "constant int SIDE_PARAMS = 54" in source
+    assert f"constant int SIDE_PARAMS = {len(TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS)}" in source
     assert "s.allowed_wel" in source
     assert "s.entry_cap" in source
     assert "min_since_open" in source
@@ -20865,6 +18740,7 @@ def test_mps_trailing_martingale_shader_contract_and_directional_smoke(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=long_enabled,
         short_enabled=short_enabled,
         hedge_mode=True,
@@ -20881,11 +18757,10 @@ def test_mps_trailing_martingale_shader_contract_and_directional_smoke(
         assert output["fill_count_long"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("is_long", [True, False])
-def test_mps_trailing_martingale_fills_recursive_entry_ladder(is_long):
+@pytest.mark.parametrize("fill_buffer", [0.0, 0.0015])
+def test_mps_trailing_martingale_fills_recursive_entry_ladder(is_long, fill_buffer):
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
     count = 7
@@ -20893,10 +18768,10 @@ def test_mps_trailing_martingale_fills_recursive_entry_ladder(is_long):
     high = np.full(count, 100.0)
     low = np.full(count, 100.0)
     if is_long:
-        low[2] = 99.99  # Fill the initial entry generated on the prior bar.
+        low[2] = 99.8  # Fill the initial entry generated on the prior bar.
         low[3] = 90.0  # Strictly cross several pre-generated recursive rungs.
     else:
-        high[2] = 100.01
+        high[2] = 100.2
         high[3] = 110.0
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     market = ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0002)
@@ -20912,7 +18787,15 @@ def test_mps_trailing_martingale_fills_recursive_entry_ladder(is_long):
         0,
         count - 1,
     )
-    data = build_mps_data(high, low, close, timestamps, run, market)
+    data = build_mps_data(
+        high,
+        low,
+        close,
+        timestamps,
+        run,
+        market,
+        limit_order_fill_buffer_pct=fill_buffer,
+    )
     row = _tm_single_row(initial_ema_dist=0.0, gate_initial=0.0, gate_reentry=0.0)
     row[4] = 1.5  # entry double-down factor
     row[6] = 0.05  # initial entry uses 5% of the exposure budget
@@ -20923,6 +18806,7 @@ def test_mps_trailing_martingale_fills_recursive_entry_ladder(is_long):
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=is_long,
         short_enabled=not is_long,
     ).run(np.array([row + row], dtype=np.float64))
@@ -20935,9 +18819,7 @@ def test_mps_trailing_martingale_fills_recursive_entry_ladder(is_long):
     assert position > 1.25
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_fills_recursive_entry_ladders_in_hedge_mode():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -20969,6 +18851,7 @@ def test_mps_trailing_martingale_fills_recursive_entry_ladders_in_hedge_mode():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=True,
@@ -20979,9 +18862,7 @@ def test_mps_trailing_martingale_fills_recursive_entry_ladders_in_hedge_mode():
     assert output["short_psize"].item() > 1.25
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("is_long", [True, False])
 @pytest.mark.parametrize("close_threshold_we", [-0.005, 0.005])
 def test_mps_trailing_martingale_fills_sorted_recursive_close_grid(
@@ -21026,6 +18907,7 @@ def test_mps_trailing_martingale_fills_sorted_recursive_close_grid(
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=is_long,
         short_enabled=not is_long,
     ).run(np.array([row + row], dtype=np.float64))
@@ -21038,9 +18920,7 @@ def test_mps_trailing_martingale_fills_sorted_recursive_close_grid(
     assert position == pytest.approx(0.5, abs=1e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_fills_recursive_close_grids_in_hedge_mode():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21073,6 +18953,7 @@ def test_mps_trailing_martingale_fills_recursive_close_grids_in_hedge_mode():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=True,
@@ -21083,9 +18964,7 @@ def test_mps_trailing_martingale_fills_recursive_close_grids_in_hedge_mode():
     assert output["short_psize"].item() == pytest.approx(4.0, abs=1e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_preserves_tick_aligned_computed_target():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21111,16 +18990,19 @@ def test_mps_trailing_martingale_preserves_tick_aligned_computed_target():
     row = _tm_single_row(initial_ema_dist=0.0)
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
     assert output["psize"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_quantizes_non_aligned_entry_down():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21146,7 +19028,12 @@ def test_mps_trailing_martingale_quantizes_non_aligned_entry_down():
     row = _tm_single_row(gate_initial=0.0, gate_reentry=0.0)
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21156,9 +19043,7 @@ def test_mps_trailing_martingale_quantizes_non_aligned_entry_down():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_quantizes_non_aligned_short_entry_up():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21184,7 +19069,12 @@ def test_mps_trailing_martingale_quantizes_non_aligned_short_entry_up():
     row = _tm_single_row(gate_initial=0.0, gate_reentry=0.0)
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=False, short_enabled=True
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=False,
+        short_enabled=True,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21194,9 +19084,7 @@ def test_mps_trailing_martingale_quantizes_non_aligned_short_entry_up():
     assert output["short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_entry_quantizes_before_strict_fill():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21226,7 +19114,12 @@ def test_mps_trailing_entry_quantizes_before_strict_fill():
     row = _tm_single_row(gate_initial=0.0, gate_reentry=0.0)
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21236,9 +19129,7 @@ def test_mps_trailing_entry_quantizes_before_strict_fill():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_initial_gate_chooses_tick_before_float32_collapse():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21268,7 +19159,12 @@ def test_mps_trailing_initial_gate_chooses_tick_before_float32_collapse():
     row = _tm_single_row(initial_ema_dist=0.0, gate_initial=1.0)
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21279,9 +19175,7 @@ def test_mps_trailing_initial_gate_chooses_tick_before_float32_collapse():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_quantizes_selected_raw_close_to_nearest_tick():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21316,7 +19210,12 @@ def test_mps_trailing_quantizes_selected_raw_close_to_nearest_tick():
     row[20] = 0.0  # disable trailing-close touch override
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21326,9 +19225,7 @@ def test_mps_trailing_quantizes_selected_raw_close_to_nearest_tick():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_sizes_raw_touch_close_before_price_finalization():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21358,7 +19255,12 @@ def test_mps_trailing_sizes_raw_touch_close_before_price_finalization():
     row[20] = 0.0
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21369,9 +19271,7 @@ def test_mps_trailing_sizes_raw_touch_close_before_price_finalization():
     assert output["psize"].item() == pytest.approx(0.9, abs=1e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_preserves_just_above_aligned_raw_touch_minimum():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21395,6 +19295,9 @@ def test_mps_trailing_preserves_just_above_aligned_raw_touch_minimum():
     )
     data = build_mps_data(high, low, close, timestamps, run, market)
     row = _tm_single_row(gate_initial=0.0, gate_reentry=0.0)
+    # Open 250 units when entry sizing uses the raw 0.088 touch. The close
+    # below then leaves exactly the nominal 125-unit minimum in the control.
+    row[6] = 0.11
     row[15] = 0.05
     row[16] = 0.299
     row[17] = -3.0  # keep a possible second grid close above the high
@@ -21408,6 +19311,7 @@ def test_mps_trailing_preserves_just_above_aligned_raw_touch_minimum():
         market,
         run,
         rounded_only_data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
@@ -21415,7 +19319,12 @@ def test_mps_trailing_preserves_just_above_aligned_raw_touch_minimum():
     assert rounded_only["psize"].item() == 125.0
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=True, short_enabled=False
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=True,
+        short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21425,9 +19334,7 @@ def test_mps_trailing_preserves_just_above_aligned_raw_touch_minimum():
     assert output["psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_quantizes_selected_short_close_to_nearest_tick():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21455,7 +19362,12 @@ def test_mps_trailing_quantizes_selected_short_close_to_nearest_tick():
     row[20] = 0.0
 
     output = MpsTrailingMartingaleRunner(
-        market, run, data, long_enabled=False, short_enabled=True
+        market,
+        run,
+        data,
+        pnl_lookback_bars=1440,
+        long_enabled=False,
+        short_enabled=True,
     ).run(np.array([row + row], dtype=np.float64))
     synchronize()
 
@@ -21465,9 +19377,7 @@ def test_mps_trailing_quantizes_selected_short_close_to_nearest_tick():
     assert output["short_psize"].item() > 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_one_way_arbitrates_initial_entry():
     from optimization.gpu.mps_kernel import MpsTrailingMartingaleRunner
 
@@ -21496,6 +19406,7 @@ def test_mps_trailing_martingale_one_way_arbitrates_initial_entry():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=True,
         hedge_mode=False,
@@ -21506,9 +19417,7 @@ def test_mps_trailing_martingale_one_way_arbitrates_initial_entry():
     assert output["short_psize"].item() == 0.0
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_martingale_entry_cap_uses_rust_nearest_step_rounding():
     """Guard the one-quantity divergence that can split a later trailing path."""
 
@@ -21549,6 +19458,7 @@ def test_mps_trailing_martingale_entry_cap_uses_rust_nearest_step_rounding():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
@@ -21559,9 +19469,7 @@ def test_mps_trailing_martingale_entry_cap_uses_rust_nearest_step_rounding():
     assert output["psize"].item() == pytest.approx(2.404, abs=1.0e-6)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_mps_trailing_touch_close_uses_nearest_not_directional_tick():
     """Match nearest-tick finalization when an off-tick touch controls a close."""
 
@@ -21631,6 +19539,7 @@ def test_mps_trailing_touch_close_uses_nearest_not_directional_tick():
         market,
         run,
         data,
+        pnl_lookback_bars=1440,
         long_enabled=True,
         short_enabled=False,
     ).run(np.array([row + row], dtype=np.float64))
@@ -21643,12 +19552,15 @@ def test_mps_trailing_touch_close_uses_nearest_not_directional_tick():
 
 @pytest.mark.parametrize("topology", ["single", "multicoin", "fused"])
 @pytest.mark.parametrize("tail_columns", [0, 2, 4, 6])
-def test_holding_duration_scalar_does_not_alias_optional_hsl_outputs(topology, tail_columns):
+def test_holding_duration_scalar_does_not_alias_optional_hsl_outputs(
+    topology, tail_columns
+):
     from optimization.gpu.mps_kernel import (
         _decode_outputs,
         _decode_directional_outputs,
         _decode_multicoin_fused_outputs,
     )
+
     base_columns = 63 if topology == "multicoin" else 68
     daily_columns = 8 if topology == "single" else 9
     daily = torch.zeros((1, 1, daily_columns), dtype=torch.float32)
@@ -21701,10 +19613,12 @@ def test_streamed_gap_moment_matches_distinct_fill_timestamps(
             if strategy_kind == "ema_anchor"
             else MpsTrailingMartingaleMulticoinFusedRunner
         )
-        runner, matrix = cls(run, data), np.asarray([row + row])
+        runner, matrix = cls(run, data, pnl_lookback_bars=0), np.asarray([row + row])
     else:
         market = ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0)
-        timestamps = run.first_ts_ms + np.arange(count, dtype=np.int64) * run.interval_ms
+        timestamps = (
+            run.first_ts_ms + np.arange(count, dtype=np.int64) * run.interval_ms
+        )
         single_data = build_mps_data(
             np.full(count, 101.0),
             np.full(count, 99.0),
@@ -21719,9 +19633,19 @@ def test_streamed_gap_moment_matches_distinct_fill_timestamps(
             else TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS
         )
         single = _single_coin_param_row(values, keys)
-        cls = MpsEmaAnchorRunner if strategy_kind == "ema_anchor" else MpsTrailingMartingaleRunner
+        cls = (
+            MpsEmaAnchorRunner
+            if strategy_kind == "ema_anchor"
+            else MpsTrailingMartingaleRunner
+        )
         runner, matrix = cls(
-            market, run, single_data, long_enabled=True, short_enabled=True
+            market,
+            run,
+            single_data,
+            pnl_lookback_bars=0,
+            hsl_enabled=False,
+            long_enabled=True,
+            short_enabled=True,
         ), np.asarray([single + single])
     fill_timestamps = set()
     for end in range(3, count):
@@ -21746,15 +19670,15 @@ def test_streamed_gap_moment_matches_distinct_fill_timestamps(
     ]
     all_gaps = np.diff(boundaries) / 3_600_000.0
     expected = np.square(all_gaps).sum() / all_gaps.sum()
-    metrics = _fill_gap_metrics({key: value.cpu() for key, value in output.items()}, run)
+    metrics = _fill_gap_metrics(
+        {key: value.cpu() for key, value in output.items()}, run
+    )
     assert metrics["fills_gap_time_weighted_mean_hours"].item() == pytest.approx(
         expected, rel=2e-6
     )
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize(
     "source_name",
     [
@@ -21797,9 +19721,7 @@ kernel void unstuck_band_probe(constant float* inputs, device float* output,
     np.testing.assert_allclose(output.cpu().numpy(), expected, rtol=2e-6, atol=2e-5)
 
 
-@pytest.mark.skipif(
-    not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable"
-)
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 @pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("interval_minutes", [1, 5])
@@ -21865,6 +19787,8 @@ def test_mps_independent_unstuck_horizons_change_reducer_only(
             market,
             run,
             data,
+            pnl_lookback_bars=0,
+            hsl_enabled=False,
             long_enabled=side == "long",
             short_enabled=side == "short",
         )
@@ -21902,7 +19826,10 @@ def test_mps_independent_unstuck_horizons_change_reducer_only(
             else TRAILING_MARTINGALE_COIN_OVERRIDE_COLS
         )
         overrides = np.full((2, cols), np.nan)
-        overrides[:, -2:] = 0.5  # Both coin pins override the slow global candidate.
+        ema_start = (EMA_ANCHOR_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN
+                     if strategy_kind == "ema_anchor"
+                     else TRAILING_MARTINGALE_COIN_OVERRIDE_UNSTUCK_EMA_START_COLUMN)
+        overrides[:, ema_start:ema_start + 2] = 0.5  # Pin both unstuck spans.
         pinned_runner, _ = _multicoin_exposure_fixture(
             strategy_kind,
             side,
@@ -21959,27 +19886,47 @@ def _tm_directional_temporal_fixture(features=False, hedge_mode=False):
     close = 100.0 * (1 + 0.15 * np.sin(steps / 23.0))
     timestamps = 1_700_000_000_000 + steps.astype(np.int64) * 60_000
     market = ProxyMarket(0.001, 0.01, 0.001, 0.0, 1.0, 0.0002)
-    run = ProxyRun(1000.0, 1, 11, int(timestamps[0]), int(timestamps[0]),
-                   int(timestamps[0]), 60_000, 0.05, 0, count - 1)
+    run = ProxyRun(
+        1000.0,
+        1,
+        11,
+        int(timestamps[0]),
+        int(timestamps[0]),
+        int(timestamps[0]),
+        60_000,
+        0.05,
+        0,
+        count - 1,
+    )
     data = build_mps_data(close * 1.02, close * 0.98, close, timestamps, run, market)
     row = _tm_single_row(initial_ema_dist=0.0, unstuck_enabled=features)
     for key, value in {
-        "hsl_enabled": float(features), "hsl_red_threshold": 0.02,
-        "hsl_ema_span_minutes": 1.0, "hsl_cooldown_minutes_after_red": 3.0,
-        "hsl_no_restart_drawdown_threshold": 1.0, "hsl_restart_policy": 1.0,
-        "hsl_tier_ratio_yellow": 0.5, "hsl_tier_ratio_orange": 0.75,
-        "hsl_signal_mode": 2.0, "hsl_slot_count": 1.0,
+        "hsl_enabled": float(features),
+        "hsl_red_threshold": 0.02,
+        "hsl_ema_span_minutes": 1.0,
+        "hsl_cooldown_minutes_after_red": 3.0,
+        "hsl_signal_mode": 2.0,
+        "hsl_slot_count": 1.0,
         "entry_threshold_volatility_1m_weight": 0.1 if features else 0.0,
-        "unstuck_ema_span_0": 7.25, "unstuck_ema_span_1": 133.5,
+        "unstuck_ema_span_0": 7.25,
+        "unstuck_ema_span_1": 133.5,
     }.items():
         row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(key)] = value
-    kwargs = dict(long_enabled=True, short_enabled=True, hedge_mode=hedge_mode,
-                  hsl_enabled=features, pnl_lookback_bars=100 if features else 0,
-                  hsl_ema_tail_enabled=features, hsl_raw_drawdown_enabled=features,
-                  hsl_raw_tail_enabled=features, recovery_distribution_enabled=features,
-                  entry_interval_enabled=features, btc_risk_enabled=features,
-                  equity_balance_diff_enabled=features,
-                  btc_prices=30_000.0 + steps if features else None)
+    kwargs = dict(
+        long_enabled=True,
+        short_enabled=True,
+        hedge_mode=hedge_mode,
+        hsl_enabled=features,
+        pnl_lookback_bars=1440 if features else 0,
+        hsl_ema_tail_enabled=features,
+        hsl_raw_drawdown_enabled=features,
+        hsl_raw_tail_enabled=features,
+        recovery_distribution_enabled=features,
+        entry_interval_enabled=features,
+        btc_risk_enabled=features,
+        equity_balance_diff_enabled=features,
+        btc_prices=30_000.0 + steps if features else None,
+    )
     return market, run, data, row, kwargs
 
 
@@ -21987,52 +19934,78 @@ def _tm_directional_temporal_fixture(features=False, hedge_mode=False):
 @pytest.mark.parametrize("features", [False, True])
 @pytest.mark.parametrize("hedge_mode", [False, True])
 @pytest.mark.parametrize("recent", [False, True])
-def test_tm_directional_temporal_replay_preserves_every_output(features, hedge_mode, recent):
-    market, run, data, row, kwargs = _tm_directional_temporal_fixture(features, hedge_mode)
+def test_tm_directional_temporal_replay_preserves_every_output(
+    features, hedge_mode, recent
+):
+    market, run, data, row, kwargs = _tm_directional_temporal_fixture(
+        features, hedge_mode
+    )
     matrix = np.asarray([row + row] * 3, dtype=np.float64)
     history = dict(history_start_step=73, trade_start_step=113) if recent else {}
     original = MpsTrailingMartingaleRunner(market, run, data, **kwargs)
-    expected = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                for k, v in original.run(matrix, **history).items()}
+    expected = {
+        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+        for k, v in original.run(matrix, **history).items()
+    }
     chunked = MpsTrailingMartingaleRunner(
-        market, run, data, max_dispatch_candidate_bars=3 * 2 * 47, **kwargs
+        market,
+        run,
+        data,
+        max_dispatch_candidate_bars=3 * 2 * 47,
+        **kwargs,
     )
     for _ in range(2):
         actual = chunked.run(matrix, profile=True, **history)
         assert actual.keys() == expected.keys()
         for key, value in actual.items():
             if isinstance(value, torch.Tensor):
-                torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+                torch.testing.assert_close(
+                    value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+                )
             else:
                 assert value == expected[key]
         assert chunked.last_profile["temporal_chunk_bars"] == 47
         begin = 74 if recent else 1
         assert chunked.last_profile["kernel_candidate_steps"] == 3 * (1512 - begin)
-        assert chunked.last_profile["dispatch_count"] == int(np.ceil((1512 - begin) / 47))
+        assert chunked.last_profile["dispatch_count"] == int(
+            np.ceil((1512 - begin) / 47)
+        )
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
 def test_tm_directional_temporal_interruption_starts_next_run_fresh():
     market, run, data, row, kwargs = _tm_directional_temporal_fixture(True)
     matrix = np.asarray([row + row], dtype=np.float64)
-    expected = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                for k, v in MpsTrailingMartingaleRunner(market, run, data, **kwargs).run(matrix).items()}
+    expected = {
+        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+        for k, v in MpsTrailingMartingaleRunner(market, run, data, **kwargs)
+        .run(matrix)
+        .items()
+    }
     calls = 0
+
     def interrupt():
         nonlocal calls
         calls += 1
         if calls == 3:
             raise InterruptedError("test interruption")
+
     runner = MpsTrailingMartingaleRunner(
-        market, run, data, max_dispatch_candidate_bars=2 * 47,
-        interrupt_check=interrupt, **kwargs
+        market,
+        run,
+        data,
+        max_dispatch_candidate_bars=2 * 47,
+        interrupt_check=interrupt,
+        **kwargs,
     )
     with pytest.raises(InterruptedError):
         runner.run(matrix)
     runner.interrupt_check = lambda: None
     for key, value in runner.run(matrix).items():
         if isinstance(value, torch.Tensor):
-            torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(
+                value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+            )
         else:
             assert value == expected[key]
 
@@ -22042,16 +20015,28 @@ def test_tm_directional_temporal_state_abi_tracks_dispatch_features():
     market, run, data, row, kwargs = _tm_directional_temporal_fixture(True)
     plain = MpsTrailingMartingaleRunner(market, run, data, **kwargs)
     chunked = MpsTrailingMartingaleRunner(
-        market, run, data, max_dispatch_candidate_bars=2 * 113, **kwargs
+        market,
+        run,
+        data,
+        max_dispatch_candidate_bars=2 * 113,
+        **kwargs,
     )
     for weight in (0.0, 0.1, 0.0):
-        row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_threshold_volatility_1m_weight")] = weight
+        row[
+            TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index(
+                "entry_threshold_volatility_1m_weight"
+            )
+        ] = weight
         matrix = np.asarray([row + row], dtype=np.float64)
-        expected = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                    for k, v in plain.run(matrix).items()}
+        expected = {
+            k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+            for k, v in plain.run(matrix).items()
+        }
         for key, value in chunked.run(matrix).items():
             if isinstance(value, torch.Tensor):
-                torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+                torch.testing.assert_close(
+                    value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+                )
             else:
                 assert value == expected[key]
     assert len(chunked._replay_state_sizes) == 2
@@ -22069,17 +20054,36 @@ def test_tm_directional_temporal_preserves_invalid_valuation(chunk_bars):
     high[6] = low[6] = close[6] = 80.0
     timestamps = 1_700_000_000_000 + np.arange(count, dtype=np.int64) * 60_000
     market = ProxyMarket(0.001, 0.01, 0.001, 5.0, 1.0, 0.0)
-    run = ProxyRun(1000.0, 1, 1, int(timestamps[0]), int(timestamps[0]),
-                   int(timestamps[0]), 60_000, 0.05, 0, 6)
+    run = ProxyRun(
+        1000.0,
+        1,
+        1,
+        int(timestamps[0]),
+        int(timestamps[0]),
+        int(timestamps[0]),
+        60_000,
+        0.05,
+        0,
+        6,
+    )
     data = build_mps_data(high, low, close, timestamps, run, market)
     row = _tm_single_row(initial_ema_dist=0.01)
-    row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_cooldown_minutes")] = 100.0
+    row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_cooldown_minutes")] = (
+        100.0
+    )
     short = list(row)
-    short[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_initial_qty_pct")] = 0.0
+    short[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_initial_qty_pct")] = (
+        0.0
+    )
     matrix = np.asarray([row + short], dtype=np.float64)
     for cap in (None, 2 * chunk_bars):
         runner = MpsTrailingMartingaleRunner(
-            market, run, data, long_enabled=True, short_enabled=True,
+            market,
+            run,
+            data,
+            hsl_enabled=False,
+            long_enabled=True,
+            short_enabled=True,
             max_dispatch_candidate_bars=cap,
         )
         for _ in range(2):
@@ -22096,17 +20100,56 @@ def test_tm_directional_temporal_preserves_early_liquidation_outputs():
     row[TRAILING_MARTINGALE_SINGLE_COIN_PARAM_KEYS.index("entry_initial_qty_pct")] = 1.0
     matrix = np.asarray([row + row], dtype=np.float64)
     original = MpsTrailingMartingaleRunner(market, run, data, **kwargs)
-    expected = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                for k, v in original.run(matrix).items()}
+    expected = {
+        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+        for k, v in original.run(matrix).items()
+    }
     assert not expected["alive"].item()
     chunked = MpsTrailingMartingaleRunner(
-        market, run, data, max_dispatch_candidate_bars=2 * 47, **kwargs
+        market,
+        run,
+        data,
+        max_dispatch_candidate_bars=2 * 47,
+        **kwargs,
     )
     for key, value in chunked.run(matrix).items():
         if isinstance(value, torch.Tensor):
-            torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(
+                value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+            )
         else:
             assert value == expected[key]
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize("side", ["long", "short", "both"])
+@pytest.mark.parametrize("features", [False, True])
+def test_tm_production_tuning_chunks_preserve_all_single_coin_outputs(side, features):
+    market, run, data, row, kwargs = _tm_directional_temporal_fixture(features)
+    kwargs.update(long_enabled=side != "short", short_enabled=side != "long")
+    matrix = np.asarray([row + row] * 3, dtype=np.float64)
+    expected = {
+        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+        for k, v in MpsTrailingMartingaleRunner(market, run, data, **kwargs)
+        .run(matrix)
+        .items()
+    }
+    runner = MpsTrailingMartingaleRunner(market, run, data, **kwargs)
+    runner.tuning_chunk_bars = 47
+    market_storage = runner.bars.data_ptr()
+    for _ in range(2):
+        runner.release_replay_scratch()
+        assert runner.bars.data_ptr() == market_storage
+        actual = runner.run(matrix, profile=True)
+        for key, value in actual.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(
+                    value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+                )
+            else:
+                assert value == expected[key]
+        assert runner.last_profile["temporal_chunk_bars"] == 47
+        assert runner.last_profile["dispatch_count"] == 33
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
@@ -22114,45 +20157,252 @@ def test_tm_directional_chunking_uses_actual_batch_work_and_switches_safely():
     market, run, data, row, kwargs = _tm_directional_temporal_fixture(True)
     original = MpsTrailingMartingaleRunner(market, run, data, **kwargs)
     runner = MpsTrailingMartingaleRunner(
-        market, run, data, max_dispatch_candidate_bars=2 * 1513, **kwargs
+        market,
+        run,
+        data,
+        max_dispatch_candidate_bars=2 * 1513,
+        **kwargs,
     )
     for count in (1, 3, 1):
         matrix = np.asarray([row + row] * count, dtype=np.float64)
-        expected = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                    for k, v in original.run(matrix).items()}
+        expected = {
+            k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+            for k, v in original.run(matrix).items()
+        }
         for key, value in runner.run(matrix, profile=True).items():
             if isinstance(value, torch.Tensor):
-                torch.testing.assert_close(value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True)
+                torch.testing.assert_close(
+                    value.cpu(), expected[key], rtol=0, atol=0, equal_nan=True
+                )
             else:
                 assert value == expected[key]
         assert runner.last_profile["dispatch_count"] == (1 if count == 1 else 3)
         assert ("temporal_chunk_bars" in runner.last_profile) == (count == 3)
 
 
-
-
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
-@pytest.mark.parametrize('side', ['long', 'short'])
+@pytest.mark.parametrize("side", ["long", "short"])
 def test_tm_multicoin_scenario_batch_matches_separate_candidate_batches(side):
     count = 503
     steps = np.arange(count)
-    closes = np.column_stack([100 * (1 + .1 * np.sin(steps / 17 + c)) for c in range(2)])
-    runner, row = _multicoin_exposure_fixture('trailing_martingale', side, count=count, closes=closes)
-    position_column = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index('n_positions')
-    qty_column = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index('entry_initial_qty_pct')
+    closes = np.column_stack(
+        [100 * (1 + 0.1 * np.sin(steps / 17 + c)) for c in range(2)]
+    )
+    runner, row = _multicoin_exposure_fixture(
+        "trailing_martingale", side, count=count, closes=closes
+    )
+    position_column = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("n_positions")
+    qty_column = TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS.index("entry_initial_qty_pct")
     matrices, separate = [], []
     for slots in (1, 2):
         matrix = np.asarray([row] * 3, dtype=np.float64)
         matrix[:, position_column] = slots
-        matrix[:, qty_column] = [.1, .5, 1.]
+        matrix[:, qty_column] = [0.1, 0.5, 1.0]
         matrices.append(matrix)
-        separate.append({k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                         for k, v in runner.run(matrix).items()})
+        separate.append(
+            {
+                k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+                for k, v in runner.run(matrix).items()
+            }
+        )
     together = runner.run(np.concatenate(matrices))
-    assert together['fill_count'].sum().item() > 0
+    assert together["fill_count"].sum().item() > 0
     for key, value in together.items():
         if isinstance(value, torch.Tensor):
             expected = torch.cat([output[key] for output in separate])
-            torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(
+                value.cpu(), expected, rtol=0, atol=0, equal_nan=True
+            )
         else:
             assert value == separate[0][key] == separate[1][key]
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+def test_mps_unstuck_rolling_pnl_window_expires_and_resets_fill_events():
+    import passivbot_rust
+
+    dense_round_trip_count = 2_096
+    fills_per_round_trip = 4
+    # Ordinary unstuck keeps one coalesced event per candle.
+    dense_capacity = dense_round_trip_count
+    probe_kernel = (
+        r"""
+kernel void passivbot_rolling_pnl_probe(
+    device float2* values,
+    device int2* indices,
+    device float* output,
+    uint b [[thread_position_in_grid]]
+) {
+    if (b > 0) return;
+    RollingPnlWindow window = init_rolling_pnl_window();
+    const int capacity = 4;
+    const int lookback_bars = 2;
+    record_rolling_pnl(
+        window, values, indices, 0, capacity, 0, lookback_bars, true, 50.0f
+    );
+    RollingPnlSignal first = effective_rolling_pnl(
+        window, values, indices, 0, capacity, 0, lookback_bars
+    );
+    record_rolling_pnl(
+        window, values, indices, 0, capacity, 1, lookback_bars, true, -80.0f
+    );
+    RollingPnlSignal second = effective_rolling_pnl(
+        window, values, indices, 0, capacity, 1, lookback_bars
+    );
+    RollingPnlSignal expired = effective_rolling_pnl(
+        window, values, indices, 0, capacity, 3, lookback_bars
+    );
+    record_rolling_pnl(
+        window, values, indices, 0, capacity, 4, lookback_bars, true, 55.0f
+    );
+    RollingPnlSignal final_signal = effective_rolling_pnl(
+        window, values, indices, 0, capacity, 4, lookback_bars
+    );
+    reset_rolling_pnl_window(window);
+    RollingPnlSignal reset_signal = effective_rolling_pnl(
+        window, values, indices, 0, capacity, 4, lookback_bars
+    );
+
+    output[0] = first.peak;
+    output[1] = first.current;
+    output[2] = second.peak;
+    output[3] = second.current;
+    output[4] = expired.peak;
+    output[5] = expired.current;
+    output[6] = final_signal.peak;
+    output[7] = final_signal.current;
+    output[8] = reset_signal.peak;
+    output[9] = reset_signal.current;
+
+    RollingPnlWindow inactive = init_rolling_pnl_window();
+    record_rolling_pnl(
+        inactive, values, indices, 4, 2, 0, 10, false, 1.0f
+    );
+    record_rolling_pnl(
+        inactive, values, indices, 4, 2, 1, 10, false, 1.0f
+    );
+    record_rolling_pnl(
+        inactive, values, indices, 4, 2, 2, 10, false, 1.0f
+    );
+    output[10] = inactive.overflowed ? 1.0f : 0.0f;
+
+    RollingPnlWindow overflow = init_rolling_pnl_window();
+    record_rolling_pnl(
+        overflow, values, indices, 4, 2, 0, 10, true, 1.0f
+    );
+    record_rolling_pnl(
+        overflow, values, indices, 4, 2, 1, 10, true, 1.0f
+    );
+    record_rolling_pnl(
+        overflow, values, indices, 4, 2, 2, 10, true, 1.0f
+    );
+    output[11] = overflow.overflowed ? 1.0f : 0.0f;
+
+    RollingPnlWindow dense = init_rolling_pnl_window();
+    for (int k = 0; k < __DENSE_ROUND_TRIP_COUNT__; ++k) {
+        for (int fill = 0; fill < __FILLS_PER_ROUND_TRIP__; ++fill) {
+            record_rolling_pnl(
+                dense, values, indices, 6, __DENSE_CAPACITY__, k,
+                __DENSE_ROUND_TRIP_COUNT__ + 1, true, -0.1f
+            );
+        }
+        record_rolling_pnl(
+            dense, values, indices, 6, __DENSE_CAPACITY__, k,
+            __DENSE_ROUND_TRIP_COUNT__ + 1, true, 1.0f
+        );
+    }
+    output[12] = dense.overflowed ? 1.0f : 0.0f;
+    output[13] = float(dense.event_count);
+
+    RollingPnlWindow coalesced = init_rolling_pnl_window();
+    record_rolling_pnl(
+        coalesced, values, indices, 6, __DENSE_CAPACITY__, 0, 2, true, 50.0f
+    );
+    record_rolling_pnl(
+        coalesced, values, indices, 6, __DENSE_CAPACITY__, 0, 2, true, -80.0f
+    );
+    RollingPnlSignal coalesced_signal = effective_rolling_pnl(
+        coalesced, values, indices, 6, __DENSE_CAPACITY__, 0, 2
+    );
+    output[14] = coalesced_signal.peak;
+    output[15] = coalesced_signal.current;
+    output[16] = float(coalesced.event_count);
+}
+""".replace("__DENSE_ROUND_TRIP_COUNT__", str(dense_round_trip_count))
+        .replace("__FILLS_PER_ROUND_TRIP__", str(fills_per_round_trip))
+        .replace("__DENSE_CAPACITY__", str(dense_capacity))
+    )
+    buffer_size = 6 + dense_capacity
+    values = torch.empty((buffer_size, 2), dtype=torch.float32, device=gpu_device())
+    indices = torch.empty((buffer_size, 2), dtype=torch.int32, device=gpu_device())
+    output = torch.zeros(17, dtype=torch.float32, device=gpu_device())
+    library = compile_shader(
+        passivbot_rust.mps_ema_anchor_multicoin_source_py() + probe_kernel
+    )
+
+    library.passivbot_rolling_pnl_probe(values, indices, output, threads=(1, 1, 1))
+    synchronize()
+
+    assert output.cpu().tolist() == [
+        50.0,
+        50.0,
+        50.0,
+        -30.0,
+        0.0,
+        -80.0,
+        55.0,
+        55.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        float(dense_round_trip_count),
+        50.0,
+        -30.0,
+        1.0,
+    ]
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Apple MPS and NVIDIA CUDA unavailable")
+@pytest.mark.parametrize("strategy_kind", ["ema_anchor", "trailing_martingale"])
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_multicoin_excess_allowance_changes_coin_hsl_signal(strategy_kind, side):
+    closes = np.tile(np.asarray([100.0, 120.0]), (64, 1))
+    closes[20:, 0] *= 0.7 if side == "long" else 1.3
+    columns = (
+        EMA_ANCHOR_COIN_OVERRIDE_COLS
+        if strategy_kind == "ema_anchor"
+        else TRAILING_MARTINGALE_COIN_OVERRIDE_COLS
+    )
+    overrides = np.full((2, columns), np.nan)
+    wel_column, allowance_column = (
+        (11, 12) if strategy_kind == "ema_anchor" else (24, 25)
+    )
+    overrides[:, wel_column] = 0.2
+    overrides[:, allowance_column] = 1.0
+    runner, row = _multicoin_exposure_fixture(
+        strategy_kind, side, overrides, closes=closes, collect_coin_fill_counts=True
+    )
+    keys = (
+        EMA_ANCHOR_MULTICOIN_PARAM_KEYS
+        if strategy_kind == "ema_anchor"
+        else TRAILING_MARTINGALE_MULTICOIN_PARAM_KEYS
+    )
+    for key, value in {
+        "hsl_enabled": 1.0,
+        "hsl_red_threshold": 0.2,
+        "hsl_ema_span_minutes": 1.0,
+        "hsl_cooldown_minutes_after_red": 0.0,
+        "hsl_restart_policy": 2.0,
+        "hsl_signal_mode": 2.0,
+        "we_excess_allowance_pct": 1.0,
+    }.items():
+        row[keys.index(key)] = value
+    scaled = list(row)
+    scaled[keys.index("hsl_scale_budget_with_excess_allowance")] = 1.0
+    out = runner.run(np.asarray([row, scaled], dtype=np.float64))
+    synchronize()
+    assert out[f"hsl_triggers_{side}"][0].item() > 0
+    assert out[f"hsl_triggers_{side}"][1].item() == 0
+    assert (out["coin_fill_counts"] >= 1).all().item()

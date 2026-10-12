@@ -39,6 +39,18 @@
 
 ## Non-Obvious Details
 
+Ordinary native higher-timeframe reads reuse verified persisted rows and fetch only missing spans,
+with one source bucket of overlap on each side. Overlapping requests are coalesced; the overlap
+retains within-response evidence for KuCoin's no-tick gaps. Pages persisted before a deadline or
+cancellation remain useful to the next acquisition, including after manager restart.
+Pagination stops when a nonempty response tail repeats or regresses. Best-effort reads
+retain all successful pages, including corrections in the stalled page. Accumulated output
+is sorted and unique by timestamp, with later pages winning corrections. Forced strict
+reads report the incomplete acquisition through the
+existing terminal-page failure contract. A moving request cursor alone is not progress. Forced
+`max_age_ms=0` reads still refetch the full requested range. Missing buckets remain unavailable;
+this acquisition optimization does not relax full-coverage EMA readiness or fabricate candles.
+
 1. Runtime synthetic candles are not always persisted to disk shards.
 2. Real candles replacing synthetic candles must trigger EMA cache invalidation.
 3. Gap semantics differ within-page vs between-page boundaries.
@@ -148,8 +160,12 @@
    processing time is not post-boundary transport provenance. The current in-progress minute is
    rejected, an existing canonical basis is required, and WebSocket silence and reconnect gaps remain
    missing. A later changed row for the same timestamp overwrites the candle and invalidates affected
-   EMA state. WebSocket shard persistence must be read-verified before the row is exposed to cache
-   and EMA readers, including where an immutable legacy shard shadows primary storage. REST remains
+   EMA state. WebSocket canonical reads, merge-before-write reads, and persistence verification
+   propagate shard read failures, including failures masked by another legacy or primary source.
+   Missing shards are distinct from unreadable history. Strict canonical reads refresh source
+   discovery; strict merges read the actual write target under the fetch lock rather than trusting
+   a cached directory listing. WebSocket shard persistence must be read-verified before the row is
+   exposed to cache and EMA readers, including where an immutable legacy shard shadows primary storage. REST remains
    the complete fallback for startup basis, historical and internal gaps,
    prolonged silence, reconnect recovery, and a configured periodic integrity audit. Audits force a
    bounded REST overlap even while the persisted WebSocket tail is current; a successful REST
@@ -218,9 +234,18 @@
     additionally requires exact aligned coverage for 1m EMA windows because its recent endpoint
     silently tail-anchors responses. HSL restart and live trailing restart reconstruction may fetch
     1m candles first, then cover only the older leading prefix with 5m, 15m, and 1h candles. The
-    finest available source wins, source counts remain visible, and only coarse buckets ending at
-    or before the first available 1m candle are eligible, so later price action cannot leak backward
-    across the precision boundary.
+    finest available source wins and source counts remain visible. Normally only coarse buckets
+    ending at or before the first available 1m candle are eligible. One coarse bucket may straddle
+    that boundary when every overlapping exact 1m minute is already present; only synthetic rows
+    before the precision boundary are eligible, while exact 1m rows retain precedence. The missing
+    prefix is expanded separately, ending at the first exact candle's open clamped to the normalized
+    coarse range. Full-bucket and boundary expansion share finite-value checks, reversed-extrema
+    normalization and endpoint clamping. Coarse extrema outside
+    the complete overlap and already-selected finer rows' ranges must belong to the missing prefix
+    and are preserved in its remaining synthetic rows. Extrema already present in finer rows are
+    not moved backward; whether they also occurred in the missing prefix is unknown. Coarse volume
+    retains its proportional approximation. This bridges retention-boundary seams without allowing
+    coarse data to conceal an internal exact-era gap.
 
     Trailing still requires a nonempty exact 1m suffix and its existing dense post-fill coverage
     and bounded open-tail checks. The first post-fill minute remains the exact reset boundary;
@@ -374,7 +399,7 @@ Cache paths use `to_standard_exchange_name()` rather than raw CCXT identifiers s
 - `src/tools/verify_hlcvs_data.py`
 - `exchange_integrations.md`
 
-## Source-resolution reads for revised HSL
+## Source-resolution reads for HSL
 
 `get_candles(standardize=False)` retains normal source acquisition and caching but
 returns sparse source rows without the 1m gap-standardization or outside-range
@@ -382,7 +407,7 @@ price seed. The 1m returned array is detached from the mutable cache. Native coa
 cache reads remain native even with no exchange object; they must not relabel 1m
 rows as 5m/15m/1h. Existing callers retain standardization by default.
 
-The staged `live.hsl_revised_candles.CandleSourceReader.acquire` reader requests supported
+The staged `live.hsl_candles.CandleSourceReader.acquire` reader requests supported
 1m/5m/15m/1h sources over the full estimator window. A real 1m close at the inclusive
 left edge belongs to the window although its source bucket opened one minute earlier.
 Rust rejects earlier closes and coarse buckets straddling the boundary, selects the
@@ -410,9 +435,9 @@ tracked within the fixed capacity until completion. Late exceptions are consumed
 unexpected late programming failures are raised on the next acquisition instead of
 silently hidden. No source projection is written into factual caches. The caller owns
 background scheduling and coherent current-state capture; this staged reader alone
-does not activate revised trading.
+does not activate hsl trading.
 
-Revised-HSL source batches may retain a native copy of their immutable scalar candle
+HSL source batches may retain a native copy of their immutable scalar candle
 rows for repeated evaluations. Replacing a source batch replaces that native copy.
 The copy contains no projected window or trading permission: every projection
 reapplies its exact lookback bounds and current exchange/UTC observation offset,

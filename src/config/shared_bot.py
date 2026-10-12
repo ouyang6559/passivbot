@@ -1,13 +1,17 @@
 from copy import deepcopy
 from typing import Optional
 
-
 BOT_POSITION_SIDES = ("long", "short")
-BOT_SHARED_GROUPS = ("risk", "forager", "hsl", "unstuck")
+BOT_SHARED_GROUPS = ("entry_cooldown", "risk", "forager", "hsl", "unstuck")
 
 BOT_GROUP_FIELD_MAP = {
+    "entry_cooldown": {
+        "base_duration_minutes": "risk_entry_cooldown_minutes",
+        "min_duration_minutes": "entry_cooldown_min_duration_minutes",
+        "max_duration_minutes": "entry_cooldown_max_duration_minutes",
+        "weights_minutes": "entry_cooldown_weights_minutes",
+    },
     "risk": {
-        "entry_cooldown_minutes": "risk_entry_cooldown_minutes",
         "n_positions": "n_positions",
         "total_wallet_exposure_limit": "total_wallet_exposure_limit",
         "total_exposure_entry_gate_enabled": "risk_twel_entry_gate_enabled",
@@ -15,12 +19,12 @@ BOT_GROUP_FIELD_MAP = {
         "total_exposure_enforcer_policy": "risk_twel_enforcer_policy",
         "total_exposure_enforcer_threshold": "risk_twel_enforcer_threshold",
         "we_excess_allowance_pct": "risk_we_excess_allowance_pct",
-        "we_excess_allowance_mode": "risk_we_excess_allowance_mode",
         "position_exposure_enforcer_enabled": "risk_wel_enforcer_enabled",
         "position_exposure_enforcer_threshold": "risk_wel_enforcer_threshold",
     },
     "forager": {
         "score_weights": "forager_score_weights",
+        "unilateralness_ema_span_1m": "unilateralness_ema_span_1m",
         "volatility_ema_span_1m": "forager_volatility_ema_span_1m",
         "volume_drop_pct": "forager_volume_drop_pct",
         "volume_ema_span_1m": "forager_volume_ema_span_1m",
@@ -29,12 +33,10 @@ BOT_GROUP_FIELD_MAP = {
         "cooldown_minutes_after_red": "hsl_cooldown_minutes_after_red",
         "ema_span_minutes": "hsl_ema_span_minutes",
         "enabled": "hsl_enabled",
-        "no_restart_drawdown_threshold": "hsl_no_restart_drawdown_threshold",
-        "orange_tier_mode": "hsl_orange_tier_mode",
+        "scale_budget_with_excess_allowance": "hsl_scale_budget_with_excess_allowance",
         "panic_close_order_type": "hsl_panic_close_order_type",
         "red_threshold": "hsl_red_threshold",
         "restart_after_red_policy": "hsl_restart_after_red_policy",
-        "tier_ratios": "hsl_tier_ratios",
     },
     "unstuck": {
         "close_pct": "unstuck_close_pct",
@@ -114,7 +116,14 @@ def flatten_shared_bot_side(bot_side: dict | None) -> dict:
     result = {}
     for flat_key in FLAT_BOT_KEY_TO_GROUP_PATH:
         value = get_grouped_bot_value(bot_side, flat_key, default=None)
-        if flat_key in bot_side or value is not None:
+        if (
+            flat_key in bot_side
+            or value is not None
+            or (
+                flat_key == "entry_cooldown_max_duration_minutes"
+                and "max_duration_minutes" in get_bot_group(bot_side, "entry_cooldown")
+            )
+        ):
             result[flat_key] = deepcopy(value)
     for key, value in bot_side.items():
         if key in result or key in BOT_SHARED_GROUPS or key == "strategy":
@@ -130,7 +139,9 @@ def inject_flattened_shared_bot_side(bot_side: dict | None) -> None:
         bot_side.setdefault(flat_key, deepcopy(value))
 
 
-def canonical_shared_bot_path_for_flat_key(pside: str, flat_key: str) -> tuple[str, ...] | None:
+def canonical_shared_bot_path_for_flat_key(
+    pside: str, flat_key: str
+) -> tuple[str, ...] | None:
     group_path = FLAT_BOT_KEY_TO_GROUP_PATH.get(flat_key)
     if group_path is None:
         return None
@@ -138,7 +149,9 @@ def canonical_shared_bot_path_for_flat_key(pside: str, flat_key: str) -> tuple[s
     return ("bot", pside, group_name, local_key)
 
 
-def resolve_shared_bot_path(bot_side: dict | None, pside: str, flat_key: str) -> tuple[str, ...] | None:
+def resolve_shared_bot_path(
+    bot_side: dict | None, pside: str, flat_key: str
+) -> tuple[str, ...] | None:
     group_path = FLAT_BOT_KEY_TO_GROUP_PATH.get(flat_key)
     if isinstance(bot_side, dict) and group_path is not None:
         group_name, local_key = group_path
@@ -194,7 +207,9 @@ def canonicalize_shared_bot_side(
             old_value = group_cfg[local_key]
             group_cfg[local_key] = moved_value
             if tracker is not None:
-                tracker.update([*path_prefix, group_name, local_key], old_value, moved_value)
+                tracker.update(
+                    [*path_prefix, group_name, local_key], old_value, moved_value
+                )
                 tracker.remove([*path_prefix, flat_key], moved_value)
         elif tracker is not None:
             tracker.remove([*path_prefix, flat_key], moved_value)

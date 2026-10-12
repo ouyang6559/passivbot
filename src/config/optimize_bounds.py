@@ -1,4 +1,5 @@
 from copy import deepcopy
+import math
 from typing import Optional
 
 from .strategy_spec import (
@@ -20,7 +21,16 @@ def _flatten_strategy_bound_items(bounds: dict, prefix: tuple[str, ...] = ()):
 
 
 SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
+    "entry_cooldown": {
+        "base_duration_minutes": "risk_entry_cooldown_minutes",
+        "weights_minutes_exposure_ratio": "entry_cooldown_weights_minutes_exposure_ratio",
+        "weights_minutes_adverse_directionality": "entry_cooldown_weights_minutes_adverse_directionality",
+        "min_duration_minutes": "entry_cooldown_min_duration_minutes",
+        "max_duration_minutes": "entry_cooldown_max_duration_minutes",
+    },
     "forager": {
+        "score_weights_unilateralness": "forager_score_weights_unilateralness",
+        "unilateralness_ema_span_1m": "unilateralness_ema_span_1m",
         "score_weights_ema_readiness": "forager_score_weights_ema_readiness",
         "score_weights_volatility": "forager_score_weights_volatility",
         "score_weights_volume": "forager_score_weights_volume",
@@ -34,7 +44,6 @@ SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY = {
         "red_threshold": "hsl_red_threshold",
     },
     "risk": {
-        "entry_cooldown_minutes": "risk_entry_cooldown_minutes",
         "n_positions": "n_positions",
         "total_exposure_enforcer_threshold": "risk_twel_enforcer_threshold",
         "we_excess_allowance_pct": "risk_we_excess_allowance_pct",
@@ -75,8 +84,8 @@ SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
             "ema_span_minutes": [720, 720, 1],
             "red_threshold": [0.15, 0.15, 0.001]
         },
+        "entry_cooldown": {"base_duration_minutes": [0, 60, 0.1]},
         "risk": {
-            "entry_cooldown_minutes": [0, 60, 0.1],
             "n_positions": [7, 7, 1],
             "position_exposure_enforcer_threshold": [1, 1, 0.001],
             "total_exposure_enforcer_threshold": [1, 1, 0.001],
@@ -106,8 +115,8 @@ SHARED_OPTIMIZE_BOUNDS_DEFAULTS = {
             "ema_span_minutes": [1, 720, 1],
             "red_threshold": [0.01, 0.15, 0.001]
         },
+        "entry_cooldown": {"base_duration_minutes": [0, 60, 0.1]},
         "risk": {
-            "entry_cooldown_minutes": [0, 60, 0.1],
             "n_positions": [5, 5, 1],
             "position_exposure_enforcer_threshold": [0.8, 1.01, 0.001],
             "total_exposure_enforcer_threshold": [0.8, 1.01, 0.001],
@@ -146,11 +155,6 @@ def flatten_optimize_bounds(bounds: dict | None, *, strategy_kind: str) -> dict:
     }
     if not isinstance(bounds, dict):
         return flat
-    if any(
-        isinstance(key, str) and (key.startswith("long_") or key.startswith("short_"))
-        for key in bounds
-    ):
-        return deepcopy(bounds)
     for key, value in bounds.get("hsl", {}).items():
         flat[f"hsl_{key}"] = deepcopy(value)
     for pside in BOT_POSITION_SIDES:
@@ -166,10 +170,119 @@ def flatten_optimize_bounds(bounds: dict | None, *, strategy_kind: str) -> dict:
                 continue
             if not isinstance(group_bounds, dict):
                 continue
+            shared_items = []
             for key, value in group_bounds.items():
+                if (group_name, key) in {
+                    ("entry_cooldown", "weights_minutes"),
+                    ("forager", "score_weights"),
+                } and isinstance(value, dict):
+                    shared_items.extend((f"{key}_{child}", bound) for child, bound in value.items())
+                else:
+                    shared_items.append((key, value))
+            for key, value in shared_items:
                 flat_key = SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY.get(group_name, {}).get(key, key)
                 flat[f"{pside}_{flat_key}"] = deepcopy(value)
+    # Flat leaves take precedence when legacy and grouped bounds are mixed.
+    flat.update({
+        key: deepcopy(value) for key, value in bounds.items()
+        if isinstance(key, str) and key.startswith(("long_", "short_", "hsl_"))
+    })
     return flat
+
+
+
+def hydrate_adaptive_optimize_bounds(config: dict, *, source_bounds=None, tracker=None) -> None:
+    """Expose omitted adaptive bounds without opening new search ranges.
+
+    source_bounds records authored bounds before template seeding. Bot values
+    must already have their canonical defaults and normalized score weights.
+    """
+    kind = config["live"]["strategy_kind"]
+    bounds = config["optimize"]["bounds"]
+    authored = flatten_optimize_bounds(
+        bounds if source_bounds is None else source_bounds, strategy_kind=kind
+    )
+    for side in BOT_POSITION_SIDES:
+        forager = config["bot"][side]["forager"]
+        cooldown = config["bot"][side]["entry_cooldown"]
+        for group, local_key, value in (
+            (
+                "forager", "score_weights_unilateralness",
+                forager["score_weights"]["unilateralness"],
+            ),
+            ("forager", "unilateralness_ema_span_1m", forager["unilateralness_ema_span_1m"]),
+            (
+                "entry_cooldown", "weights_minutes_exposure_ratio",
+                cooldown["weights_minutes"]["exposure_ratio"],
+            ),
+            (
+                "entry_cooldown", "weights_minutes_adverse_directionality",
+                cooldown["weights_minutes"]["adverse_directionality"],
+            ),
+            ("entry_cooldown", "min_duration_minutes", cooldown["min_duration_minutes"]),
+            ("entry_cooldown", "max_duration_minutes", cooldown["max_duration_minutes"]),
+        ):
+            flat_key = SHARED_OPTIMIZE_LOCAL_TO_FLAT_KEY[group][local_key]
+            bound_key = f"{side}_{flat_key}"
+            if bound_key in authored:
+                # Keep explicit nested/legacy bounds ahead of seeded shorthand
+                # defaults when the canonical grouped representation is built.
+                set_flat_optimize_bound(bounds, kind, bound_key, authored[bound_key])
+                continue
+            # Null means an unbounded duration, not a numeric optimizer endpoint.
+            if value is None:
+                continue
+            if group == "entry_cooldown" and local_key == "max_duration_minutes":
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"bot.{side}.entry_cooldown.max_duration_minutes must be finite when set")
+            frozen = [value, value]
+            local_path = (
+                ("weights_minutes", local_key.removeprefix("weights_minutes_"))
+                if group == "entry_cooldown" and local_key.startswith("weights_minutes_")
+                else (local_key,)
+            )
+            target = bounds.setdefault(side, {}).setdefault(group, {})
+            for part in local_path[:-1]:
+                target = target.setdefault(part, {})
+            leaf = local_path[-1]
+            if tracker is not None:
+                path = ["optimize", "bounds", side, group, *local_path]
+                if leaf not in target:
+                    tracker.add(path, frozen)
+                elif target[leaf] != frozen:
+                    tracker.update(path, target[leaf], frozen)
+            target[leaf] = frozen
+
+
+def preserve_optional_adaptive_bounds(template: dict, source: dict) -> None:
+    """Keep explicit search dimensions without adding them to default searches."""
+    kind = source.get("live", {}).get("strategy_kind", "trailing_martingale")
+    flat = flatten_optimize_bounds(source.get("optimize", {}).get("bounds"), strategy_kind=kind)
+    optional = {
+        "entry_cooldown_weights_minutes_exposure_ratio",
+        "entry_cooldown_weights_minutes_adverse_directionality",
+        "entry_cooldown_min_duration_minutes",
+        "entry_cooldown_max_duration_minutes",
+        "forager_score_weights_unilateralness",
+        "unilateralness_ema_span_1m",
+    }
+    target = template["optimize"]["bounds"]
+    for key, value in flat.items():
+        if key.split("_", 1)[-1] in optional:
+            set_flat_optimize_bound(target, kind, key, value)
+    # Input also accepts nested score_weights before canonical bound sorting.
+    for side in BOT_POSITION_SIDES:
+        scoring = (
+            source.get("optimize", {})
+            .get("bounds", {})
+            .get(side, {})
+            .get("forager", {})
+            .get("score_weights", {})
+        )
+        if isinstance(scoring, dict) and "unilateralness" in scoring:
+            target[side]["forager"].setdefault("score_weights", {})["unilateralness"] = deepcopy(
+                scoring["unilateralness"]
+            )
 
 
 def set_flat_optimize_bound(bounds: dict, strategy_kind: str, flat_key: str, value) -> None:
@@ -199,7 +312,13 @@ def set_flat_optimize_bound(bounds: dict, strategy_kind: str, flat_key: str, val
             current[key] = deepcopy(value)
     else:
         local_key = SHARED_OPTIMIZE_FLAT_TO_LOCAL_KEY[group].get(key, key)
-        side_bounds.setdefault(group, {})[local_key] = deepcopy(value)
+        target = side_bounds.setdefault(group, {})
+        if group == "entry_cooldown" and local_key.startswith("weights_minutes_"):
+            target.setdefault("weights_minutes", {})[local_key.removeprefix("weights_minutes_")] = (
+                deepcopy(value)
+            )
+        else:
+            target[local_key] = deepcopy(value)
 
 
 def sort_optimize_bounds_in_place(bounds: dict, *, strategy_kind: str, portfolio_hsl: bool = False) -> None:

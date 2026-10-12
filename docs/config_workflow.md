@@ -6,7 +6,7 @@ This is the recommended way to work with Passivbot configs on the current config
 
 - The canonical hardcoded defaults live in `src/config/schema.py`.
 - The example config `configs/examples/default_trailing_martingale_long.json` provides the maintained default strategy profile.
-- New configs use top-level `config_version: "v8.4.0"`. Supported v8.0.0–v8.3.0 configs migrate
+- New configs use top-level `config_version: "v8.6.0"`. Supported v8.0.0–v8.5.0 configs migrate
   on load; review warnings and the normalized result rather than manually relabeling an old file.
   Config-schema versions are separate from [package versions and release tags](releases.md).
   V7 and pre-v8 configs require explicit migration.
@@ -35,6 +35,12 @@ passivbot live configs/private/my_config.json
 ```
 
 ## Best Practices
+
+Use `passivbot tool clean-config input.json output.json` to produce a full schema-aligned config,
+or add `--mode live` for a lean live export. Formatting only is available with `--mode format`.
+Inputs stay untouched by default; replacement requires `--in-place`. See
+[Config cleanup and formatting](tools.md#config-cleanup-and-formatting) for bulk depth, HJSON,
+dry-run/check modes and migration boundaries.
 
 - Keep one normal JSON or HJSON config per strategy/account instead of relying on many CLI overrides.
 - Use CLI overrides for temporary experiments, not as your main configuration workflow.
